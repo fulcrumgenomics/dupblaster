@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-14
+
 Initial release of dupblaster — a fast, streaming duplicate marker for
 **query-grouped** SAM/BAM, inspired by samblaster (Faust & Hall, 2014) and
 Picard MarkDuplicates.
@@ -95,4 +97,5 @@ Picard MarkDuplicates.
   Picard's `kf`-tagged output to produce set-equivalence, orphan-discordance,
   and supplementary-flag-inheritance TSVs.
 
-[Unreleased]: https://github.com/fulcrumgenomics/dupblaster/compare/HEAD
+[Unreleased]: https://github.com/fulcrumgenomics/dupblaster/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/fulcrumgenomics/dupblaster/releases/tag/v0.1.0
