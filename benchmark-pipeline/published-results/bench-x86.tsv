@@ -1,0 +1,11 @@
+sample	tool	rep	wall_s	user_s	sys_s	cpu_percent	max_rss_kb	exit_status
+HG03953	dupblaster-bam	1	59.97	39.85	28.72	114	1278316	0
+HG03953	dupblaster-picard-approx	1	66.13	59.62	31.36	137	2369924	0
+HG03953	dupblaster-picard-exact	1	60.8	43.18	28.06	117	1501532	0
+HG03953	dupblaster-sam	1	92.96000000000001	95.58	29.71	134	1258592	0
+HG03953	dupsifter	1	203.21	165.36	37.76	99	3188600	0
+HG03953	picard	1	825.18	1210.15	39.98	151	8783404	0
+HG03953	samblaster	1	123.43	87.57	35.84	99	1458968	0
+HG03953	samtools-markdup	1	808.15	790.55	4.66	98	222800	0
+HG03953	samtools-markdup-S	1	991.9	934.89	13.2	95	233124	0
+HG03953	samtools-markdup-seq-S	1	986.5	942.38	13.19	96	233316	0

@@ -1,0 +1,13 @@
+.pixi/
+.snakemake/
+# pixi.lock IS committed — it is the authoritative env pin for reproducing the
+# benchmark numbers published in the top-level README (raw collated TSVs live in
+# published-results/). Do not add it back here.
+# results/ holds live run output; published-results/ (tracked) holds the
+# curated TSVs the README cites.
+results/
+run.log
+__pycache__/
+*.pyc
+# Bring-your-own Picard jar (default location; see README "Picard jar").
+picard.jar

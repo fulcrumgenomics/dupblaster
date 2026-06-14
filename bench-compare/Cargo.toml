@@ -1,0 +1,30 @@
+[package]
+name = "bench-compare"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Single-pass duplicate-marking comparison vs Picard (kf tag) for the dupblaster benchmark"
+# Internal benchmark tool — never published to crates.io. Without this, a
+# workspace `cargo release` (release.toml sets `publish = true`) would try to
+# publish it alongside dupblaster and fail mid-release.
+publish = false
+
+[[bin]]
+name = "bench-compare"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bstr = "1"
+clap = { version = "4", features = ["derive"] }
+rustc-hash = "2"
+# Streaming BAM IO via noodles — deliberately independent of the dupblaster
+# product so this benchmark tool doesn't depend on the thing it measures.
+noodles-bam = "0.90"
+noodles-bgzf = "0.47"
+noodles-sam = "0.85"
+mimalloc = { version = "0.1", default-features = false }
+# Release profile (lto/codegen-units) is inherited from the workspace root.
+
+[dev-dependencies]
+tempfile = "3"

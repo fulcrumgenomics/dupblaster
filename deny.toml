@@ -1,0 +1,69 @@
+# cargo-deny configuration for dupblaster.
+#
+# Run locally: `cargo deny check`
+# CI:          `.github/workflows/deny.yml` (weekly + on PR)
+#
+# Schema docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Advisories: fail on known CVEs, unmaintained crates, yanked versions.
+# Pulls from https://github.com/RustSec/advisory-db
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+# Fail (not just warn) on a yanked dependency: for a published crate a yanked
+# transitive dep is a real supply-chain signal worth blocking CI on.
+yanked = "deny"
+ignore = []
+
+# ---------------------------------------------------------------------------
+# Licenses: only permissive MIT-compatible licenses are allowed. Anything
+# weak/strong copyleft (LGPL, GPL, AGPL, MPL) or proprietary will fail the
+# check. The allow-list reflects the licenses currently present in the
+# transitive dep tree; add new entries only after a deliberate decision.
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# ---------------------------------------------------------------------------
+# Bans: control duplicate versions and ban specific crates.
+# `multiple-versions = "warn"` because some duplication is normal in a
+# healthy dep tree (e.g. proc-macro libs that bridge syn 1.x → 2.x).
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+# ---------------------------------------------------------------------------
+# Sources: deps must come from a known registry / git host. Defends against
+# typo-squatting and accidental forks.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

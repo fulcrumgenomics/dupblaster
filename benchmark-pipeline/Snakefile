@@ -1,0 +1,939 @@
+# dupblaster benchmark pipeline.
+#
+# Per sample:
+#   1. Download the NYGC 30× high-coverage CRAM (bwa-mem aligned, has
+#      supplementary alignments — the original 1000G phase-3 .mapped.bam
+#      was bwa-aln and had none).
+#   2. `samtools view --subsample` subsamples + decodes CRAM → BAM in
+#      one pass. Picard is much slower on CRAM than BAM, so we do the
+#      conversion *before* prep.
+#   3. Strip any prior FLAG_DUPLICATE bit (every NYGC record carries one
+#      from the production Picard run) and qname-group via `samtools view
+#      --remove-flags 0x400 | samtools collate`. We deliberately do NOT
+#      use Picard `RevertSam` here — RevertSam drops every secondary and
+#      supplementary record by design, which would defeat the reason we
+#      picked the NYGC bwa-mem alignments. See benchmark-pipeline/README
+#      "Why we don't use Picard RevertSam".
+#   4. From the clean name-sorted BAM we derive two additional prepped
+#      inputs upstream of the timed windows that need them:
+#        - SAM text view (samblaster, dupblaster-sam)
+#        - coord-sorted BAM at L=1 post `samtools fixmate -m`
+#          (samtools markdup; the `MC`/`ms` tags fixmate injects are
+#          read by markdup during representative selection).
+#      Every other tool — the dupblaster modes, dupsifter, and Picard
+#      (`ASSUME_SORT_ORDER=queryname`) — consumes the name-sorted BAM
+#      directly.
+#   5. Each tool is timed (`env time -v`) and serialized via the `bench`
+#      resource. The timed window wraps ONLY the tool, which writes its
+#      native, uncompressed output. Then, as a separate untimed step
+#      inside the same rule, that raw output is converted to the shared
+#      comparison artifact: an L1 BGZF BAM in the common name-sorted
+#      order (`out.nsort.bam`). Order-preserving tools just recompress
+#      (`samtools view -b --output-fmt-option level=1`); the
+#      coordinate-order tools (samtools markdup) and dupblaster-picard-exact
+#      (buffers orphans to the end) are name-sorted (`samtools sort -n -l 1`). Keeping compression out
+#      of the timed window means output-format cost never penalizes a
+#      tool, while the comparison still gets a uniformly compressed,
+#      uniformly ordered input.
+#   6. `bench-compare` co-streams Picard's kf-tagged output against each
+#      partner's output in one pass, emitting per-set concordance, a
+#      four-bucket orphan-discordance triage, and per-tool dup-flag
+#      inheritance (primary → secondary/supplementary propagation).
+
+from pathlib import Path
+
+WORKDIR = Path(workflow.basedir)
+
+# `set -euo pipefail` on every shell rule. Without `pipefail`, a samtools
+# stage failing mid-pipeline (SIGPIPE on premature reader exit, OOM, etc.)
+# can silently look like success because only the LAST pipe stage's exit
+# code propagates. With `-u` an undefined variable in a shell block is a
+# hard error rather than an empty expansion. Snakemake does NOT apply
+# these flags by default.
+shell.prefix("set -euo pipefail; ")
+
+# ---- knobs (override via --config replicates=1 etc.) ---------------------
+
+REPLICATES = int(config.get("replicates", 1))
+DUPBLASTER_BIN = config.get(
+    "dupblaster_bin",
+    str(WORKDIR.parent / "target" / "release" / "dupblaster"),
+)
+# Rust single-pass comparison tool (workspace sibling of dupblaster). Reads
+# Picard's `kf` tag + a partner's dup flags and emits set/orphan concordance +
+# dup-flag inheritance in one pass — replacing the tcsort + Python comparison.
+BENCH_COMPARE_BIN = config.get(
+    "bench_compare_bin",
+    str(WORKDIR.parent / "target" / "release" / "bench-compare"),
+)
+# Heap for Picard MarkDuplicates. 8G is comfortable at ~6× WGS (~60M
+# templates). Bump for larger samples or higher coverage.
+PICARD_HEAP = config.get("picard_heap", "8g")
+# Bring-your-own Picard jar: drop it at benchmark-pipeline/picard.jar (the
+# default, gitignored) or override with --config picard_jar=/path/to/picard.jar.
+# A stock Picard release is enough for the timing benchmark; the kf-concordance
+# comparison (run_picard + bench-compare) needs a build with the opt-in
+# TAG_DUPLICATE_KEY argument (the `tf_tag_duplicate_key` branch). See README.
+PICARD_JAR = config.get("picard_jar", str(WORKDIR / "picard.jar"))
+
+# ---- reference + sample sheet -------------------------------------------
+# NYGC 1000G_2504_high_coverage data. The CRAMs need the GRCh38 +
+# decoy + HLA reference to decode; we download it once and cache it
+# in results/reference/. MD5s come from the NYGC
+# 1000G_2504_high_coverage.sequence.index.
+#
+# AWS S3 (in us-east-1) is much faster than EBI FTP for these files.
+
+S3 = "https://1000genomes.s3.amazonaws.com"
+
+REFERENCE_URL = (
+    f"{S3}/technical/reference/GRCh38_reference_genome/"
+    "GRCh38_full_analysis_set_plus_decoy_hla.fa"
+)
+
+SAMPLES = {
+    "HG03953": {
+        "population": "STU",
+        "run_id":     "ERR3242904",
+        "coverage_x": 29.8,
+        "cram_md5":   "d6d2fc2a27c9ba38e067fbcdc790fdbd",
+        # Subsample fraction → effective coverage. 0.27 of ~30× ≈ 8×,
+        # close to the previous HG00096 4.5× baseline (but slightly
+        # higher to better surface inter-tool numerical effects). Seed
+        # kept fixed for reproducibility. Use the explicit
+        # `--subsample/--subsample-seed` flags below.
+        "subsample_frac": 0.27,
+        "subsample_seed": 42,
+    },
+    # Add more samples here. Pull MD5/run_id from the NYGC index:
+    # https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1000G_2504_high_coverage/1000G_2504_high_coverage.sequence.index
+}
+
+# Optional CLI subset: --config samples=HG03953,...
+if "samples" in config:
+    requested = {s.strip() for s in str(config["samples"]).split(",")}
+    SAMPLES = {k: v for k, v in SAMPLES.items() if k in requested}
+    if not SAMPLES:
+        raise WorkflowError(f"No samples matched {requested!r}.")
+
+
+def _cram_url(sample: str) -> str:
+    m = SAMPLES[sample]
+    return f"{S3}/1000G_2504_high_coverage/data/{m['run_id']}/{sample}.final.cram"
+
+
+# ---- tools ---------------------------------------------------------------
+
+# The partner tools compared against Picard. Each tool's `run_*` rule
+# names its own prep input and native raw-output format explicitly, then
+# converts that raw output to the shared `out.nsort.bam` artifact in the
+# same rule (see step 5 in the header). This list only drives the
+# per-(sample, tool, rep) fan-out for aggregation + comparison.
+#
+# Notes on the less obvious ones:
+#   - samtools-markdup-S: `-S` propagates the dup flag to secondary /
+#     supplementary alignments of duplicate primaries. The samtools docs
+#     flag this as "slower" — we measure how much.
+#   - samtools-markdup-seq-S: as `-S` but adds `-m s` (sequence mode).
+#     Default markdup is `-m t` (template mode), which folds R1/R2 identity
+#     into the key for same-strand pairs; Picard and dupblaster are
+#     coordinate-canonical and R1/R2-agnostic, the closer analogue to `-m s`.
+#     This row tests whether `-m s` tightens pair concordance with Picard.
+#   - dupsifter (huishenlab): samblaster-lineage, single-pass, streams a
+#     read-name-grouped BAM. Run in `-W` (WGS-only) mode here since our
+#     bench data is unconverted WGS; its WGBS strand-coupling is irrelevant.
+TOOLS = [
+    "samblaster",
+    "dupblaster-sam",
+    "dupblaster-bam",
+    "dupblaster-picard-approx",
+    "dupblaster-picard-exact",
+    "picard",
+    "samtools-markdup",
+    "samtools-markdup-S",
+    "samtools-markdup-seq-S",
+    "dupsifter",
+]
+
+SAMPLE_NAMES = list(SAMPLES.keys())
+TOOL_NAMES   = list(TOOLS)
+REP_IDS      = list(range(1, REPLICATES + 1))
+
+
+# ---- targets -------------------------------------------------------------
+
+rule all:
+    input:
+        "results/bench.tsv",
+        "results/setcmp.tsv",
+        "results/orphan_triage.tsv",
+        "results/inheritance.tsv",
+
+
+# ---- prep: reference -----------------------------------------------------
+
+rule download_reference:
+    """Fetch GRCh38 + decoy + HLA. Used to decode the NYGC CRAMs. ~3.3 GB."""
+    output:
+        fa = "results/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa",
+    params:
+        url = REFERENCE_URL,
+    threads: 4
+    shell:
+        r"""
+        outdir=$(dirname {output.fa})
+        mkdir -p "$outdir"
+        aria2c \
+            --dir="$outdir" \
+            --out=$(basename {output.fa}).part \
+            -x 4 -s 4 -k 16M \
+            --file-allocation=none \
+            --auto-file-renaming=false \
+            --console-log-level=warn \
+            --summary-interval=10 \
+            --retry-wait=5 --max-tries=3 \
+            {params.url:q}
+        mv {output.fa}.part {output.fa}
+        """
+
+
+rule index_reference:
+    input:
+        fa = "results/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa",
+    output:
+        fai = "results/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa.fai",
+    shell:
+        r"""
+        samtools faidx {input.fa}
+        """
+
+
+# ---- prep: per-sample download + subsample -------------------------------
+
+rule download_cram:
+    """Fetch a sample's NYGC 30× CRAM from S3 and verify its MD5."""
+    output:
+        cram = "results/download/{sample}.final.cram",
+    params:
+        url = lambda wc: _cram_url(wc.sample),
+        md5 = lambda wc: SAMPLES[wc.sample]["cram_md5"],
+    threads: 8
+    shell:
+        r"""
+        outdir=$(dirname {output.cram})
+        mkdir -p "$outdir"
+        aria2c \
+            --dir="$outdir" \
+            --out=$(basename {output.cram}).part \
+            -x 8 -s 8 -k 16M \
+            --file-allocation=none \
+            --auto-file-renaming=false \
+            --console-log-level=warn \
+            --summary-interval=10 \
+            --retry-wait=5 --max-tries=3 \
+            {params.url:q}
+        actual=$( (md5sum {output.cram}.part 2>/dev/null || md5 -q {output.cram}.part) \
+                  | awk '{{print $1}}' )
+        if [ "$actual" != "{params.md5}" ]; then
+            echo "MD5 mismatch: expected {params.md5}, got $actual" >&2
+            exit 1
+        fi
+        mv {output.cram}.part {output.cram}
+        """
+
+
+rule prep_subsampled_bam:
+    """`samtools view --subsample <frac> --subsample-seed <seed>`
+    subsamples by qname-hash (preserves pair + supplementary
+    co-membership) and converts CRAM → BAM at L=1 in one pass. Picard
+    is dramatically slower on CRAM than BAM, and we don't want CRAM
+    decoding in the prep cost of any timed step."""
+    input:
+        cram = "results/download/{sample}.final.cram",
+        fa   = "results/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa",
+        fai  = "results/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa.fai",
+    output:
+        bam = temp("results/prepped/{sample}.sub.bam"),
+    params:
+        frac = lambda wc: SAMPLES[wc.sample]["subsample_frac"],
+        seed = lambda wc: SAMPLES[wc.sample]["subsample_seed"],
+    threads: 8
+    shell:
+        # NB: do NOT pass `-l N` to `samtools view`. In `view`, `-l` is
+        # `--library` (filter to reads in library N), NOT a compression
+        # level — `-l 1` silently filters to the nonexistent library "1"
+        # and emits a header-only BAM. (`-l` *is* compression level in
+        # `samtools sort`/`markdup`, which is the easy way to get bitten.)
+        # To set BAM compression level in `view`, use `-1`/`--fast` or
+        # `--output-fmt-option level=N`. Here we just take BGZF's default —
+        # the subsampled BAM is intermediate (temp()) so size is transient.
+        r"""
+        samtools view -@ {threads} -b \
+            --reference {input.fa} \
+            --subsample {params.frac} \
+            --subsample-seed {params.seed} \
+            -o {output.bam} \
+            {input.cram}
+        """
+
+
+rule prep_namesorted_bam:
+    """Strip any pre-existing `FLAG_DUPLICATE` bits and name-sort
+    (`samtools sort -n`) the subsampled BAM into the one canonical,
+    uncompressed (L0) input every tool shares.
+
+    Name-sorting (not just collating) gives a deterministic lexicographic
+    QNAME order, so every order-preserving tool — the dupblaster modes,
+    samblaster, dupsifter, and Picard (`ASSUME_SORT_ORDER=queryname`) — emits
+    output in that same order, letting `bench-compare` co-stream any two
+    outputs with no re-sort. (samtools markdup is the exception: it needs a
+    coordinate sort, and its output is name-sorted afterward by the untimed
+    conversion step inside its own run rule.)
+
+    We deliberately do *not* use Picard `RevertSam` here — RevertSam
+    drops every secondary and supplementary record by design, defeating
+    the whole reason we picked the NYGC bwa-mem alignments (which have
+    supplementary alignments from split / chimeric reads). The simpler
+    pipeline below clears the duplicate flag on every record (primary,
+    secondary, and supplementary alike) without touching anything else,
+    then groups by qname so all records of a template are contiguous —
+    the format every timed tool consumes.
+
+    This output is intentionally **not** `temp()`: it is the canonical
+    cached input for the whole bench. Persisting it means we never
+    re-decode + re-subsample the (large) CRAM on a partial re-run, and —
+    because its mtime stays stable across runs — it also stops the temp
+    derivative below it (`fixmate-coord.bam`) from being regenerated,
+    which would otherwise cascade into needless samtools-markdup reruns
+    when only the streaming tools changed. The large `sub.bam` intermediate
+    stays `temp()`; this file is cheap to rebuild from it (a name sort) if
+    it's ever invalidated. Changing
+    `subsample_frac` / `subsample_seed` still re-subsamples
+    automatically (Snakemake's params trigger re-fires `sub.bam`, whose
+    new mtime invalidates this file); delete it by hand only to force a
+    rebuild for some other reason."""
+    input:
+        bam = "results/prepped/{sample}.sub.bam",
+    output:
+        bam = "results/prepped/{sample}.qnsort.bam",
+    threads: 8
+    shell:
+        r"""
+        tmpdir=$(dirname {output.bam})/namesort-tmp
+        mkdir -p "$tmpdir"
+        samtools view -@ {threads} -h --remove-flags 0x400 -u {input.bam} \
+            | samtools sort -n -@ {threads} -l 0 \
+                -T "$tmpdir/sort" \
+                -o {output.bam} -
+        rm -rf "$tmpdir"
+        """
+
+
+rule prep_namesorted_sam:
+    """SAM text view of the name-sorted BAM. samblaster + dupblaster-sam
+    consume this."""
+    input:
+        bam = "results/prepped/{sample}.qnsort.bam",
+    output:
+        sam = temp("results/prepped/{sample}.qnsort.sam"),
+    threads: 2
+    shell:
+        r"""
+        samtools view -@ {threads} -h -O sam -o {output.sam} {input.bam}
+        """
+
+
+rule prep_fixmate_coord_bam:
+    """Coord-sorted BAM at L=1 with mate-info tags injected by
+    `samtools fixmate -m` — samtools markdup consumes this.
+
+    `fixmate -m` is mandatory: markdup reads the `MC` (mate CIGAR) and
+    `ms` (mate base-quality score) tags it injects during
+    representative selection. The samtools docs spell out the required
+    chain as `collate | fixmate -m | sort | markdup`; we already have
+    a name-sorted (qname-grouped) BAM upstream, so this rule covers the
+    `fixmate -m | sort` portion as untimed prep — keeping the coordinate
+    sort and fixmate-tag injection out of markdup's timed window.
+
+    Compression level 1 mirrors the lightly-compressed output of a typical
+    production-sort step — the realistic upstream for a coord-sorted
+    tool."""
+    input:
+        bam = "results/prepped/{sample}.qnsort.bam",
+    output:
+        bam = temp("results/prepped/{sample}.fixmate-coord.bam"),
+    threads: 4
+    shell:
+        r"""
+        tmpdir=$(dirname {output.bam})/fixmate-coord-tmp
+        mkdir -p "$tmpdir"
+        samtools fixmate -@ {threads} -m -u {input.bam} - \
+            | samtools sort -@ {threads} -l 1 \
+                -T "$tmpdir/sort" \
+                -o {output.bam} -
+        rm -rf "$tmpdir"
+        """
+
+
+# ---- timed runs ----------------------------------------------------------
+# Each timed rule grabs the whole `bench` pool (size 100, set in `run.sh`
+# via `--resources bench=100`) so nothing else with a `bench` requirement
+# can run at the same time. The actual number is arbitrary — what matters
+# is that the resource amount each timed rule claims equals the pool
+# size, which makes timed runs strictly serial. Prep / aggregation rules
+# don't declare `bench` and run up to `--cores` freely between timed
+# jobs.
+#
+# The prep step strips prior FLAG_DUPLICATE bits but does not "sanitize"
+# orphan reads (since we don't use RevertSam — see header). Any genuine
+# orphans in the source CRAM pass through to the tools, so the
+# samblaster / dupblaster runners pass `--ignoreUnmated` /
+# `--ignore-unmated` to turn the hard-fail-on-orphan check into a
+# warning counter. Picard and samtools markdup handle orphans natively.
+
+rule run_samblaster:
+    input:
+        sam = "results/prepped/{sample}.qnsort.sam",
+    output:
+        out = "results/runs/{sample}/samblaster/rep{rep}/out.nsort.bam",
+        time_txt = "results/runs/{sample}/samblaster/rep{rep}/time.txt",
+    threads: 4
+    resources:
+        bench = 100,
+    shell:
+        # `--ignoreUnmated`: we no longer sanitize the input via RevertSam,
+        # so any genuine orphan reads in the source CRAM pass through to
+        # the tools. The flag turns samblaster's hard error into a warning
+        # + counter. samblaster's stats line reports the actual count;
+        # `0 unmated` means the data was clean.
+        #
+        # Timed window writes native SAM (uncompressed); the L1 BAM
+        # conversion below is untimed. samblaster preserves input order, so
+        # its output is already name-sorted — just recompress.
+        r"""
+        rep=$(dirname {output.out})
+        env time -v -o {output.time_txt} \
+            samblaster --ignoreUnmated -i {input.sam} -o $rep/out.raw.sam
+        samtools view -@ {threads} -b --output-fmt-option level=1 -o {output.out} $rep/out.raw.sam
+        rm -f $rep/out.raw.sam
+        """
+
+
+rule run_dupblaster_sam:
+    input:
+        sam = "results/prepped/{sample}.qnsort.sam",
+    output:
+        out = "results/runs/{sample}/dupblaster-sam/rep{rep}/out.nsort.bam",
+        time_txt = "results/runs/{sample}/dupblaster-sam/rep{rep}/time.txt",
+    threads: 4
+    resources:
+        bench = 100,
+    params:
+        bin = DUPBLASTER_BIN,
+    shell:
+        # Timed window writes uncompressed BAM (L0); the L1 conversion
+        # below is untimed. dupblaster-sam preserves input order, so its
+        # output is already name-sorted — just recompress.
+        r"""
+        rep=$(dirname {output.out})
+        env time -v -o {output.time_txt} \
+            {params.bin} -i {input.sam} -o $rep/out.raw.bam --ignore-unmated --quiet
+        samtools view -@ {threads} -b --output-fmt-option level=1 -o {output.out} $rep/out.raw.bam
+        rm -f $rep/out.raw.bam
+        """
+
+
+rule run_dupblaster_bam:
+    input:
+        bam = "results/prepped/{sample}.qnsort.bam",
+    output:
+        out = "results/runs/{sample}/dupblaster-bam/rep{rep}/out.nsort.bam",
+        time_txt = "results/runs/{sample}/dupblaster-bam/rep{rep}/time.txt",
+    threads: 4
+    resources:
+        bench = 100,
+    params:
+        bin = DUPBLASTER_BIN,
+    shell:
+        # Timed window writes uncompressed BAM (L0); the L1 conversion
+        # below is untimed. dupblaster-bam preserves input order, so its
+        # output is already name-sorted — just recompress.
+        r"""
+        rep=$(dirname {output.out})
+        env time -v -o {output.time_txt} \
+            {params.bin} -i {input.bam} -o $rep/out.raw.bam --ignore-unmated --quiet
+        samtools view -@ {threads} -b --output-fmt-option level=1 -o {output.out} $rep/out.raw.bam
+        rm -f $rep/out.raw.bam
+        """
+
+
+rule run_dupblaster_picard_approx:
+    """Same dupblaster binary as `dupblaster-bam`, but with
+    `--single-end-strategy picard-approx` — enables the streaming
+    Picard-style cross-check that registers each pair-end's 5' position
+    in the orphan/fragment table, so subsequent orphan reads at those
+    positions are marked as duplicates of the pair. See the dupblaster
+    README's single-end-strategies section."""
+    input:
+        bam = "results/prepped/{sample}.qnsort.bam",
+    output:
+        out = "results/runs/{sample}/dupblaster-picard-approx/rep{rep}/out.nsort.bam",
+        time_txt = "results/runs/{sample}/dupblaster-picard-approx/rep{rep}/time.txt",
+    threads: 4
+    resources:
+        bench = 100,
+    params:
+        bin = DUPBLASTER_BIN,
+    shell:
+        # Timed window writes uncompressed BAM (L0); the L1 conversion
+        # below is untimed. picard-approx preserves input order, so its
+        # output is already name-sorted — just recompress.
+        r"""
+        rep=$(dirname {output.out})
+        env time -v -o {output.time_txt} \
+            {params.bin} -i {input.bam} -o $rep/out.raw.bam \
+                --single-end-strategy picard-approx --ignore-unmated --quiet
+        samtools view -@ {threads} -b --output-fmt-option level=1 -o {output.out} $rep/out.raw.bam
+        rm -f $rep/out.raw.bam
+        """
+
+
+rule run_dupblaster_picard_exact:
+    """Same dupblaster binary as `dupblaster-bam`, but with
+    `--single-end-strategy picard-exact` — the exact, order-independent
+    form of the "fragments don't beat pairs" rule. Pairs stream straight
+    to the output while orphan / single-end reads are buffered to a temp
+    BAM (`--tmp-dir`, kept inside this rule's own scratch dir); after the
+    pair pass the pair table is drained into a fragment table and the
+    buffered reads are re-marked against it. Unlike picard-approx this is
+    insensitive to whether an orphan precedes or follows its pair in the
+    stream. The timed wall/RSS therefore includes the temp-BAM write and
+    second-pass read. Buffered reads are emitted at the end of the output
+    stream, so this tool's output is NOT in name order; the untimed L1
+    conversion below name-sorts it (`samtools sort -n`) so the reordering
+    does not affect the comparison. See the dupblaster README's
+    single-end-strategies section."""
+    input:
+        bam = "results/prepped/{sample}.qnsort.bam",
+    output:
+        out = "results/runs/{sample}/dupblaster-picard-exact/rep{rep}/out.nsort.bam",
+        time_txt = "results/runs/{sample}/dupblaster-picard-exact/rep{rep}/time.txt",
+    threads: 4
+    resources:
+        bench = 100,
+    params:
+        bin = DUPBLASTER_BIN,
+    shell:
+        # Timed window writes uncompressed BAM (L0) with orphans buffered
+        # to the end; the conversion below name-sorts to L1 (untimed).
+        r"""
+        rep=$(dirname {output.out})
+        tmpdir=$rep/picard-exact-tmp
+        mkdir -p "$tmpdir"
+        env time -v -o {output.time_txt} \
+            {params.bin} -i {input.bam} -o $rep/out.raw.bam \
+                --single-end-strategy picard-exact --tmp-dir "$tmpdir" \
+                --ignore-unmated --quiet
+        samtools sort -n -@ {threads} -l 1 -T "$tmpdir/sort" \
+            -o {output.out} $rep/out.raw.bam
+        rm -rf "$tmpdir" $rep/out.raw.bam
+        """
+
+
+rule run_dupsifter:
+    """dupsifter (huishenlab) in `-W` (WGS-only) mode.
+
+    Like the dupblaster modes, dupsifter is samblaster-lineage and streams
+    a read-name-grouped BAM, so it consumes the same cached name-sorted input
+    with no extra prep. The reference is a required positional argument; in
+    WGS mode strand inference is off so it is not read heavily.
+
+    Output is SAM, not BAM. dupsifter has no compression-level flag and
+    infers the output format from the filename extension (its
+    `sam_open_mode(...)` call), so `.bam` would write default level-6 BGZF —
+    ~4.6x slower. Writing `.sam` keeps the timed window uncompressed (like
+    every other tool); the untimed conversion below recompresses it to an
+    L1 name-sorted BAM. dupsifter preserves input order, so its output is
+    already name-sorted — just recompress."""
+    input:
+        bam = "results/prepped/{sample}.qnsort.bam",
+        ref = "results/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa",
+    output:
+        out = "results/runs/{sample}/dupsifter/rep{rep}/out.nsort.bam",
+        stats = "results/runs/{sample}/dupsifter/rep{rep}/dupsifter_stats.txt",
+        time_txt = "results/runs/{sample}/dupsifter/rep{rep}/time.txt",
+    threads: 4
+    resources:
+        bench = 100,
+    shell:
+        r"""
+        rep=$(dirname {output.out})
+        env time -v -o {output.time_txt} \
+            dupsifter -W -o $rep/out.raw.sam -O {output.stats} \
+                {input.ref} {input.bam}
+        samtools view -@ {threads} -b --output-fmt-option level=1 -o {output.out} $rep/out.raw.sam
+        rm -f $rep/out.raw.sam
+        """
+
+
+rule run_picard:
+    input:
+        bam = "results/prepped/{sample}.qnsort.bam",
+    output:
+        out      = "results/runs/{sample}/picard/rep{rep}/out.nsort.bam",
+        metrics  = "results/runs/{sample}/picard/rep{rep}/metrics.txt",
+        time_txt = "results/runs/{sample}/picard/rep{rep}/time.txt",
+    threads: 4
+    resources:
+        bench = 100,
+    params:
+        heap = PICARD_HEAP,
+        jar  = PICARD_JAR,
+    shell:
+        # Runs the patched Picard jar (PICARD_JAR) from the
+        # tf_tag_duplicate_key branch. Argument choices:
+        # - ASSUME_SORT_ORDER=queryname: the input is the name-sorted BAM;
+        #   Picard marks order-independently and emits output in that same
+        #   name order, so bench-compare can co-stream it against the other
+        #   tools with no re-sort.
+        # - TAG_DUPLICATE_KEY=true: write the canonical `kf` fragment-key tag
+        #   on every primary mapped record — the basis for the kf comparison.
+        # - TAGGING_POLICY=All + TAG_DUPLICATE_SET_MEMBERS=true: keep DI/DS too
+        #   (handy for cross-checking; bench-compare keys on kf).
+        # - OPTICAL_DUPLICATE_PIXEL_DISTANCE=100: HiSeq-2000-era value; affects
+        #   only the PCR/optical split in the metrics, not the total count.
+        # - COMPRESSION_LEVEL=0: write uncompressed in the timed window;
+        #   the untimed conversion below recompresses to L1. Picard emits
+        #   in the input (name) order, so it only needs recompression.
+        # - VALIDATION_STRINGENCY=LENIENT: tolerate the occasional mate-info
+        #   inconsistency in the NYGC bwa-mem alignments.
+        r"""
+        rep=$(dirname {output.out})
+        tmpdir=$rep/picard-tmp
+        mkdir -p "$tmpdir"
+        env time -v -o {output.time_txt} \
+            java -Xmx{params.heap} -jar {params.jar} MarkDuplicates \
+                INPUT={input.bam} \
+                OUTPUT=$rep/out.raw.bam \
+                METRICS_FILE={output.metrics} \
+                TMP_DIR="$tmpdir" \
+                ASSUME_SORT_ORDER=queryname \
+                TAG_DUPLICATE_KEY=true \
+                TAGGING_POLICY=All \
+                TAG_DUPLICATE_SET_MEMBERS=true \
+                OPTICAL_DUPLICATE_PIXEL_DISTANCE=100 \
+                REMOVE_DUPLICATES=false \
+                COMPRESSION_LEVEL=0 \
+                VALIDATION_STRINGENCY=LENIENT \
+                VERBOSITY=WARNING \
+                QUIET=true
+        samtools view -@ {threads} -b --output-fmt-option level=1 -o {output.out} $rep/out.raw.bam
+        rm -rf "$tmpdir" $rep/out.raw.bam
+        """
+
+
+rule run_samtools_markdup:
+    """Time only the `samtools markdup` binary. Required upstream prep
+    (`fixmate -m | sort` at L=1) lives in prep_fixmate_coord_bam and is
+    NOT counted toward markdup's wall/CPU/RSS — analogous to how
+    Picard's coord-sorted input is prepped upstream of its timed
+    window. See the benchmark-pipeline README for the prep-vs-timed
+    framing."""
+    input:
+        bam = "results/prepped/{sample}.fixmate-coord.bam",
+    output:
+        out      = "results/runs/{sample}/samtools-markdup/rep{rep}/out.nsort.bam",
+        time_txt = "results/runs/{sample}/samtools-markdup/rep{rep}/time.txt",
+    threads: 4
+    resources:
+        bench = 100,
+    shell:
+        # `-d 100`: optical-dup pixel distance (matches Picard's
+        # OPTICAL_DUPLICATE_PIXEL_DISTANCE=100).
+        # `-c`: clear any prior dup flags / `do` / `dt` tags before
+        # this run. Functionally a no-op on our input (the prep step
+        # strips `0x400` already), but matches Picard's implicit
+        # "overwrite this run's decision" semantics so the tools'
+        # idempotence behavior is on the same footing.
+        # `-l 0`: emit uncompressed BGZF in the timed window. The untimed
+        # conversion below name-sorts the coordinate-order output to L1
+        # (`samtools sort -n`) so it lines up with the other tools.
+        # `-T <prefix>`: tmp prefix for any spill (only used with -S).
+        r"""
+        rep=$(dirname {output.out})
+        tmpdir=$rep/markdup-tmp
+        mkdir -p "$tmpdir"
+        env time -v -o {output.time_txt} \
+            samtools markdup -d 100 -c -l 0 \
+                -T "$tmpdir/markdup" \
+                {input.bam} $rep/out.raw.bam
+        samtools sort -n -@ {threads} -l 1 -T "$tmpdir/sort" \
+            -o {output.out} $rep/out.raw.bam
+        rm -rf "$tmpdir" $rep/out.raw.bam
+        """
+
+
+rule run_samtools_markdup_S:
+    """Like `run_samtools_markdup` but with `-S` added: propagates the
+    dup flag from each duplicate-marked primary to every secondary /
+    supplementary alignment of the same template. The samtools docs
+    label this mode "slower" — `-S` triggers a tmp-file spill (the
+    only spill markdup performs) so it can re-scan supplementary
+    records after the main pass. We time it as a separate row so the
+    cost is visible alongside the default."""
+    input:
+        bam = "results/prepped/{sample}.fixmate-coord.bam",
+    output:
+        out      = "results/runs/{sample}/samtools-markdup-S/rep{rep}/out.nsort.bam",
+        time_txt = "results/runs/{sample}/samtools-markdup-S/rep{rep}/time.txt",
+    threads: 4
+    resources:
+        bench = 100,
+    shell:
+        # See run_samtools_markdup for the flag rationale; `-S` adds the
+        # secondary/supplementary dup-flag propagation. Timed window emits
+        # L0 coordinate order; the untimed conversion name-sorts to L1.
+        r"""
+        rep=$(dirname {output.out})
+        tmpdir=$rep/markdup-tmp
+        mkdir -p "$tmpdir"
+        env time -v -o {output.time_txt} \
+            samtools markdup -d 100 -c -S -l 0 \
+                -T "$tmpdir/markdup" \
+                {input.bam} $rep/out.raw.bam
+        samtools sort -n -@ {threads} -l 1 -T "$tmpdir/sort" \
+            -o {output.out} $rep/out.raw.bam
+        rm -rf "$tmpdir" $rep/out.raw.bam
+        """
+
+
+rule run_samtools_markdup_seq_S:
+    """Like `run_samtools_markdup_S` but adds `-m s` (sequence mode).
+
+    Default markdup uses `-m t` (template mode), whose pair key folds R1/R2
+    (first/second-in-template) identity into the orientation for same-strand
+    (FF/RR) pairs — making it diverge from Picard and dupblaster, which are
+    coordinate-canonical and R1/R2-agnostic. Sequence mode keys on each
+    read's 5' end with no first/second distinction, the closer analogue to
+    Picard's keying. This row tests whether `-m s` tightens pair concordance
+    with Picard relative to the default `-m t`. `-S` is kept so supplementary
+    propagation matches the `samtools-markdup-S` row and only the mode
+    differs between them."""
+    input:
+        bam = "results/prepped/{sample}.fixmate-coord.bam",
+    output:
+        out      = "results/runs/{sample}/samtools-markdup-seq-S/rep{rep}/out.nsort.bam",
+        time_txt = "results/runs/{sample}/samtools-markdup-seq-S/rep{rep}/time.txt",
+    threads: 4
+    resources:
+        bench = 100,
+    shell:
+        # Identical to run_samtools_markdup_S except for `-m s`. Timed window
+        # emits L0 coordinate order; the untimed conversion name-sorts to L1.
+        r"""
+        rep=$(dirname {output.out})
+        tmpdir=$rep/markdup-tmp
+        mkdir -p "$tmpdir"
+        env time -v -o {output.time_txt} \
+            samtools markdup -d 100 -c -S -m s -l 0 \
+                -T "$tmpdir/markdup" \
+                {input.bam} $rep/out.raw.bam
+        samtools sort -n -@ {threads} -l 1 -T "$tmpdir/sort" \
+            -o {output.out} $rep/out.raw.bam
+        rm -rf "$tmpdir" $rep/out.raw.bam
+        """
+
+
+# ---- timing (/dev/null output) -------------------------------------------
+# A second, timing-only path that runs each tool writing its output to a
+# named FIFO drained to /dev/null. This models the real
+# `aligner | dupblaster | sorter` deployment: the tool's writer thread still
+# does all of its BGZF/SAM serialization (so that CPU is counted), but the
+# ~110 GB of output is never persisted, so wall/CPU/RSS reflect *compute*
+# rather than storage throughput. The input is pulled into the page cache
+# first (untimed `cat`), so on a host with RAM > input size the timed read is
+# RAM-speed and the streaming tools become compute-bound — directly
+# comparable across machines regardless of disk.
+#
+# This is deliberately separate from the run_<tool> rules above, which still
+# write real output files for the kf comparison. `collate_bench` reads the
+# time.devnull.txt produced here; `compare` reads the run_<tool> outputs.
+#
+# Picard is timed *vanilla* here (no TAG_DUPLICATE_KEY / TAGGING_POLICY /
+# TAG_DUPLICATE_SET_MEMBERS) — those exist only to feed the comparison and
+# cost CPU a normal user never pays; run_picard keeps them for `compare`.
+
+def _time_inputs(wildcards):
+    base = f"results/prepped/{wildcards.sample}"
+    tool = wildcards.tool
+    if tool in ("dupblaster-sam", "samblaster"):
+        return {"main": f"{base}.qnsort.sam"}
+    if tool.startswith("samtools-markdup"):
+        return {"main": f"{base}.fixmate-coord.bam"}
+    if tool == "dupsifter":
+        return {"main": f"{base}.qnsort.bam",
+                "ref": "results/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa"}
+    return {"main": f"{base}.qnsort.bam"}
+
+def _time_command(wildcards, input):
+    """The exact command timed for each tool, writing to the shell var $sink
+    (a FIFO) and using $tmp for any on-disk scratch (counted in the timed
+    window where the tool needs it — e.g. picard-exact's orphan buffer)."""
+    tool = wildcards.tool
+    bin = DUPBLASTER_BIN
+    def dupblaster(extra=""):
+        return f'{bin} -i {input.main} -o "$sink" {extra}--ignore-unmated --quiet'
+    if tool == "dupblaster-bam":           return dupblaster()
+    if tool == "dupblaster-sam":           return dupblaster()
+    if tool == "dupblaster-picard-approx": return dupblaster("--single-end-strategy picard-approx ")
+    if tool == "dupblaster-picard-exact":  return dupblaster('--single-end-strategy picard-exact --tmp-dir "$tmp" ')
+    if tool == "samblaster":               return f'samblaster --ignoreUnmated -i {input.main} -o "$sink"'
+    if tool == "dupsifter":                return f'dupsifter -W -o "$sink" -O "$tmp/stats.txt" {input.ref} {input.main}'
+    if tool == "picard":
+        return (f'java -Xmx{PICARD_HEAP} -jar {PICARD_JAR} MarkDuplicates '
+                f'INPUT={input.main} OUTPUT="$sink" METRICS_FILE="$tmp/metrics.txt" TMP_DIR="$tmp" '
+                f'ASSUME_SORT_ORDER=queryname OPTICAL_DUPLICATE_PIXEL_DISTANCE=100 '
+                f'REMOVE_DUPLICATES=false COMPRESSION_LEVEL=0 '
+                f'VALIDATION_STRINGENCY=LENIENT VERBOSITY=WARNING QUIET=true')
+    if tool == "samtools-markdup":       return f'samtools markdup -d 100 -c -l 0 -T "$tmp/md" {input.main} "$sink"'
+    if tool == "samtools-markdup-S":     return f'samtools markdup -d 100 -c -S -l 0 -T "$tmp/md" {input.main} "$sink"'
+    if tool == "samtools-markdup-seq-S": return f'samtools markdup -d 100 -c -S -m s -l 0 -T "$tmp/md" {input.main} "$sink"'
+    raise ValueError(f"no timing command for tool {tool!r}")
+
+def _time_ext(wildcards):
+    # samblaster and dupsifter emit SAM text; everything else emits BAM.
+    return "sam" if wildcards.tool in ("samblaster", "dupsifter") else "bam"
+
+rule time_tool:
+    """Time one tool writing to /dev/null (via a drained FIFO). Produces only
+    a GNU-time report; no output BAM. See the block comment above."""
+    input:
+        unpack(_time_inputs),
+    output:
+        time_txt = "results/runs/{sample}/{tool}/rep{rep}/time.devnull.txt",
+    wildcard_constraints:
+        tool = "|".join(TOOL_NAMES),
+    threads: 4
+    resources:
+        bench = 100,
+    params:
+        cmd = _time_command,
+        ext = _time_ext,
+    shell:
+        # Drain the FIFO to /dev/null in the background (the "downstream
+        # consumer"), pre-warm the input into page cache so the timed read is
+        # RAM-speed, then time the tool. `wait` on the drainer reaps it once
+        # the tool closes the FIFO (normal exit or crash both close the fd).
+        r"""
+        rep=$(dirname {output.time_txt})
+        tmp=$rep/devnull-tmp
+        rm -rf "$tmp"; mkdir -p "$tmp"
+        sink=$tmp/sink.{params.ext}
+        rm -f "$sink"; mkfifo "$sink"
+        # Drain the FIFO to /dev/null (the downstream "sorter" in the pipe).
+        cat "$sink" >/dev/null &
+        catpid=$!
+        # Hold a write fd so the drainer gets EOF (and we never hang on `wait`)
+        # even if the tool exits before opening its output.
+        exec 9>"$sink"
+        # Drop the page cache first so a previous tool's resident input can't
+        # crowd ours out: with both the 88 GB SAM and 67 GB BAM warm we'd
+        # exceed RAM (155 > 123 GiB) and thrash mid-read. After dropping, only
+        # this tool's input is pulled back in, so it stays fully resident and
+        # the timed read is genuinely RAM-speed.
+        #
+        # This is Linux-only (needs /proc/sys/vm/drop_caches, written directly
+        # if we're root or via passwordless sudo). On macOS or a host without
+        # passwordless sudo we warn and skip: the pre-warm below still runs, so
+        # we lose only cache-drop fidelity (timing may see warm-cache effects
+        # from a prior tool), never correctness. Keeps the pipeline runnable
+        # everywhere instead of failing the rule outright.
+        sync
+        if [ -w /proc/sys/vm/drop_caches ]; then
+            echo 3 > /proc/sys/vm/drop_caches
+        elif [ -e /proc/sys/vm/drop_caches ] && sudo -n true 2>/dev/null; then
+            sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+        else
+            echo "WARN: cannot drop page cache (no writable /proc/sys/vm/drop_caches and no passwordless sudo); timing may include warm-cache effects" >&2
+        fi
+        # Pre-warm the input into page cache so the timed read is RAM-speed.
+        cat {input} >/dev/null
+        # Time the tool writing to the FIFO; capture status so a tool failure
+        # surfaces instead of silently producing an empty time report.
+        status=0
+        env time -v -o {output.time_txt} {params.cmd} || status=$?
+        exec 9>&-
+        wait $catpid
+        rm -rf "$tmp"
+        exit $status
+        """
+
+
+# ---- aggregation ---------------------------------------------------------
+
+rule collate_bench:
+    """Walk every time.devnull.txt and emit one TSV row per (sample, tool, rep)."""
+    input:
+        expand("results/runs/{sample}/{tool}/rep{rep}/time.devnull.txt",
+               sample=SAMPLE_NAMES, tool=TOOL_NAMES, rep=REP_IDS),
+    output:
+        tsv = "results/bench.tsv",
+    params:
+        script = str(WORKDIR / "workflow" / "scripts" / "collate_bench.py"),
+    shell:
+        r"""
+        python {params.script} --root results/runs --output {output.tsv}
+        """
+
+
+rule compare:
+    """Single-pass kf comparison of every partner tool against Picard.
+
+    `bench-compare` co-streams Picard's kf-tagged output and each partner's
+    output (both the name-sorted L1 `out.nsort.bam` each run rule produces)
+    and emits, in ONE pass over the pair: per-set concordance
+    (`setcmp.tsv`), the four-bucket
+    orphan-discordance triage (`orphan_triage.tsv`), and per-tool dup-flag
+    inheritance (`inheritance.tsv`). This replaces the entire tcsort +
+    concordance_per_set + triage_orphans + check_inheritance machinery —
+    duplicate sets are read off Picard's `kf` tag rather than re-derived, and
+    no template-coordinate sort is needed (a plain name sort suffices)."""
+    input:
+        outs = lambda wc: [
+            f"results/runs/{s}/{t}/rep1/out.nsort.bam"
+            for s in SAMPLE_NAMES for t in TOOL_NAMES
+        ],
+    output:
+        setcmp      = "results/setcmp.tsv",
+        orphan      = "results/orphan_triage.tsv",
+        inheritance = "results/inheritance.tsv",
+    params:
+        bin      = BENCH_COMPARE_BIN,
+        samples  = SAMPLE_NAMES,
+        partners = [t for t in TOOL_NAMES if t != "picard"],
+    shell:
+        # Atomic TSVs: accumulate into `.tmp` files and only `mv` on success.
+        r"""
+        tmp_sc={output.setcmp}.tmp
+        tmp_or={output.orphan}.tmp
+        tmp_in={output.inheritance}.tmp
+        rm -f $tmp_sc $tmp_or $tmp_in
+        for sample in {params.samples}; do
+            picard_bam=results/runs/$sample/picard/rep1/out.nsort.bam
+            for partner in {params.partners}; do
+                partner_bam=results/runs/$sample/$partner/rep1/out.nsort.bam
+                {params.bin} \
+                    --sample $sample \
+                    --picard-bam $picard_bam \
+                    --partner-bam $partner_bam \
+                    --partner-label $partner \
+                    --setcmp-tsv $tmp_sc \
+                    --orphan-tsv $tmp_or \
+                    --inheritance-tsv $tmp_in \
+                    > results/runs/$sample/$partner/rep1/compare.txt
+            done
+        done
+        mv $tmp_sc {output.setcmp}
+        mv $tmp_or {output.orphan}
+        mv $tmp_in {output.inheritance}
+        """

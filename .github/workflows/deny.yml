@@ -1,0 +1,26 @@
+name: Supply chain (cargo-deny)
+
+# Runs on every PR (so a PR that adds a problematic dep fails review) and
+# on a weekly cron (so a newly published advisory against an existing dep
+# surfaces even on a quiet repo). Decoupled from the main test/lint
+# workflow so an advisory drop on Friday doesn't red-flag unrelated PRs.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 12 * * 1" # Mondays 12:00 UTC
+  workflow_dispatch:
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check advisories licenses bans sources

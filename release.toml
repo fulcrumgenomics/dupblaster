@@ -1,0 +1,39 @@
+# Configuration for cargo-release (https://github.com/crate-ci/cargo-release).
+#
+# One-time setup:
+#   cargo install cargo-release
+#
+# Cut a release:
+#   cargo release 0.1.0            # dry run — shows what would happen
+#   cargo release 0.1.0 --execute  # bumps the crate version, rewrites the
+#                                  # [Unreleased] section of CHANGELOG.md,
+#                                  # commits, tags v0.1.0, pushes, and
+#                                  # publishes to crates.io.
+
+# Publish to crates.io on release. Requires a crates.io token configured
+# on the maintainer's machine (`cargo login`).
+publish = true
+
+# Tag template: `vX.Y.Z`. Match git-tag conventions and what bioconda
+# recipes typically grep for.
+tag-name = "v{{version}}"
+
+# Match the commit-message style used for past version bumps.
+pre-release-commit-message = "Bump version to {{version}}"
+
+# Rewrite CHANGELOG.md at release time:
+#   1. Replace `## [Unreleased]` with `## [Unreleased]\n\n## [X.Y.Z] - YYYY-MM-DD`
+#      so the previous section is renamed and a fresh empty Unreleased
+#      section is left at the top for future work.
+#   2. Update the compare URL at the bottom of the file: the old
+#      `[Unreleased]: .../compare/HEAD` becomes
+#      `[Unreleased]: .../compare/vX.Y.Z...HEAD`, and a new
+#      `[X.Y.Z]: .../compare/vP.R.E...vX.Y.Z` line is appended.
+#
+# `prerelease = true` allows these to be no-ops on a fresh repo where
+# the previous tag doesn't exist yet (avoids "previous version not
+# found" errors before the first release).
+pre-release-replacements = [
+    { file = "CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
+    { file = "CHANGELOG.md", search = "\\[Unreleased\\]: https://github.com/fulcrumgenomics/dupblaster/compare/HEAD", replace = "[Unreleased]: https://github.com/fulcrumgenomics/dupblaster/compare/v{{version}}...HEAD\n[{{version}}]: https://github.com/fulcrumgenomics/dupblaster/releases/tag/v{{version}}", exactly = 1 },
+]

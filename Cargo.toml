@@ -1,0 +1,57 @@
+[workspace]
+# The root package (dupblaster) is the product; bench-compare is the
+# benchmark-suite comparison tool. Both are workspace members so CI
+# (cargo ci-test / ci-lint / ci-fmt, all run with --workspace) covers them.
+members = ["bench-compare"]
+
+[package]
+name = "dupblaster"
+version = "0.1.0"
+authors = ["Tim Fennell <tim@fulcrumgenomics.com>"]
+description = "Fast duplicate marking for query-grouped SAM/BAM files, inspired by samblaster and Picard MarkDuplicates"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/fulcrumgenomics/dupblaster"
+repository = "https://github.com/fulcrumgenomics/dupblaster"
+keywords = ["bioinformatics", "genomics", "sam", "bam", "duplicates"]
+categories = ["science::bioinformatics", "command-line-utilities"]
+# Ship only what's needed to build/use the crate; keep the benchmark, docs, and
+# CI trees out of the published tarball (README images load from raw URLs).
+exclude = ["/benchmark-pipeline", "/docs", "/.github"]
+
+[[bin]]
+name = "dupblaster"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bgzf = "0.3.0"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+env_logger = "0.11"
+fgoxide = "0.6"
+fgumi-raw-bam = "0.2.0"
+libc = "0.2"
+libdeflater = "1.25"
+log = "0.4"
+memchr = "2"
+mimalloc = { version = "0.1", default-features = false }
+noodles-sam = "0.85"
+ringbuf = "0.5"
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+wide = "1.4"
+
+[dev-dependencies]
+# Test-only: read dupblaster's BAM output back for assertions without
+# shelling out to `samtools`. noodles-util auto-detects SAM/BAM and yields
+# RecordBufs (tag order normalized — fine for tests); noodles-bam's lazy
+# reader is used where a test must see physically duplicate aux tags
+# (RecordBuf de-dupes them). Versions track noodles-sam 0.85.
+noodles-bam = "0.90"
+noodles-util = { version = "0.80", features = ["alignment"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

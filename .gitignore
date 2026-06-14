@@ -1,0 +1,5 @@
+/target
+*.swp
+.DS_Store
+.claude/
+/plans/
