@@ -179,8 +179,9 @@ pub struct LibraryStats {
     pub dup_count: u64,
     /// Templates whose primary reads are both unmapped — never dup-checked.
     pub both_unmapped_id_count: u64,
-    /// Templates with a single unmapped primary record (only under
-    /// `--ignore-unmated`).
+    /// Templates with a single unmapped primary: an unmapped single-end read
+    /// (always), or a paired primary whose mate is absent and itself unmapped
+    /// (only under `--ignore-unmated`).
     pub unmapped_orphan_id_count: u64,
     /// Templates with one mapped + one unmapped/absent primary read.
     pub mapped_orphan_id_count: u64,
@@ -486,6 +487,9 @@ impl RecordProcessor {
                 continue;
             }
             if f & FLAG_PAIRED == 0 {
+                // Single-end primary: there is no first/second distinction, so
+                // park it in `second`. The lone-primary branch below retrieves
+                // it via `first.or(second)` regardless of which slot is used.
                 second = Some(i);
             } else if f & FLAG_FIRST_SEGMENT != 0 {
                 first = Some(i);
@@ -509,9 +513,24 @@ impl RecordProcessor {
             let only_idx = first.or(second).expect("at least one primary present");
             let only_flags = block[only_idx].flags();
 
-            // Check UNMAPPED first: a single primary that is paired+unmapped
-            // is an unmapped orphan, not an "unmated" record. (Both conditions
-            // hold but the more specific one wins.)
+            // Single-end (unpaired) read: there is no mate, so none of the
+            // broken-pair / not-query-grouped conditions apply — the template
+            // is already complete. An unmapped SE read simply passes through
+            // untouched (counted as an unmapped orphan, never dup-checked); a
+            // mapped SE read enters fragment dedup. This must come before the
+            // paired-orphan handling below, which gates a *missing mate* behind
+            // --ignore-unmated; an SE read never had a mate to miss.
+            if !has(only_flags, FLAG_PAIRED) {
+                if has(only_flags, FLAG_UNMAPPED) {
+                    return Ok(BlockClass::UnmappedOrphan);
+                }
+                return Ok(BlockClass::Fragment { mapped: only_idx, mate: None });
+            }
+
+            // From here the read IS paired but its mate is absent from the
+            // block. Check UNMAPPED first: a paired+unmapped lone primary is an
+            // unmapped orphan, not an "unmated" record. (Both conditions hold
+            // but the more specific one wins.)
             if has(only_flags, FLAG_UNMAPPED) {
                 if self.opts.ignore_unmated {
                     return Ok(BlockClass::UnmappedOrphan);
@@ -520,14 +539,15 @@ impl RecordProcessor {
             }
             // Paired primary, mate flag says mate is *mapped*, but the mate
             // is missing from this block → input is not properly QNAME-grouped.
-            if has(only_flags, FLAG_PAIRED) && !has(only_flags, FLAG_MATE_UNMAPPED) {
+            if !has(only_flags, FLAG_MATE_UNMAPPED) {
                 if self.opts.ignore_unmated {
                     return Ok(BlockClass::Unmated);
                 }
                 bail!("{}", broken_block_message(block));
             }
-            // A lone mapped primary: a true single-end read, or a mapped
-            // orphan whose unmapped mate isn't in this block. No mate to tag.
+            // A paired primary that is mapped, with its mate flagged unmapped
+            // but absent from the block (e.g. unmapped mate filtered out
+            // upstream). A lone mapped orphan with no mate to tag.
             return Ok(BlockClass::Fragment { mapped: only_idx, mate: None });
         }
 
@@ -882,7 +902,9 @@ impl RecordProcessor {
 enum BlockClass {
     /// Both primary ends are unmapped — never dup-checked.
     BothUnmapped,
-    /// `--ignore-unmated`: the lone primary is unmapped (unmapped orphan).
+    /// A lone unmapped primary: an unmapped single-end read (always), or a
+    /// paired primary whose mate is absent and itself unmapped (under
+    /// `--ignore-unmated`). Emitted untouched, never dup-checked.
     UnmappedOrphan,
     /// `--ignore-unmated`: a paired primary whose mate should be mapped but is
     /// absent from the block (unmated / not properly query-grouped).

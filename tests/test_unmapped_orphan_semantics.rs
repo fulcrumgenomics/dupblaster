@@ -103,6 +103,69 @@ fn two_reverse_strand_single_end_orphans_at_same_position_are_dups() {
 }
 
 #[test]
+fn unmapped_single_end_read_passes_through_without_ignore_unmated() {
+    // Regression: a single-end *unmapped* read (FLAG_UNMAPPED, no PAIRED bit)
+    // is a complete template with no mate to find. It must pass straight
+    // through in default mode — not bail with the "can't find first/second of
+    // pair" broken-block error, which previously fired because the unmapped
+    // check was shared with the paired-orphan path. We mix it with a secondary
+    // alignment and a mapped SE read to mirror real single-end input.
+    let env = TestEnv::new();
+    SamBuilder::new()
+        .sq("chr1", 1_000_000)
+        // Unmapped SE read (flag 4) — the case that used to crash.
+        .record("rU", FLAG_UNMAPPED, "*", 0, 0, "*", "*", 0, 0, &"A".repeat(50), &"I".repeat(50))
+        // Mapped SE read plus a secondary alignment for the same QNAME.
+        .rec_simple("rM", 0, "chr1", 200, "50M", "*", 0, 0)
+        .rec_simple("rM", FLAG_SECONDARY, "chr1", 9000, "50M", "*", 0, 0)
+        .write_to(&env.input);
+    let bam_out = env._tmp.path().join("out.bam");
+    // No --ignore-unmated: this must succeed on the defaults.
+    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+
+    // Every input record is emitted, none marked duplicate (the unmapped read
+    // is never dup-checked; the lone mapped read has no other fragment).
+    assert_eq!(recs.len(), 3, "all records must pass through");
+    for (qname, flag) in &recs {
+        assert_eq!(flag & FLAG_DUPLICATE, 0, "{qname} (flag {flag}) must not be marked duplicate");
+    }
+    // The unmapped read is present and still flagged unmapped.
+    let unmapped = recs.iter().find(|(q, _)| q == "rU").expect("unmapped read in output");
+    assert_eq!(unmapped.1 & FLAG_UNMAPPED, FLAG_UNMAPPED);
+}
+
+#[test]
+fn unmapped_single_end_read_passes_through_in_picard_exact_mode() {
+    // picard-exact is the two-pass path most affected by single-end routing:
+    // fragments are buffered to a temp BAM and re-checked in pass 2, while
+    // unmapped/pair blocks stream straight out in pass 1. An unmapped SE read
+    // must take the pass-1 pass-through route and never be buffered or
+    // dup-checked. Pair the mapped SE read with a real duplicate so the
+    // fragment dedup path is exercised in the same run.
+    let env = TestEnv::new();
+    SamBuilder::new()
+        .sq("chr1", 1_000_000)
+        // Unmapped SE read — must pass through untouched.
+        .record("rU", FLAG_UNMAPPED, "*", 0, 0, "*", "*", 0, 0, &"A".repeat(50), &"I".repeat(50))
+        // Two identical forward SE reads at the same 5' position: rB is a dup of rA.
+        .rec_simple("rA", 0, "chr1", 200, "50M", "*", 0, 0)
+        .rec_simple("rB", 0, "chr1", 200, "50M", "*", 0, 0)
+        .write_to(&env.input);
+    let bam_out = env._tmp.path().join("out.bam");
+    let recs =
+        run_and_extract_flags(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]);
+
+    assert_eq!(recs.len(), 3, "all records must pass through");
+    // The unmapped SE read is emitted, never marked duplicate, still unmapped.
+    let unmapped = recs.iter().find(|(q, _)| q == "rU").expect("unmapped read in output");
+    assert_eq!(unmapped.1 & FLAG_DUPLICATE, 0, "unmapped SE read must not be marked dup");
+    assert_eq!(unmapped.1 & FLAG_UNMAPPED, FLAG_UNMAPPED);
+    // Fragment dedup still works in the same run: exactly one of rA/rB is a dup.
+    let dup_count = recs.iter().filter(|(q, f)| q != "rU" && f & FLAG_DUPLICATE != 0).count();
+    assert_eq!(dup_count, 1, "exactly one of the identical mapped SE reads is a dup");
+}
+
+#[test]
 fn two_reverse_strand_single_end_orphans_at_different_positions_are_not_dups() {
     let env = TestEnv::new();
     SamBuilder::new()

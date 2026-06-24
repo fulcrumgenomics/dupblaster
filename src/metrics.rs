@@ -61,8 +61,9 @@ pub struct Metrics {
     pub mapped_orphans: u64,
     /// Duplicates among `mapped_orphans`.
     pub duplicate_orphans: u64,
-    /// Single-record templates whose only record is unmapped (only under
-    /// `--ignore-unmated`).
+    /// Single-record templates whose only record is unmapped: an unmapped
+    /// single-end read (always), or a paired primary whose mate is absent and
+    /// itself unmapped (only under `--ignore-unmated`).
     pub unmapped_orphans: u64,
     /// Templates where both reads are unmapped — never dup-checked.
     pub unmapped_pairs: u64,
