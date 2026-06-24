@@ -18,8 +18,10 @@ publish = true
 # recipes typically grep for.
 tag-name = "v{{version}}"
 
-# Match the commit-message style used for past version bumps.
-pre-release-commit-message = "Bump version to {{next_version}}"
+# Match the commit-message style used for past version bumps. Use
+# `{{version}}` (the version being released); `{{next_version}}` is not
+# bound in the pre-release commit context and renders as a literal.
+pre-release-commit-message = "Bump version to {{version}}"
 
 # Rewrite CHANGELOG.md at release time:
 #   1. Replace `## [Unreleased]` with `## [Unreleased]\n\n## [X.Y.Z] - YYYY-MM-DD`
