@@ -6,7 +6,7 @@ members = ["bench-compare"]
 
 [package]
 name = "dupblaster"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Tim Fennell <tim@fulcrumgenomics.com>"]
 description = "Fast duplicate marking for query-grouped SAM/BAM files, inspired by samblaster and Picard MarkDuplicates"
 edition = "2024"
