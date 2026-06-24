@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Single-end **unmapped** reads (SAM flag `0x4` with no paired bit) no longer
+  abort the run with "Can't find first and/or second of pair". They now pass
+  through untouched — counted as unmapped orphans and never dup-checked, the
+  same as fully-unmapped pairs. Mapped single-end reads were already handled
+  correctly; only unmapped single-end reads were affected.
+
 ## [0.1.0] - 2026-06-14
 
 Initial release of dupblaster — a fast, streaming duplicate marker for
