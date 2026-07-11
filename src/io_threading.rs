@@ -40,6 +40,22 @@ fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Reconstruct an `io::Error` equivalent to `e` without consuming it.
+///
+/// `io::Error` is `!Clone` (it may wrap an arbitrary boxed payload), so the
+/// error slot is surfaced by *copying* rather than draining: every observer
+/// gets its own error and the original stays put. This is what makes the slot a
+/// write-once, read-many latch — the presence of an error is itself the sticky
+/// "this end has failed" state, so no separate flag is needed. OS errors
+/// round-trip losslessly (kind + errno + message); for other errors we preserve
+/// the kind and the `Display` message, which is the actionable part.
+fn clone_io_error(e: &io::Error) -> io::Error {
+    match e.raw_os_error() {
+        Some(code) => io::Error::from_raw_os_error(code),
+        None => io::Error::new(e.kind(), e.to_string()),
+    }
+}
+
 /// Join an IO thread to completion, ignoring its `()` result.
 ///
 /// A panic inside the IO loop is *not* lost despite the discarded join
@@ -58,17 +74,18 @@ fn join_io_thread(join: Option<JoinHandle<()>>) {
 /// `unpark` calls never run. Without this, a panic in the IO thread while
 /// the worker is parked on a full/empty ring would hang forever.
 ///
-/// On a panicking unwind it also records a fallback error (if none is set)
-/// so the panic surfaces as a clean failure rather than silent truncation.
+/// On a panicking unwind it also records a fallback error (if none is set) so
+/// the panic surfaces as a clean failure rather than silent truncation. That
+/// recorded error is the sticky failure state for both ends — the writer has no
+/// separate flag, and the reader additionally sets `eof` so a parked reader
+/// stops waiting for bytes that will never come.
 struct PanicGuard<'a> {
     /// The thread to wake when this guard fires (the counterpart IO end).
     counterpart: &'a thread::Thread,
     /// Shared error slot: records a fallback error message if we're panicking
-    /// and the slot is still empty.
+    /// and the slot is still empty. Never drained, so its presence is what tells
+    /// the counterpart this end has failed.
     error: &'a Mutex<Option<io::Error>>,
-    /// Sticky error flag to set on panic (writer side); `None` on the read
-    /// side, which signals failure via `eof` + the error slot instead.
-    errored: Option<&'a AtomicBool>,
     /// EOF flag to set on panic so a parked reader stops waiting; `None` on
     /// the write side.
     eof: Option<&'a AtomicBool>,
@@ -77,9 +94,6 @@ struct PanicGuard<'a> {
 impl Drop for PanicGuard<'_> {
     fn drop(&mut self) {
         if thread::panicking() {
-            if let Some(errored) = self.errored {
-                errored.store(true, Ordering::Release);
-            }
             if let Some(eof) = self.eof {
                 eof.store(true, Ordering::Release);
             }
@@ -134,9 +148,11 @@ impl ThreadedReader {
         Self { consumer, io_thread, eof, stop, error, join: Some(join) }
     }
 
-    /// Take the stored IO error out of the shared slot, leaving it empty.
-    fn take_error(&self) -> Option<io::Error> {
-        lock_or_recover(&self.error).take()
+    /// Copy the stored IO error, if any, leaving it in the slot (see
+    /// [`clone_io_error`]). Idempotent: re-reads keep surfacing the failure
+    /// rather than masking it as a clean EOF.
+    fn peek_error(&self) -> Option<io::Error> {
+        lock_or_recover(&self.error).as_ref().map(clone_io_error)
     }
 }
 
@@ -154,7 +170,7 @@ impl BufRead for ThreadedReader {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         loop {
             // Surface any IO-thread error first.
-            if let Some(e) = self.take_error() {
+            if let Some(e) = self.peek_error() {
                 return Err(e);
             }
 
@@ -210,12 +226,7 @@ fn io_read_loop<R: Read>(
 ) {
     // Wake the consumer on any exit (incl. panic) so it never parks against
     // a dead producer; on panic also flag EOF + record a fallback error.
-    let _guard = PanicGuard {
-        counterpart: &consumer_thread,
-        error: &error,
-        errored: None,
-        eof: Some(&*eof),
-    };
+    let _guard = PanicGuard { counterpart: &consumer_thread, error: &error, eof: Some(&*eof) };
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -273,15 +284,14 @@ pub struct ThreadedWriter {
     io_thread: thread::Thread,
     /// Set by `finish()` or `Drop` to signal the IO thread that no more data is coming.
     finished: Arc<AtomicBool>,
-    /// First write error from the IO thread, if any.
+    /// The IO thread's write error, if any. Written once by the IO thread and
+    /// never drained, so its presence is the sticky "this writer has failed"
+    /// state: every `write`/`flush`/`finish` copies it out (see [`peek_error`])
+    /// and rejects the operation, and a failed writer can never accept more
+    /// bytes into a ring its exited IO thread would never drain.
+    ///
+    /// [`peek_error`]: ThreadedWriter::peek_error
     error: Arc<Mutex<Option<io::Error>>>,
-    /// Sticky "an error occurred" flag. The rich `error` is `take`n by the
-    /// first `write`/`flush` that surfaces it, but this flag stays set so
-    /// `finish()` can never report success after a failed write even if the
-    /// error was already drained. Set by the IO thread *before* it stores
-    /// the error, so observing this flag implies the error slot is (or was)
-    /// populated.
-    errored: Arc<AtomicBool>,
     /// Join handle consumed by `Drop` to reap the IO thread.
     join: Option<JoinHandle<()>>,
 }
@@ -294,27 +304,25 @@ impl ThreadedWriter {
         let (producer, consumer) = rb.split();
         let finished = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
-        let errored = Arc::new(AtomicBool::new(false));
 
         let finished_io = finished.clone();
         let error_io = error.clone();
-        let errored_io = errored.clone();
         let producer_thread = thread::current();
 
         let join = thread::Builder::new()
             .name("dupblaster-io-write".into())
-            .spawn(move || {
-                io_write_loop(dst, consumer, finished_io, error_io, errored_io, producer_thread)
-            })
+            .spawn(move || io_write_loop(dst, consumer, finished_io, error_io, producer_thread))
             .expect("spawning IO write thread");
         let io_thread = join.thread().clone();
 
-        Self { producer, io_thread, finished, error, errored, join: Some(join) }
+        Self { producer, io_thread, finished, error, join: Some(join) }
     }
 
-    /// Take the stored IO error out of the shared slot, leaving it empty.
-    fn take_error(&self) -> Option<io::Error> {
-        lock_or_recover(&self.error).take()
+    /// Copy the stored IO error, if any, leaving it in the slot (see
+    /// [`clone_io_error`]). The slot is never drained, so this keeps surfacing
+    /// the failure on every call — including the re-entrant writes `Drop` makes.
+    fn peek_error(&self) -> Option<io::Error> {
+        lock_or_recover(&self.error).as_ref().map(clone_io_error)
     }
 
     /// Flush remaining bytes, signal the IO thread to drain, then join.
@@ -324,13 +332,8 @@ impl ThreadedWriter {
         self.finished.store(true, Ordering::Release);
         self.io_thread.unpark();
         join_io_thread(self.join.take());
-        if let Some(e) = self.take_error() {
+        if let Some(e) = self.peek_error() {
             return Err(e);
-        }
-        // The rich error may have already been drained by an earlier
-        // `write`/`flush`; the sticky flag guarantees we still fail here.
-        if self.errored.load(Ordering::Acquire) {
-            return Err(io::Error::other("IO write thread reported an error"));
         }
         Ok(())
     }
@@ -338,10 +341,15 @@ impl ThreadedWriter {
 
 impl Write for ThreadedWriter {
     fn write(&mut self, mut buf: &[u8]) -> io::Result<usize> {
-        // Surface any pending IO-thread error once per call, not per
-        // ring-push iteration. The previous per-iteration check acquired
-        // the `Mutex` ~150 M times on a 30 GB run.
-        if let Some(e) = self.take_error() {
+        // Surface any IO-thread error before touching the ring, and only once
+        // per call rather than per ring-push iteration (the previous
+        // per-iteration check locked the `Mutex` ~150 M times on a 30 GB run).
+        // Rejecting a write on a failed writer *up front* is what prevents the
+        // deadlock: otherwise we push into a ring the exited IO thread will
+        // never drain, fill it, and `park` forever with no one left to `unpark`
+        // us. This is exactly the re-entry `bgzf::Writer::Drop` performs (flush
+        // buffered blocks + write the EOF marker) after a broken pipe surfaced.
+        if let Some(e) = self.peek_error() {
             return Err(e);
         }
         let initial_len = buf.len();
@@ -359,11 +367,8 @@ impl Write for ThreadedWriter {
                 // re-check we'd loop forever pushing into a ring nobody
                 // drains. Surfacing the error here both reports the failure
                 // and breaks the deadlock.
-                if let Some(e) = self.take_error() {
+                if let Some(e) = self.peek_error() {
                     return Err(e);
-                }
-                if self.errored.load(Ordering::Acquire) {
-                    return Err(io::Error::other("IO write thread reported an error"));
                 }
             }
         }
@@ -373,7 +378,7 @@ impl Write for ThreadedWriter {
     fn flush(&mut self) -> io::Result<()> {
         // Nothing to flush at this layer — bytes are already in the ring
         // or written to `dst`. The IO thread does its own write_all.
-        if let Some(e) = self.take_error() {
+        if let Some(e) = self.peek_error() {
             return Err(e);
         }
         Ok(())
@@ -400,23 +405,16 @@ fn io_write_loop<W: Write>(
     mut consumer: HeapCons<u8>,
     finished: Arc<AtomicBool>,
     error: Arc<Mutex<Option<io::Error>>>,
-    errored: Arc<AtomicBool>,
     producer_thread: thread::Thread,
 ) {
     // Wake the producer on any exit (incl. panic) so it never parks against
-    // a dead consumer; on panic also set the sticky flag + a fallback error.
-    let _guard = PanicGuard {
-        counterpart: &producer_thread,
-        error: &error,
-        errored: Some(&*errored),
-        eof: None,
-    };
-    // Record an IO error: set the sticky flag *before* storing the rich
-    // error so any thread that observes `errored` is guaranteed the error
-    // slot is populated, then wake the producer (which may be parked on a
-    // full ring) so it can surface the failure instead of blocking forever.
+    // a dead consumer; on panic also record a fallback error.
+    let _guard = PanicGuard { counterpart: &producer_thread, error: &error, eof: None };
+    // Record an IO error into the shared slot, then wake the producer (which may
+    // be parked on a full ring) so it surfaces the failure instead of blocking
+    // forever. The slot is never drained, so this single write latches the
+    // failure for every future `write`/`flush`/`finish`.
     let record_error = |e: io::Error| {
-        errored.store(true, Ordering::Release);
         *lock_or_recover(&error) = Some(e);
         producer_thread.unpark();
     };
@@ -536,18 +534,137 @@ mod tests {
         assert!(errored, "a failing sink must surface as an error");
     }
 
-    /// Once a `write` has surfaced (and drained) the rich error, `finish()`
-    /// must still report failure via the sticky flag rather than falsely
-    /// returning `Ok`. Regression test for `take_error` clearing the slot.
+    /// Once a `write` has surfaced the rich error, `finish()` must also report
+    /// failure rather than falsely returning `Ok`. The error slot is a latch
+    /// that is never drained, so both calls observe it.
     #[test]
     fn threaded_writer_finish_fails_after_error_already_surfaced() {
         let ring = 4096;
         let payload = vec![7u8; 1024 * 1024];
         let mut w = ThreadedWriter::new(FailingSink, ring);
         // The oversized payload guarantees the producer parks and observes
-        // the error, so the first `write_all` returns `Err` and drains it.
+        // the error, so the first `write_all` returns `Err`.
         assert!(w.write_all(&payload).is_err());
-        assert!(w.finish().is_err(), "finish must stay failed after a drained error");
+        assert!(w.finish().is_err(), "finish must report the latched error too");
+    }
+
+    /// Number of iterations for the re-entrant-write stress test. Kept modest so
+    /// the default suite stays fast (each iteration spins up and tears down a
+    /// fresh IO thread); the deadlock (pre-fix) reproduces on the very first
+    /// iteration, and the fix has been verified locally across hundreds of
+    /// thousands of iterations via the `REENTRANT_STRESS_ITERS` override below.
+    const REENTRANT_STRESS_ITERS: usize = 2_000;
+
+    /// Re-entrant writes performed after the error is first surfaced. bgzf's
+    /// `Drop` re-enters the sink several times (one write per buffered block,
+    /// then the EOF marker, then a flush). The dying IO thread leaves at most a
+    /// couple of stray `unpark` tokens, each of which can rescue one parked
+    /// write; this count comfortably exceeds them so the pre-fix hang would
+    /// reproduce reliably rather than depending on `unpark` timing.
+    const REENTRANT_WRITES: usize = 16;
+
+    /// Run `body` on its own thread and wait up to 10 s for it to finish.
+    ///
+    /// Returns `Some(value)` if `body` completes, or `None` if it *deadlocks*
+    /// (parks forever). A non-deadlocked body finishes in microseconds, so the
+    /// 10 s bound only ever elapses on a genuine hang. On deadlock we repeatedly
+    /// `unpark` the stuck thread — each nudge lets `ThreadedWriter::write` fall
+    /// through to its post-park error re-check and return, and a body that
+    /// re-parks (a loop of writes, like bgzf's multi-write `Drop`) needs several
+    /// — then join it, so the stress test never leaks threads across iterations.
+    fn run_or_detect_deadlock<T, F>(body: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        use std::sync::mpsc::RecvTimeoutError;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = tx.send(body());
+        });
+        let handle = worker.thread().clone();
+        // Fast path: a healthy body reports back near-instantly.
+        if let Ok(value) = rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            worker.join().unwrap();
+            return Some(value);
+        }
+        // Deadlock path: keep nudging until the body unwinds and reports, then
+        // reap it. Bounded so a hang `unpark` can't clear doesn't wedge the
+        // suite — we detach and report rather than block the test binary.
+        for _ in 0..1000 {
+            handle.unpark();
+            match rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                Ok(_) => {
+                    worker.join().unwrap();
+                    return None;
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    worker.join().unwrap();
+                    return None;
+                }
+            }
+        }
+        std::mem::forget(worker);
+        None
+    }
+
+    /// Drive a `ThreadedWriter` over a failing sink to the exact deadlock state:
+    /// surface the write error, leaving the ring full and the IO thread gone,
+    /// then re-enter `write` repeatedly the way `bgzf::Writer::Drop` does.
+    /// Returns `true` iff every write surfaced an error. Without the fix one of
+    /// the re-entrant writes parks forever, so this never returns and the
+    /// watchdog reports a deadlock instead.
+    fn reentrant_write_after_error_surfaced(ring: usize) -> bool {
+        let mut w = ThreadedWriter::new(FailingSink, ring);
+        // Payload ≥ ring: the producer fills the ring and parks while the IO
+        // thread dies on its first write, so this surfaces the error and leaves
+        // the ring full with the IO thread already exited.
+        let mut all_errored = w.write_all(&vec![0u8; 2 * ring]).is_err();
+        for _ in 0..REENTRANT_WRITES {
+            all_errored &= w.write_all(b"trailing BGZF EOF marker").is_err();
+        }
+        all_errored
+    }
+
+    /// After a sink write fails and that error has been surfaced once, further
+    /// writes must return `Err` rather than park forever.
+    ///
+    /// This reproduces the re-entry `bgzf::Writer::Drop` performs while
+    /// unwinding: it flushes its block buffer and writes the BGZF EOF marker
+    /// back through this writer *after* a broken-pipe error already propagated
+    /// out. If a re-entrant write parks on a full ring whose IO thread has
+    /// exited, the process deadlocks in `Drop` — which is how a released
+    /// dupblaster hung for hours when its downstream sorter died on ENOSPC.
+    #[test]
+    fn threaded_writer_reentrant_write_after_error_does_not_deadlock() {
+        let all_errored =
+            run_or_detect_deadlock(|| reentrant_write_after_error_surfaced(64 * 1024)).expect(
+                "re-entrant write deadlocked: parked on a full ring whose IO thread had exited",
+            );
+        assert!(all_errored, "every write after a surfaced error must error, not succeed");
+    }
+
+    /// Stress the re-entrant-write path across many IO-thread lifetimes to shake
+    /// out the timing-dependent hang. Each iteration spins up a fresh writer +
+    /// IO thread, kills it via a failing sink, surfaces the error, then
+    /// re-enters. The pre-fix deadlock reproduces on the first iteration; the fix
+    /// must hold across all of them.
+    ///
+    /// Override the iteration count with `REENTRANT_STRESS_ITERS=<n>` to grind
+    /// on it harder (e.g. hundreds of thousands) when auditing the fix locally.
+    #[test]
+    fn threaded_writer_reentrant_write_stress_no_deadlock() {
+        let iters = std::env::var("REENTRANT_STRESS_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(REENTRANT_STRESS_ITERS);
+        for i in 0..iters {
+            let all_errored =
+                run_or_detect_deadlock(|| reentrant_write_after_error_surfaced(64 * 1024))
+                    .unwrap_or_else(|| panic!("iteration {i}: re-entrant write deadlocked"));
+            assert!(all_errored, "iteration {i}: every re-entrant write must surface an error");
+        }
     }
 
     /// A panic inside the IO write thread must not deadlock the producer and

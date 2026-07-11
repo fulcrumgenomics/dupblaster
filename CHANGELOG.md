@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a deadlock where dupblaster could hang indefinitely — instead of exiting with an error — when the process downstream of it in a pipe died (e.g. `… | dupblaster --output - | sorter` where `sorter` exits on a full disk). After the broken-pipe error was surfaced once, the threaded writer would accept further writes into a ring buffer its already-exited IO thread could never drain, then park forever waiting to be woken. The re-entrant write that the `bgzf` writer performs while being dropped (flushing buffered blocks and the BGZF EOF marker) triggered exactly this. The threaded writer now rejects all writes and flushes once its IO thread has reported an error, so the failure propagates and the process exits non-zero.
+
 ## [0.1.1] - 2026-06-24
 
 ### Fixed
