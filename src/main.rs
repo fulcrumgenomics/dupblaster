@@ -607,10 +607,13 @@ fn run(args: Args) -> Result<ExitCode> {
         write_rows_to_path(&rows, stats_path).context("writing --stats TSV")?;
     }
 
+    // `--complexity-metrics <PREFIX>`, shared by the two QC blocks below.
+    let prefix = args.complexity_metrics.as_deref();
+
     // Emit the duplicate-rate ladder (only when `--complexity-metrics` was set,
     // which is the only case `ladder` is `Some`). `finalize` appends the final
     // per-library snapshot and sorts rows for a stable file order.
-    if let (Some(mut rec), Some(prefix)) = (ladder, args.complexity_metrics.as_deref()) {
+    if let (Some(mut rec), Some(prefix)) = (ladder, prefix) {
         rec.finalize(&stats);
         let path = ladder_path(prefix);
         write_ladder_rows(rec.rows(), &path).context("writing duplication-sampled TSV")?;
@@ -620,7 +623,7 @@ fn run(args: Args) -> Result<ExitCode> {
 
     // Group-size histogram (η_k), from the per-library occurrence counts. Only
     // populated when `--complexity-metrics` was set (so `counts()` is `Some`).
-    if let (Some(prefix), Some(counts)) = (args.complexity_metrics.as_deref(), processor.counts()) {
+    if let (Some(prefix), Some(counts)) = (prefix, processor.counts()) {
         let sample = resolve_sample(&header, args.sample.as_deref());
         let rows = histogram_rows(counts, &stats, &sample);
         write_histogram_rows(&rows, &histogram_path(prefix))

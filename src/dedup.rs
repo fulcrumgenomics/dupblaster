@@ -672,8 +672,8 @@ impl RecordProcessor {
                 frag.check_or_insert(s_derived.bin_num, s_derived.bin_pos, s_derived.is_reverse);
         }
         // Complexity-metrics counting (only when `--complexity-metrics` is on).
-        // Uses the same canonicalized ends `a`/`b` fed to `check_dm`, so a
-        // counted signature matches the dedup signature exactly.
+        // Reuses the same `slot` fed to `insert_pair`, so a counted signature
+        // matches the dedup signature exactly.
         if let Some(counts) = self.counts.as_mut() {
             counts[lib as usize].observe_pair(slot, is_dup);
         }
