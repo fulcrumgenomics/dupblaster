@@ -1037,7 +1037,7 @@ fn write_cigar_text<I: IntoIterator<Item = u32>>(ops: I, out: &mut Vec<u8>) {
         let len = word >> 4;
         let code = (word & 0xf) as usize;
         // Same op-code table as `parse_cigar_ops` in sam_reader.rs.
-        const OPS: [u8; 9] = [b'M', b'I', b'D', b'N', b'S', b'H', b'P', b'=', b'X'];
+        const OPS: [u8; 9] = *b"MIDNSHP=X";
         // itoa would be faster, but `write!` into a Vec<u8> uses no
         // intermediate heap allocation — the lookup-table-based digit
         // path in core::fmt fills directly into our buffer.
