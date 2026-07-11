@@ -311,6 +311,54 @@ pub enum MethylationMode {
     Directional,
 }
 
+// ── partitioning + shared signature slots ──────────────────────────────────
+
+/// Cell-row stride for a partitioned table: `(bin_count + 1) * 2`. A cell index
+/// `s = bin_num*2 + strand` runs `[0, stride)`, so a 2D pair table needs
+/// `stride²` cells and a 1D single-end table `stride`. Shared by the dedup
+/// [`DupTable`] and the complexity-metrics count side-table so both partition
+/// identically.
+#[inline]
+pub(crate) fn stride_for(bin_count: u32) -> u32 {
+    (bin_count + 1) * 2
+}
+
+/// A resolved position in a partitioned table: the cell offset `off` and the
+/// within-cell signature `sig`.
+///
+/// Computed once per observation (from an alignment's canonicalized
+/// coordinates) and reused for **both** the dedup [`DupTable`] check and the
+/// `--complexity-metrics` count side-table, so the signature is never recomputed
+/// just to touch the counter — and the two structures group signatures
+/// identically by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Slot<S> {
+    /// Partition cell index.
+    pub off: usize,
+    /// Within-cell signature.
+    pub sig: S,
+}
+
+/// Pair signature slot: `u64` sig `(bin_pos1 << 32) | bin_pos2`, into `stride²` cells.
+pub(crate) type PairSlot = Slot<u64>;
+/// Single-end / orphan signature slot: `u32` sig `bin_pos`, into `stride` cells.
+pub(crate) type FragmentSlot = Slot<u32>;
+
+/// Compute the single-end / orphan slot: cell `s = bin_num*2 + strand` (strand
+/// dropped when `!strand_aware` — i.e. samblaster-legacy, which keys orphans
+/// strand-obliviously) and `sig = bin_pos`. Shared by the fragment/orphan dedup
+/// keying and the single-end count table so they group identically.
+#[inline]
+pub(crate) fn single_end_slot(
+    bin_num: u32,
+    bin_pos: u32,
+    rev: bool,
+    strand_aware: bool,
+) -> FragmentSlot {
+    let s = bin_num * 2 + (rev && strand_aware) as u32;
+    Slot { off: s as usize, sig: bin_pos }
+}
+
 // ── DupTable: partitioned dedup hash sets ──────────────────────────────────
 
 /// Partitioned hash table holding dedup signatures.
@@ -387,7 +435,7 @@ where
     /// `cell_cap` is the initial bucket capacity pre-allocated for each
     /// partition cell (see `with_n_cells`).
     pub fn new_pair(bin_count: u32, cell_cap: usize) -> Self {
-        let stride = (bin_count + 1) * 2;
+        let stride = stride_for(bin_count);
         let n = (stride as usize).saturating_mul(stride as usize);
         Self::with_n_cells(stride, n, cell_cap)
     }
@@ -398,7 +446,7 @@ where
     /// `stride²` − `stride` empty cells the 2D layout would otherwise
     /// allocate.
     pub fn new_single_end(bin_count: u32, cell_cap: usize) -> Self {
-        let stride = (bin_count + 1) * 2;
+        let stride = stride_for(bin_count);
         let n = stride as usize;
         Self::with_n_cells(stride, n, cell_cap)
     }
@@ -421,67 +469,47 @@ where
 // ── pair-table-specific operations (u64 sigs) ──────────────────────────────
 
 impl PairDupTable {
-    /// Insert and check the doubly-mapped (DM) signature. Returns `true`
-    /// if this signature was already present (i.e. the pair is a
-    /// duplicate). Caller must ensure the table was built with
-    /// [`Self::new_pair`].
+    /// Compute the pair [`Slot`] for two already-canonicalized ends: cell
+    /// `s1*stride + s2` (with `s = bin_num*2 + strand`) and the `u64` signature
+    /// `(bin_pos1 << 32) | bin_pos2`. Pure — the caller reuses the returned slot
+    /// for the count side-table so the signature is computed only once.
     #[inline]
-    pub fn check_dm(
-        &mut self,
+    pub(crate) fn pair_slot(
+        &self,
         bin_num1: u32,
         bin_pos1: u32,
         rev1: bool,
         bin_num2: u32,
         bin_pos2: u32,
         rev2: bool,
-    ) -> bool {
+    ) -> PairSlot {
         let s1 = bin_num1 * 2 + (rev1 as u32);
         let s2 = bin_num2 * 2 + (rev2 as u32);
-        let off = (s1 * self.stride + s2) as usize;
-        let sig = ((bin_pos1 as u64) << 32) | (bin_pos2 as u64);
-        !self.sets[off].insert(sig)
+        Slot {
+            off: (s1 * self.stride + s2) as usize,
+            sig: ((bin_pos1 as u64) << 32) | (bin_pos2 as u64),
+        }
     }
 
-    /// Insert and check the orphan / single-end signature on the pair
-    /// table (used by `StrandAware` and `SamblasterLegacy`, which don't
-    /// allocate a separate fragment table). The first side is the
-    /// (placeholder) unmapped read — its `s1` and `bin_pos` contribute
-    /// zero.
-    ///
-    /// Only `StrandAware` and `SamblasterLegacy` reach this method —
-    /// `PicardApprox` / `PicardExact` key orphans on their own
-    /// [`FragmentDupTable`] instead, never here.
-    ///
-    /// * [`SingleEndStrategy::StrandAware`]: `s2 = bin_num*2 + (rev as u32)`
-    ///   — strand-aware, so a forward orphan and a reverse orphan at the
-    ///   same 5'-aligned position land in different cells and are *not*
-    ///   duplicates of each other.
-    /// * [`SingleEndStrategy::SamblasterLegacy`]: `s2 = bin_num*2` —
-    ///   strand bit is dropped, so any two orphans whose alignments
-    ///   share a leftmost-aligned coordinate (the upstream caller is
-    ///   expected to pass that coordinate via `bin_pos2`) collide,
-    ///   regardless of strand.
+    /// Insert a precomputed pair slot; returns `true` if it was already present
+    /// (the pair is a duplicate). Caller must ensure the table was built with
+    /// [`Self::new_pair`] (so `slot.off < stride²`).
     #[inline]
-    pub fn check_orphan(
-        &mut self,
-        bin_num2: u32,
-        bin_pos2: u32,
-        rev2: bool,
-        strategy: SingleEndStrategy,
-    ) -> bool {
-        let s2 = match strategy {
-            SingleEndStrategy::StrandAware => bin_num2 * 2 + (rev2 as u32),
-            SingleEndStrategy::SamblasterLegacy => bin_num2 * 2,
-            // The picard strategies route orphans through a FragmentDupTable
-            // (see `check_fragment_signature` in `dedup.rs`), never here;
-            // panic loudly if a future refactor wires them in by mistake.
-            SingleEndStrategy::PicardApprox | SingleEndStrategy::PicardExact => {
-                unreachable!("check_orphan is only reached from StrandAware/SamblasterLegacy")
-            }
-        };
-        let off = s2 as usize;
-        let sig = bin_pos2 as u64;
-        !self.sets[off].insert(sig)
+    pub(crate) fn insert_pair(&mut self, slot: PairSlot) -> bool {
+        !self.sets[slot.off].insert(slot.sig)
+    }
+
+    /// Insert a precomputed orphan slot on the pair table's `s1 = 0` row
+    /// (`slot.off < stride`); returns `true` if already present. The `u32`
+    /// signature widens to the cell's `u64`.
+    ///
+    /// Reached only under `StrandAware` / `SamblasterLegacy` (the strand-drop
+    /// for the latter is applied in [`single_end_slot`], which generated the
+    /// slot); `PicardApprox` / `PicardExact` key orphans on their own
+    /// [`FragmentDupTable`] instead.
+    #[inline]
+    pub(crate) fn insert_orphan(&mut self, slot: FragmentSlot) -> bool {
+        !self.sets[slot.off].insert(slot.sig as u64)
     }
 
     /// Consume every stored pair signature, inserting *both* 5'-aligned ends
@@ -546,9 +574,15 @@ impl FragmentDupTable {
     /// (paired-end-end inserts in `RecordProcessor`) simply ignore it.
     #[inline]
     pub fn check_or_insert(&mut self, bin_num: u32, bin_pos: u32, rev: bool) -> bool {
-        let s = bin_num * 2 + (rev as u32);
-        let off = s as usize;
-        !self.sets[off].insert(bin_pos)
+        // Fragment keying is always strand-aware (allocated only under
+        // PicardApprox, which has no legacy strand-drop variant).
+        self.insert(single_end_slot(bin_num, bin_pos, rev, true))
+    }
+
+    /// Insert a precomputed fragment slot; returns `true` if already present.
+    #[inline]
+    pub(crate) fn insert(&mut self, slot: FragmentSlot) -> bool {
+        !self.sets[slot.off].insert(slot.sig)
     }
 }
 
@@ -589,45 +623,60 @@ mod tests {
     #[test]
     fn dm_repeat_detected_as_duplicate() {
         let mut t = PairDupTable::new_pair(8, 64);
-        assert!(!t.check_dm(1, 100, false, 2, 200, true));
-        assert!(t.check_dm(1, 100, false, 2, 200, true));
+        let s = t.pair_slot(1, 100, false, 2, 200, true);
+        assert!(!t.insert_pair(s));
+        assert!(t.insert_pair(s));
     }
 
     #[test]
     fn dm_strand_differs_no_collision() {
         let mut t = PairDupTable::new_pair(8, 64);
-        assert!(!t.check_dm(1, 100, false, 2, 200, false));
-        // Different strand on the second alignment → different cell.
-        assert!(!t.check_dm(1, 100, false, 2, 200, true));
+        let fwd = t.pair_slot(1, 100, false, 2, 200, false);
+        let rev = t.pair_slot(1, 100, false, 2, 200, true);
+        assert!(!t.insert_pair(fwd));
+        // Different strand on the second end → different cell.
+        assert!(!t.insert_pair(rev));
+    }
+
+    #[test]
+    fn single_end_slot_is_strand_aware_unless_legacy() {
+        // Strand-aware: forward and reverse at the same coord get different cells.
+        let fwd = single_end_slot(3, 555, false, true);
+        let rev = single_end_slot(3, 555, true, true);
+        assert_ne!(fwd.off, rev.off, "strand-aware fwd/rev must land in different cells");
+        assert_eq!(fwd.sig, rev.sig);
+        // Strand-oblivious (samblaster-legacy): they collapse to one slot.
+        assert_eq!(
+            single_end_slot(3, 555, false, false),
+            single_end_slot(3, 555, true, false),
+            "legacy fwd/rev must be the same slot"
+        );
     }
 
     #[test]
     fn strand_aware_orphan_repeat_detected() {
         let mut t = PairDupTable::new_pair(8, 64);
-        // Two reverse-strand orphans with the same strand-aware 5' coord
-        // (the caller already passed `rev2=true` and the 5'-aligned bin_pos).
-        assert!(!t.check_orphan(3, 555, true, SingleEndStrategy::StrandAware));
-        assert!(t.check_orphan(3, 555, true, SingleEndStrategy::StrandAware));
+        // Two reverse-strand orphans with the same strand-aware 5' coord.
+        let s = single_end_slot(3, 555, true, true);
+        assert!(!t.insert_orphan(s));
+        assert!(t.insert_orphan(s));
     }
 
     #[test]
     fn strand_aware_orphan_fwd_rev_do_not_collide() {
         let mut t = PairDupTable::new_pair(8, 64);
-        // Forward orphan at bin (3, 555) and reverse orphan at the same
-        // (3, 555) — under StrandAware they go to different cells and
-        // do NOT collide.
-        assert!(!t.check_orphan(3, 555, false, SingleEndStrategy::StrandAware));
-        assert!(!t.check_orphan(3, 555, true, SingleEndStrategy::StrandAware));
+        // Forward and reverse orphan at the same (3, 555): under strand-aware
+        // keying they go to different cells and do NOT collide.
+        assert!(!t.insert_orphan(single_end_slot(3, 555, false, true)));
+        assert!(!t.insert_orphan(single_end_slot(3, 555, true, true)));
     }
 
     #[test]
     fn samblaster_legacy_orphan_fwd_rev_collide() {
         let mut t = PairDupTable::new_pair(8, 64);
-        // Same locus — strand is intentionally not part of the key for
-        // SamblasterLegacy (the caller is expected to pass the leftmost-
-        // aligned coord via bin_pos2, regardless of strand).
-        assert!(!t.check_orphan(3, 555, false, SingleEndStrategy::SamblasterLegacy));
-        assert!(t.check_orphan(3, 555, true, SingleEndStrategy::SamblasterLegacy));
+        // Strand is dropped (legacy), so fwd then rev at the same coord collide.
+        assert!(!t.insert_orphan(single_end_slot(3, 555, false, false)));
+        assert!(t.insert_orphan(single_end_slot(3, 555, true, false)));
     }
 
     #[test]
@@ -650,7 +699,8 @@ mod tests {
     fn drain_recovers_both_pair_ends_into_fragment_table() {
         let mut pairs = PairDupTable::new_pair(8, 64);
         // Insert one pair: end A = (bin 1, pos 100, fwd), end B = (bin 2, pos 200, rev).
-        assert!(!pairs.check_dm(1, 100, false, 2, 200, true));
+        let s = pairs.pair_slot(1, 100, false, 2, 200, true);
+        assert!(!pairs.insert_pair(s));
         let mut frag = pairs.drain_into_fragment_table(64);
         // Both ends of the pair are now present in the fragment table: a
         // re-insert at either coordinate reports a collision.
@@ -664,7 +714,8 @@ mod tests {
     fn drain_is_strand_aware() {
         let mut pairs = PairDupTable::new_pair(8, 64);
         // Pair end at (bin 4, pos 555, forward).
-        assert!(!pairs.check_dm(4, 555, false, 5, 600, false));
+        let s = pairs.pair_slot(4, 555, false, 5, 600, false);
+        assert!(!pairs.insert_pair(s));
         let mut frag = pairs.drain_into_fragment_table(64);
         // The forward end collides; the reverse-strand coordinate at the same
         // bin/pos is a distinct key and does not.

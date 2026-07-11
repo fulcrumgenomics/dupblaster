@@ -13,9 +13,13 @@
 //! see README for the rationale.
 
 mod cigar;
+mod complexity;
+mod counts;
+mod countset;
 mod dedup;
 mod io_threading;
 mod metrics;
+mod plots;
 mod raw_reader;
 mod raw_writer;
 mod sam_reader;
@@ -23,7 +27,7 @@ mod sig;
 
 use std::fs::File;
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -36,9 +40,11 @@ use noodles_sam::header::record::value::Map;
 use noodles_sam::header::record::value::map::Program;
 use noodles_sam::header::record::value::map::program::tag as program_tag;
 
+use crate::complexity::{LadderRecorder, ladder_path, write_ladder_rows};
+use crate::counts::{histogram_path, histogram_rows, write_histogram_rows};
 use crate::dedup::{LibraryIndex, ProcessorOptions, RecordProcessor, Stats};
 use crate::io_threading::ThreadedReader;
-use crate::metrics::{Metrics, write_rows_to_path};
+use crate::metrics::{Metrics, resolve_sample, write_rows_to_path};
 use crate::raw_reader::RawBamReader;
 use crate::raw_writer::RawBamWriter;
 use crate::sam_reader::SamReader;
@@ -250,6 +256,29 @@ pub struct Args {
     #[arg(long = "sample")]
     pub sample: Option<String>,
 
+    /// Enable duplication-complexity metrics, writing four per-library QC files
+    /// with this path prefix — a TSV and a PDF plot for each of:
+    ///   `<PREFIX>.duplication-sampled.{tsv,pdf}`   — duplicate rate vs. sequencing
+    ///     depth, sampled every `--complexity-interval` templates; and
+    ///   `<PREFIX>.duplication-spectrum.{tsv,pdf}`  — the group-size histogram η_k:
+    ///     how many molecules were seen 1×, 2×, … (multi-library plots are faceted
+    ///     into the one PDF).
+    /// Each library is reported on one category: its paired subset (`pairs`) if it
+    /// has any pairs — the clean two-endpoint estimator — else its single-end
+    /// signatures (`single_end`) for a solely single-end library. Works under any
+    /// --single-end-strategy. Off by default; when unset, no extra work or memory
+    /// is spent.
+    #[arg(long = "complexity-metrics")]
+    pub complexity_metrics: Option<PathBuf>,
+
+    /// Snapshot cadence for the `--complexity-metrics` ladder, in templates.
+    /// A row group is emitted every N templates per library (plus a final row
+    /// at the true total). Only meaningful with `--complexity-metrics`.
+    #[arg(long = "complexity-interval",
+          default_value_t = 1_000_000,
+          value_parser = clap::value_parser!(u64).range(1..))]
+    pub complexity_interval: u64,
+
     /// Output fewer statistics.
     #[arg(short = 'q', long = "quiet")]
     pub quiet: bool,
@@ -370,6 +399,26 @@ fn main() -> ExitCode {
 /// Run dupblaster end to end: detect the input format, wire reader → processor
 /// → writer, drive the QNAME-block loop, and emit the summary, metrics, and
 /// resource footer. Returns the process exit code.
+/// Fail fast if the directory that would hold `path` (an output file, or the
+/// prefix the `--complexity-metrics` files derive from) is missing or not
+/// writable — so a bad location errors up front instead of after a full
+/// processing pass (those files are written only at the end). Probes by creating
+/// and removing a temp file in that directory.
+fn ensure_dir_writable(path: &Path, flag: &str) -> Result<()> {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if !dir.is_dir() {
+        bail!("{flag}: output directory {} does not exist", dir.display());
+    }
+    let probe = dir.join(format!(".dupblaster-write-probe.{}", std::process::id()));
+    std::fs::File::create(&probe)
+        .and_then(|_| std::fs::remove_file(&probe))
+        .with_context(|| format!("{flag}: cannot write to output directory {}", dir.display()))?;
+    Ok(())
+}
+
 fn run(args: Args) -> Result<ExitCode> {
     if args.show_version {
         // Version goes to stdout (not stderr) so `dupblaster --version | head`
@@ -378,6 +427,16 @@ fn run(args: Args) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     args.validate()?;
+    // Fail fast if the optional QC outputs (written only at the very end) can't
+    // be created, rather than after a full processing pass. The main `-o` output
+    // is validated separately when its writer is opened, below.
+    if let Some(stats) = args.stats.as_deref() {
+        ensure_dir_writable(stats, "--stats")?;
+    }
+    if let Some(prefix) = args.complexity_metrics.as_deref() {
+        // All four complexity files share the prefix's directory.
+        ensure_dir_writable(prefix, "--complexity-metrics")?;
+    }
     let started = StartedRun::now();
     if !args.quiet {
         eprintln!("dupblaster: Version {DUPBLASTER_BUILD}");
@@ -489,29 +548,86 @@ fn run(args: Args) -> Result<ExitCode> {
         }
     }
 
+    // Optional duplication-complexity metrics. The recorder and per-library
+    // counters are constructed only when `--complexity-metrics` is set, so the
+    // default path allocates nothing and its performance/RSS are unchanged.
+    // Works under every single-end strategy: each library is reported on its
+    // paired subset when it has any pairs (a strategy-independent key), and on
+    // single-end signatures only when it has none — the case where the fragment
+    // keyspace is guaranteed free of pair-ends and so is clean under Picard too.
+    let mut ladder = args.complexity_metrics.as_ref().map(|_| {
+        LadderRecorder::new(
+            num_libs as usize,
+            args.complexity_interval,
+            resolve_sample(&header, args.sample.as_deref()),
+        )
+    });
+
     // dupblaster requires query-grouped input: records are read in maximal
     // runs sharing a QNAME ("blocks") and each block is processed as a unit.
     // `for_each_block` owns that grouping loop. picard-exact takes a separate
     // two-pass driver (pairs stream out, fragments are buffered then
     // re-processed); every other strategy is a single streaming pass.
     if args.single_end_strategy.to_strategy() == SingleEndStrategy::PicardExact {
-        run_picard_exact(&mut reader, &mut processor, &mut stats, &mut out, &header, &args)?;
+        run_picard_exact(
+            &mut reader,
+            &mut processor,
+            &mut stats,
+            &mut out,
+            &header,
+            &args,
+            &mut ladder,
+        )?;
     } else {
         let mut pool: Vec<RawRecord> = Vec::with_capacity(8);
         for_each_block(&mut reader, &mut pool, |block| {
-            processor.process_block(block, &mut stats, &mut out)
+            let lib = processor.process_block(block, &mut stats, &mut out)?;
+            // One comparison per template in the common case; the recorder
+            // snapshots only when a library crosses an interval boundary.
+            if let Some(rec) = ladder.as_mut() {
+                rec.observe(lib, &stats.libraries[lib as usize]);
+            }
+            Ok(())
         })
         .context("processing record block")?;
     }
 
     print_run_stats(&stats, &args);
 
+    // Finalize the primary BAM output *before* writing the optional QC side
+    // files (`--stats`, `--complexity-metrics`). Their rows/counts are already
+    // fully in memory, so a hiccup writing them (a bad prefix path, a full disk,
+    // a kuva render error) must not abort the run before `finish()` has flushed
+    // the BGZF EOF block and surfaced any main-output write error — an error
+    // that relying on `Drop` alone would silently swallow.
+    out.finish().context("finishing main output")?;
+
     if let Some(stats_path) = args.stats.as_deref() {
         let rows = Metrics::rows_from_stats(&stats, &header, args.sample.as_deref());
         write_rows_to_path(&rows, stats_path).context("writing --stats TSV")?;
     }
 
-    out.finish().context("finishing main output")?;
+    // Emit the duplicate-rate ladder (only when `--complexity-metrics` was set,
+    // which is the only case `ladder` is `Some`). `finalize` appends the final
+    // per-library snapshot and sorts rows for a stable file order.
+    if let (Some(mut rec), Some(prefix)) = (ladder, args.complexity_metrics.as_deref()) {
+        rec.finalize(&stats);
+        let path = ladder_path(prefix);
+        write_ladder_rows(rec.rows(), &path).context("writing duplication-sampled TSV")?;
+        plots::write_duplicate_ladder_pdf(rec.rows(), &plots::ladder_plot_path(prefix))
+            .context("writing duplication-sampled plot")?;
+    }
+
+    // Group-size histogram (η_k), from the per-library occurrence counts. Only
+    // populated when `--complexity-metrics` was set (so `counts()` is `Some`).
+    if let (Some(prefix), Some(counts)) = (args.complexity_metrics.as_deref(), processor.counts()) {
+        let sample = resolve_sample(&header, args.sample.as_deref());
+        let rows = histogram_rows(counts, &stats, &sample);
+        write_histogram_rows(&rows, &histogram_path(prefix))
+            .context("writing duplication-spectrum TSV")?;
+        plots::write_count_histogram_pdfs(&rows, prefix)
+            .context("writing duplication-spectrum plot")?;
+    }
 
     // Footer (wall/CPU/RSS) is emitted *after* output finalization so its
     // numbers include any flush/close time.
@@ -538,6 +654,7 @@ fn processor_options(args: &Args) -> ProcessorOptions {
         max_read_length: args.max_read_length,
         single_end_strategy: args.single_end_strategy.to_strategy(),
         methylation_mode: args.methylation_mode.map(MethylationModeCli::to_mode),
+        collect_counts: args.complexity_metrics.is_some(),
     }
 }
 
@@ -664,6 +781,7 @@ fn run_picard_exact(
     out: &mut RawBamWriter,
     header: &Header,
     args: &Args,
+    ladder: &mut Option<LadderRecorder>,
 ) -> Result<()> {
     // A modest ring is plenty: fragments are a small fraction of paired data,
     // and this writer targets local disk rather than a bursty downstream.
@@ -685,7 +803,11 @@ fn run_picard_exact(
             .context("opening temp orphan BAM")?;
         let mut pool: Vec<RawRecord> = Vec::with_capacity(8);
         for_each_block(reader, &mut pool, |block| {
-            processor.process_block_phase1(block, stats, out, &mut temp_writer)
+            let lib = processor.process_block_phase1(block, stats, out, &mut temp_writer)?;
+            if let Some(rec) = ladder.as_mut() {
+                rec.observe(lib, &stats.libraries[lib as usize]);
+            }
+            Ok(())
         })
         .context("processing record block (picard-exact pass 1)")?;
         temp_writer.finish().context("finishing temp orphan BAM")?;
@@ -703,7 +825,11 @@ fn run_picard_exact(
     temp_reader.read_header().context("reading temp orphan BAM header")?;
     let mut pool: Vec<RawRecord> = Vec::with_capacity(8);
     for_each_block(&mut temp_reader, &mut pool, |block| {
-        processor.process_fragment_block(block, stats, out)
+        let lib = processor.process_fragment_block(block, stats, out)?;
+        if let Some(rec) = ladder.as_mut() {
+            rec.observe(lib, &stats.libraries[lib as usize]);
+        }
+        Ok(())
     })
     .context("processing fragment block (picard-exact pass 2)")?;
 
@@ -928,6 +1054,8 @@ mod tests {
             tmp_dir: None,
             stats: None,
             sample: None,
+            complexity_metrics: None,
+            complexity_interval: 1_000_000,
             quiet: true,
             min_bins: 32,
             check_crc: false,

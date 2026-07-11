@@ -215,7 +215,9 @@ The most common flags:
 | `--tmp-dir <DIR>` | Directory for the temp BAM used by `--single-end-strategy picard-exact` (default: `$TMPDIR`). |
 | `--library-unaware` | Disable library-aware marking; use one dedup table across all reads (samblaster behavior). No effect when the header has ≤1 library. See [§ Library awareness](#library-awareness). |
 | `--stats <PATH>` | Write a per-library TSV of run-summary metrics (one row per library). |
-| `--sample <NAME>` | Override the `sample` column in `--stats` output. |
+| `--sample <NAME>` | Override the `sample` column in `--stats` (and `--complexity-metrics`) output. |
+| `--complexity-metrics <PREFIX>` | Write per-library duplication-complexity QC: a duplicate-rate ladder and a group-size histogram. Off by default. See [§ Complexity metrics](#complexity-metrics---complexity-metrics). |
+| `--complexity-interval <N>` | Snapshot cadence (in templates) for the complexity ladder. Default 1,000,000. |
 
 Run `dupblaster --help` for the full list, including tuning knobs for
 the IO ring buffers (`--read-buffer-mb`, `--write-buffer-mb`) and
@@ -246,6 +248,66 @@ DuckDB. Give `--stats` a `.gz` (or `.bgz`) suffix to gzip-compress the file.
 | `unmapped_pairs` | Templates with both reads unmapped. |
 | `unmated_templates` | Templates with a stray half (skipped unless `--ignore-unmated`). |
 | `estimated_library_size` | Lander-Waterman estimate of unique molecules; empty when not estimable. |
+
+## Complexity metrics (`--complexity-metrics`)
+
+`--complexity-metrics <PREFIX>` opts into extra per-library QC output aimed at the questions "how complex is this library?" and "would sequencing deeper pay off?". It writes **four files** — a TSV and a PDF plot for each of a *duplication-sampled ladder* and a *duplication spectrum (η_k)*:
+
+- `<PREFIX>.duplication-sampled.tsv` / `.pdf`
+- `<PREFIX>.duplication-spectrum.tsv` / `.pdf`
+
+It is **off by default**; when unset, dupblaster allocates nothing extra and its speed and memory are unchanged. It works under every `--single-end-strategy`, and `--complexity-interval <N>` sets the ladder's snapshot cadence (default 1,000,000 templates).
+
+### Pairs vs. single-end: one category per library
+
+Each library is reported on **exactly one** category:
+
+- **`pairs`** — the both-ends-mapped subset — if the library has *any* pairs. A pair signature pins *two* genomic endpoints, so coincidental "same coordinates by chance" collisions are rare and the numbers are a clean library-complexity signal. A library's mapped-orphan / single-end reads are a small, noisy minority (a single-end signature pins only one endpoint), so for a paired library they are intentionally left out.
+- **`single_end`** — the mapped single-end / orphan signatures — only if the library is *solely* single-end (no pairs at all). This covers single-end runs (e.g. much RNA-seq) where the single-end signatures are all you have.
+
+This split is also what keeps the metrics correct and consistent across every single-end strategy: single-end numbers are only ever reported for a library with no pairs, which is exactly the case where the underlying keying is unambiguous. The `category` column names which subset a row describes.
+
+### `<PREFIX>.duplication-sampled.tsv` — duplication rate vs. depth
+
+Snapshots taken every `--complexity-interval` templates (plus a final row at the true total). Each row carries a **cumulative** set (`total`/`unique`/`duplicates`/`frac_duplicates`) and a matching **window** set (`window_*`) covering just the templates added since the previous snapshot — plot cumulative `frac_duplicates` vs. `total` for the running rate, or `window_frac_duplicates` vs. `total` for the marginal view (usually the more legible one).
+
+| Column | Meaning |
+|---|---|
+| `sample` | As in `--stats`. |
+| `library` | Library name. |
+| `category` | `pairs` or `single_end` (see above). |
+| `total` | Cumulative templates observed in this category at this snapshot. |
+| `unique` | Distinct molecules so far (`total − duplicates`). |
+| `duplicates` | Templates flagged as duplicates so far. |
+| `frac_duplicates` | Cumulative `duplicates / total`. |
+| `window_total` | Templates added *in this window* (since the previous snapshot; equals `total` for the first row). |
+| `window_unique` | Distinct molecules in this window (`window_total − window_duplicates`). |
+| `window_duplicates` | Duplicates flagged in this window. |
+| `window_frac_duplicates` | Marginal rate: `window_duplicates ÷ window_total`. |
+
+> **The ladder's shape depends on input order.** It is cleanest on single-lane or homogeneous-lane input, where it reads as a genuine saturation curve. On coordinate- or queryname-sorted **multi-flowcell** input the curve is dominated by contiguous per-read-group blocks — flowcell/ExAmp (optical) duplicates cluster within a read group and land adjacent under sorting — so the ladder is an order-dependent *diagnostic* (a flowcell-heterogeneity fingerprint), **not** a complexity estimator. For order-independent library complexity, use the duplication spectrum (η_k) below.
+
+### `<PREFIX>.duplication-sampled.pdf` — ladder plot
+
+A ready-made PDF of the **marginal** (per-window) duplication rate vs. depth, one line per library on a shared fraction-duplicated axis so libraries compare directly (a legend appears when there is more than one). The cumulative rate is left to the TSV; the marginal is the more legible view, and the same order-dependence caveat above applies.
+
+### `<PREFIX>.duplication-spectrum.tsv` — group-size histogram (η_k)
+
+For each distinct molecule, how many times it was observed; tallied into "how many molecules were seen exactly once, exactly twice, …". This is the same shape as RSeQC's duplication plot and the input to library-complexity estimators. Internally it is kept cheap with a side table that stores counts only for the duplicate signatures seen ≥2× (singletons are recovered by subtraction), and that table is dropped the moment a library is known to be paired.
+
+> **Per-molecule counts saturate at 65,535** (held as `u16` to keep the side table compact). A molecule observed more than that is reported at `n_observations = 65535`, so for an extremely amplified molecule — e.g. a single 5′ position in very deep RNA-seq — the reads/pairs figures can slightly undercount. The distinct-molecule counts (`n_molecules`) are never affected.
+
+| Column | Meaning |
+|---|---|
+| `sample` | As in `--stats`. |
+| `library` | Library name. |
+| `category` | `pairs` or `single_end` (see above). |
+| `n_observations` | Occurrence count *k* — how many times each distinct molecule was seen (capped at 65,535; see above). |
+| `n_molecules` | How many distinct molecules were observed exactly `n_observations` times. |
+
+### `<PREFIX>.duplication-spectrum.pdf` — η_k plot
+
+A ready-made PDF of the spectrum: the fraction of **molecules** and of **reads/pairs** (weighting each family by its size *k*) observed exactly *k* times, as points on a log-y / linear-x percent plot. The x-axis is trimmed to where the spectrum is dense (extended while ≥50% of occurrence bins in `[1..k]` are populated, capped at *k*=500); molecules and reads beyond that are summarized in the x-axis label rather than clipped. Divergence between the two series — reads riding above molecules in the tail — flags high-copy families (PCR/optical jackpots, or highly-expressed transcripts in RNA) that carry a disproportionate share of the reads. With more than one library the plot is a **faceted grid**, one panel per library on the single page.
 
 ## Algorithm sketch
 

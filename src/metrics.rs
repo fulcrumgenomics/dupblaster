@@ -76,8 +76,12 @@ pub struct Metrics {
 }
 
 /// Serialize an `f64` with 6 decimal places (fixed precision for the duplicate
-/// fraction). Used via `#[serde(serialize_with = "serialize_f64_6dp")]`.
-fn serialize_f64_6dp<S: serde::Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+/// fraction). Used via `#[serde(serialize_with = "serialize_f64_6dp")]`. Shared
+/// with [`crate::complexity`] so both TSV outputs render fractions identically.
+pub(crate) fn serialize_f64_6dp<S: serde::Serializer>(
+    value: &f64,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&format!("{value:.6}"))
 }
 

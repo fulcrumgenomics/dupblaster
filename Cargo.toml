@@ -32,6 +32,7 @@ clap = { version = "4", features = ["derive", "wrap_help"] }
 env_logger = "0.11"
 fgoxide = "0.6"
 fgumi-raw-bam = "0.2.0"
+kuva = { version = "0.4.0", features = ["pdf"] }
 libc = "0.2"
 libdeflater = "1.25"
 log = "0.4"
