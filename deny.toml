@@ -29,6 +29,14 @@ ignore = [
     # not on any read/dedup/write data path. Accepted as an unmaintained-crate
     # flag (not a vulnerability). Revisit if kuva's PDF stack moves off ttf-parser.
     "RUSTSEC-2026-0192",
+    # rustybuzz is unmaintained (maintainer declared the project unmaintained on
+    # 2026-07-11, recommending harfrust; no patched version). Same kuva PDF
+    # backend as ttf-parser above (kuva -> svg2pdf -> usvg/resvg -> rustybuzz),
+    # doing font shaping only when writing the optional `--complexity-metrics`
+    # plots — not on any read/dedup/write data path. Accepted as an
+    # unmaintained-crate flag (not a vulnerability). Revisit if kuva's PDF stack
+    # moves off rustybuzz.
+    "RUSTSEC-2026-0206",
 ]
 
 # ---------------------------------------------------------------------------
