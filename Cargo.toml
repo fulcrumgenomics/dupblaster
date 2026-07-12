@@ -39,7 +39,7 @@ log = "0.4"
 memchr = "2"
 mimalloc = { version = "0.1", default-features = false }
 noodles-sam = "0.85"
-ringbuf = "0.5"
+rawb-io = "0.1"
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 wide = "1.4"

@@ -17,7 +17,6 @@ mod complexity;
 mod counts;
 mod countset;
 mod dedup;
-mod io_threading;
 mod metrics;
 mod plots;
 mod raw_reader;
@@ -39,11 +38,11 @@ use noodles_sam::Header;
 use noodles_sam::header::record::value::Map;
 use noodles_sam::header::record::value::map::Program;
 use noodles_sam::header::record::value::map::program::tag as program_tag;
+use rawb_io::ReadAhead;
 
 use crate::complexity::{LadderRecorder, ladder_path, write_ladder_rows};
 use crate::counts::{histogram_path, histogram_rows, write_histogram_rows};
 use crate::dedup::{LibraryIndex, ProcessorOptions, RecordProcessor, Stats};
-use crate::io_threading::ThreadedReader;
 use crate::metrics::{Metrics, resolve_sample, write_rows_to_path};
 use crate::raw_reader::RawBamReader;
 use crate::raw_writer::RawBamWriter;
@@ -447,7 +446,7 @@ fn run(args: Args) -> Result<ExitCode> {
     // error.
     //
     // Input goes through a dedicated IO read thread + ring buffer
-    // (see [`ThreadedReader`]) so the worker never blocks on the kernel pipe.
+    // (a `rawb_io::ReadAhead`) so the worker never blocks on the kernel pipe.
     let raw_source: Box<dyn std::io::Read + Send> = match args.input.as_deref() {
         Some(p) if p.to_string_lossy() != "-" => {
             let f = File::open(p).with_context(|| format!("opening {} for read", p.display()))?;
@@ -457,7 +456,7 @@ fn run(args: Args) -> Result<ExitCode> {
     };
     let read_buf_bytes = (args.read_buffer_mb as usize).saturating_mul(1024 * 1024);
     let mut reader_box: Box<dyn BufRead> =
-        Box::new(ThreadedReader::new(raw_source, read_buf_bytes));
+        Box::new(ReadAhead::with_thread_name(raw_source, read_buf_bytes, "dupblaster"));
     let input_name =
         args.input.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "stdin".into());
     let input_format = detect_format(&mut reader_box)?;

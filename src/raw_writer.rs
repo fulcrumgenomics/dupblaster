@@ -29,8 +29,7 @@ use bgzf::{CompressionLevel, Writer as BgzfWriter};
 use fgumi_raw_bam::RawRecord;
 use noodles_sam::Header;
 use noodles_sam::io::Writer as SamWriter;
-
-use crate::io_threading::ThreadedWriter;
+use rawb_io::WriteBehind;
 
 /// BGZF magic bytes "BAM\1" — first 4 bytes of every BAM file.
 const BAM_MAGIC: &[u8; 4] = b"BAM\x01";
@@ -69,9 +68,9 @@ impl Write for Sink {
 /// wins). After writing all records, call [`Self::finish`] to flush
 /// and emit the BGZF EOF marker.
 pub struct RawBamWriter {
-    /// The underlying BGZF writer wrapping a [`ThreadedWriter`]. Wrapped in
+    /// The underlying BGZF writer wrapping a [`WriteBehind`]. Wrapped in
     /// `Option` so `finish()` can `take()` ownership to drive `BgzfWriter::finish`.
-    bgzf: Option<BgzfWriter<ThreadedWriter>>,
+    bgzf: Option<BgzfWriter<WriteBehind<Sink>>>,
 }
 
 impl RawBamWriter {
@@ -79,7 +78,7 @@ impl RawBamWriter {
     /// emit the BAM header (magic + SAM text + reference list), and leave
     /// the writer positioned for record output.
     ///
-    /// Output goes through a [`ThreadedWriter`] with a `ring_bytes` ring
+    /// Output goes through a [`WriteBehind`] with a `ring_bytes` ring
     /// buffer so BGZF compression on the worker thread is decoupled from
     /// the actual `write()` syscall on the underlying file/stdout.
     pub fn open(
@@ -96,7 +95,7 @@ impl RawBamWriter {
             }
             _ => Sink::Stdout(io::stdout()),
         };
-        let threaded = ThreadedWriter::new(sink, ring_bytes);
+        let threaded = WriteBehind::with_thread_name(sink, ring_bytes, "dupblaster");
         let mut bgzf = BgzfWriter::new(threaded, level);
         write_bam_header(&mut bgzf, header)?;
         Ok(Self { bgzf: Some(bgzf) })
