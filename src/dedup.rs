@@ -20,10 +20,11 @@ use noodles_sam::Header;
 use noodles_sam::header::record::value::map::read_group::tag as rg_tag;
 
 use crate::cigar::CigarInfo;
+use crate::counts::CountsMap;
 use crate::raw_writer::RawBamWriter;
 use crate::sig::{
     BinIndex, FragmentDupTable, MethylationMode, PairDupTable, SingleEndStrategy,
-    five_prime_aligned_pos, orphan_pos_override,
+    five_prime_aligned_pos, orphan_pos_override, single_end_slot,
 };
 
 // ── SAM flag constants ──────────────────────────────────────────────────────
@@ -72,6 +73,13 @@ pub struct ProcessorOptions {
     /// affected — the single-end/orphan path is already strand-aware, so it
     /// keeps OT/OB orphans separate in every mode.
     pub methylation_mode: Option<MethylationMode>,
+    /// Collect per-signature occurrence counts for the `--complexity-metrics`
+    /// group-size histogram. When `false` (the default) no counting structure
+    /// is allocated and the dedup path is unchanged. Works under every
+    /// single-end strategy — a library's single-end counts are only ever
+    /// emitted when it has no pairs, which is exactly when the fragment keyspace
+    /// is free of pair-ends and so counts cleanly (see [`crate::counts`]).
+    pub collect_counts: bool,
 }
 
 /// Display name used for reads whose library can't be determined (no `RG`
@@ -195,7 +203,20 @@ pub struct LibraryStats {
     pub unmated_count: u64,
 }
 
+/// The `pairs` complexity-metrics category label (both-ends-mapped subset).
+pub(crate) const CATEGORY_PAIRS: &str = "pairs";
+/// The `single_end` complexity-metrics category label (mapped orphans).
+pub(crate) const CATEGORY_SINGLE_END: &str = "single_end";
+
 impl LibraryStats {
+    /// The single complexity-metrics category this library is reported on:
+    /// [`CATEGORY_PAIRS`] if it has any both-mapped pairs, else
+    /// [`CATEGORY_SINGLE_END`]. Shared by the ladder ([`crate::complexity`]) and
+    /// the histogram ([`crate::counts`]) so both agree on the `category` column.
+    pub(crate) fn reported_category(&self) -> &'static str {
+        if self.both_mapped_id_count > 0 { CATEGORY_PAIRS } else { CATEGORY_SINGLE_END }
+    }
+
     /// Add `other`'s counters into `self` (used to roll per-library counters up
     /// into a run-wide total). The name is left untouched.
     fn accumulate(&mut self, other: &LibraryStats) {
@@ -313,6 +334,11 @@ pub struct RecordProcessor {
     /// `add_mate_tags` writes mate CIGAR into here so we don't allocate a
     /// fresh `String` per pair. Reused across blocks.
     mate_cigar_scratch: Vec<u8>,
+    /// Per-library occurrence counters for the `--complexity-metrics` histogram,
+    /// `Some` only when `opts.collect_counts` is set. Indexed by library bucket,
+    /// parallel to `dups`. `None` (the default) means no counting and no extra
+    /// memory.
+    counts: Option<Vec<CountsMap>>,
 }
 
 impl RecordProcessor {
@@ -338,6 +364,12 @@ impl RecordProcessor {
         // first template, matching the pre-library memory profile.
         let dups = (0..num_libs).map(|_| None).collect();
         let frag_dups = (0..num_libs).map(|_| None).collect();
+        // Counts are eagerly allocated per library (unlike the lazily-built dup
+        // tables) so the per-template observe hook is a simple cell index. Each
+        // count side-table mirrors the dedup tables' partitioning, so it is
+        // sized from the same `bin_count`.
+        let counts =
+            opts.collect_counts.then(|| (0..num_libs).map(|_| CountsMap::new(bin_count)).collect());
         Self {
             bins,
             bin_count,
@@ -349,7 +381,14 @@ impl RecordProcessor {
             last_lib_idx: 0,
             opts,
             mate_cigar_scratch: Vec::with_capacity(64),
+            counts,
         }
+    }
+
+    /// The per-library occurrence counters, if `--complexity-metrics` was on.
+    /// Indexed by library bucket, parallel to the `--stats` library rows.
+    pub fn counts(&self) -> Option<&[CountsMap]> {
+        self.counts.as_deref()
     }
 
     /// Lazily get (allocating on first use) the pair table for `lib`.
@@ -402,17 +441,20 @@ impl RecordProcessor {
         self.bin_count
     }
 
-    /// Process one block of records sharing a QNAME and emit them to the output.
+    /// Process one QNAME block: resolve its library, mark/flag duplicates,
+    /// update `stats`, and write output. Returns the library bucket the block
+    /// was attributed to, so a caller tracking per-library metrics (e.g. the
+    /// `--complexity-metrics` ladder) knows which library's counters advanced.
     pub fn process_block(
         &mut self,
         block: &mut [RawRecord],
         stats: &mut Stats,
         out: &mut RawBamWriter,
-    ) -> Result<()> {
+    ) -> Result<u32> {
         let lib = self.resolve_library(block);
         let is_dup = self.mark_dups(block, lib, stats)?;
         self.emit(block, is_dup, out)?;
-        Ok(())
+        Ok(lib)
     }
 
     /// Classify `block`, update `stats`, and return `true` if the template is a
@@ -603,7 +645,10 @@ impl RecordProcessor {
         } else {
             (&f_derived, &s_derived)
         };
-        let is_dup = self.pair_table(lib).check_dm(
+        // Compute the pair signature slot once, then reuse it for both the dedup
+        // check and (below) the complexity-metrics count side-table, so the
+        // signature is never recomputed and the two group identically.
+        let slot = self.pair_table(lib).pair_slot(
             a.bin_num,
             a.bin_pos,
             a.is_reverse,
@@ -611,6 +656,7 @@ impl RecordProcessor {
             b.bin_pos,
             b.is_reverse,
         );
+        let is_dup = self.pair_table(lib).insert_pair(slot);
         // PicardApprox side effect: register both ends of the pair in this
         // library's fragment table so later orphans at those coordinates are
         // marked as duplicates of this pair ("fragments don't beat pairs",
@@ -624,6 +670,12 @@ impl RecordProcessor {
                 frag.check_or_insert(f_derived.bin_num, f_derived.bin_pos, f_derived.is_reverse);
             let _ =
                 frag.check_or_insert(s_derived.bin_num, s_derived.bin_pos, s_derived.is_reverse);
+        }
+        // Complexity-metrics counting (only when `--complexity-metrics` is on).
+        // Reuses the same `slot` fed to `insert_pair`, so a counted signature
+        // matches the dedup signature exactly.
+        if let Some(counts) = self.counts.as_mut() {
+            counts[lib as usize].observe_pair(slot, is_dup);
         }
         Ok(is_dup)
     }
@@ -645,14 +697,34 @@ impl RecordProcessor {
         if d.clamped {
             self.note_clamp(stats);
         }
-        Ok(match self.opts.single_end_strategy {
+        // Single-end keying is strand-aware except under samblaster-legacy,
+        // which keys orphans strand-obliviously. Compute the slot once (the
+        // strand-drop lives in `single_end_slot`), then reuse it for the dedup
+        // check and the count side-table so they group identically.
+        let se_strand_aware = self.opts.single_end_strategy != SingleEndStrategy::SamblasterLegacy;
+        let slot = single_end_slot(d.bin_num, d.bin_pos, d.is_reverse, se_strand_aware);
+        let is_dup = match self.opts.single_end_strategy {
+            // Picard keys orphans on the fragment table (which also holds every
+            // pair-end, so an orphan collides with a pair at its 5' coordinate).
             SingleEndStrategy::PicardApprox | SingleEndStrategy::PicardExact => {
-                self.frag_table(lib).check_or_insert(d.bin_num, d.bin_pos, d.is_reverse)
+                self.frag_table(lib).insert(slot)
             }
-            strategy @ (SingleEndStrategy::StrandAware | SingleEndStrategy::SamblasterLegacy) => {
-                self.pair_table(lib).check_orphan(d.bin_num, d.bin_pos, d.is_reverse, strategy)
+            // StrandAware / SamblasterLegacy key orphans on the pair table's
+            // `s1 = 0` row (no separate fragment table allocated).
+            SingleEndStrategy::StrandAware | SingleEndStrategy::SamblasterLegacy => {
+                self.pair_table(lib).insert_orphan(slot)
             }
-        })
+        };
+        // Complexity-metrics counting (only when `--complexity-metrics` is on).
+        // `observe_single_end` runs under every strategy; single-end counts stay
+        // faithful because `CountsMap` only ever *reports* them for a library
+        // with no pairs, whose fragment keyspace therefore holds no pair-ends —
+        // so `is_dup` is a true "seen this fragment before" signal even under
+        // the Picard strategies (whose fragment table otherwise mixes in pairs).
+        if let Some(counts) = self.counts.as_mut() {
+            counts[lib as usize].observe_single_end(slot, is_dup);
+        }
+        Ok(is_dup)
     }
 
     // ── picard-exact two-pass driver ────────────────────────────────────────
@@ -670,7 +742,7 @@ impl RecordProcessor {
         stats: &mut Stats,
         out: &mut RawBamWriter,
         temp: &mut RawBamWriter,
-    ) -> Result<()> {
+    ) -> Result<u32> {
         let lib = self.resolve_library(block);
         let li = lib as usize;
         match self.classify_block(block)? {
@@ -685,22 +757,21 @@ impl RecordProcessor {
                 for rec in block.iter() {
                     temp.write_record(rec)?;
                 }
-                Ok(())
             }
             BlockClass::BothUnmapped => {
                 stats.libraries[li].id_count += 1;
                 stats.libraries[li].both_unmapped_id_count += 1;
-                self.emit(block, false, out)
+                self.emit(block, false, out)?;
             }
             BlockClass::UnmappedOrphan => {
                 stats.libraries[li].id_count += 1;
                 stats.libraries[li].unmapped_orphan_id_count += 1;
-                self.emit(block, false, out)
+                self.emit(block, false, out)?;
             }
             BlockClass::Unmated => {
                 stats.libraries[li].id_count += 1;
                 stats.libraries[li].unmated_count += 1;
-                self.emit(block, false, out)
+                self.emit(block, false, out)?;
             }
             BlockClass::Pair { first, second } => {
                 stats.libraries[li].id_count += 1;
@@ -713,9 +784,10 @@ impl RecordProcessor {
                     stats.libraries[li].dup_count += 1;
                     stats.libraries[li].both_mapped_dup_count += 1;
                 }
-                self.emit(block, dup, out)
+                self.emit(block, dup, out)?;
             }
         }
+        Ok(lib)
     }
 
     /// Transition between phases 1 and 2 of [`SingleEndStrategy::PicardExact`]:
@@ -745,7 +817,7 @@ impl RecordProcessor {
         block: &mut [RawRecord],
         stats: &mut Stats,
         out: &mut RawBamWriter,
-    ) -> Result<()> {
+    ) -> Result<u32> {
         let lib = self.resolve_library(block);
         let li = lib as usize;
         stats.libraries[li].id_count += 1;
@@ -768,7 +840,8 @@ impl RecordProcessor {
                 other.describe()
             ),
         };
-        self.emit(block, dup, out)
+        self.emit(block, dup, out)?;
+        Ok(lib)
     }
 
     /// Add `MC`/`MQ` mate tags in both directions for a block whose two

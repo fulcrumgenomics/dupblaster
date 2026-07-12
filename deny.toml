@@ -21,7 +21,15 @@ version = 2
 # Fail (not just warn) on a yanked dependency: for a published crate a yanked
 # transitive dep is a real supply-chain signal worth blocking CI on.
 yanked = "deny"
-ignore = []
+ignore = [
+    # ttf-parser is unmaintained (author declared; no fix forthcoming, no safe
+    # upgrade). It is a transitive dependency of kuva's PDF backend
+    # (kuva -> svg2pdf -> fontdb/usvg/resvg/rustybuzz -> ttf-parser), used only to
+    # embed fonts when writing the optional `--complexity-metrics` plots — it is
+    # not on any read/dedup/write data path. Accepted as an unmaintained-crate
+    # flag (not a vulnerability). Revisit if kuva's PDF stack moves off ttf-parser.
+    "RUSTSEC-2026-0192",
+]
 
 # ---------------------------------------------------------------------------
 # Licenses: only permissive MIT-compatible licenses are allowed. Anything

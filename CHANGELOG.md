@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--complexity-metrics <PREFIX>`: opt-in, off-by-default per-library duplication-complexity QC (no extra cost when unset). Writes a **duplicate-rate ladder** (`.duplication-sampled.tsv`/`.pdf`) — duplicate rate vs. sequencing depth, sampled every `--complexity-interval` templates, with matching cumulative and per-window columns — and a **group-size histogram** η_k (`.duplication-spectrum.tsv`/`.pdf`) — how many molecules were seen exactly *k* times. Each library is reported on one category: `pairs` if it has any both-ends-mapped pairs, else `single_end` (the cleaner estimator, and what keeps the metrics correct under every `--single-end-strategy`). PDF plots render via [kuva](https://crates.io/crates/kuva); see the README for details.
+- `--complexity-interval <N>`: snapshot cadence (in templates) for the complexity ladder. Default 1,000,000.
+
 ### Fixed
 
 - Fixed a deadlock where dupblaster could hang indefinitely — instead of exiting with an error — when the process downstream of it in a pipe died (e.g. `… | dupblaster --output - | sorter` where `sorter` exits on a full disk). After the broken-pipe error was surfaced once, the threaded writer would accept further writes into a ring buffer its already-exited IO thread could never drain, then park forever waiting to be woken. The re-entrant write that the `bgzf` writer performs while being dropped (flushing buffered blocks and the BGZF EOF marker) triggered exactly this. The threaded writer now rejects all writes and flushes once its IO thread has reported an error, so the failure propagates and the process exits non-zero.
