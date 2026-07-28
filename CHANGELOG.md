@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-28
+
 ### Added
 
 - `--complexity-metrics <PREFIX>`: opt-in, off-by-default per-library duplication-complexity QC (no extra cost when unset). Writes a **duplicate-rate ladder** (`.duplication-sampled.tsv`/`.pdf`) — duplicate rate vs. sequencing depth, sampled every `--complexity-interval` templates, with matching cumulative and per-window columns — and a **group-size histogram** η_k (`.duplication-spectrum.tsv`/`.pdf`) — how many molecules were seen exactly *k* times. Each library is reported on one category: `pairs` if it has any both-ends-mapped pairs, else `single_end` (the cleaner estimator, and what keeps the metrics correct under every `--single-end-strategy`). PDF plots render via [kuva](https://crates.io/crates/kuva); see the README for details.
@@ -116,6 +118,7 @@ Picard MarkDuplicates.
   Picard's `kf`-tagged output to produce set-equivalence, orphan-discordance,
   and supplementary-flag-inheritance TSVs.
 
-[Unreleased]: https://github.com/fulcrumgenomics/dupblaster/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/fulcrumgenomics/dupblaster/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/fulcrumgenomics/dupblaster/releases/tag/v0.2.0
 [0.1.1]: https://github.com/fulcrumgenomics/dupblaster/releases/tag/v0.1.1
 [0.1.0]: https://github.com/fulcrumgenomics/dupblaster/releases/tag/v0.1.0
