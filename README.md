@@ -56,6 +56,7 @@ more about how we can power your bioinformatics with dupblaster and beyond.
 - **A per-library stats TSV, ready for QC pipelines.** `--stats <PATH>` writes a
   wide TSV — one row per library — with sample, template/duplicate counts,
   Picard-style `frac_duplicates`, and a Lander-Waterman library-size estimate.
+- **Opt-in library-complexity QC.** `--complexity-metrics <PREFIX>` adds a duplicate-rate-vs-depth ladder and a group-size histogram (η_k) per library — TSVs plus ready-made PDF plots — to answer "how complex is this library, and would sequencing deeper pay off?". Off by default, and free when unset. See [§ Complexity metrics](#complexity-metrics---complexity-metrics).
 - **Modern, gnu-style CLI.** `--remove-dups`, `--add-mate-tags`,
   `--ignore-unmated`, `--max-read-length`, `--stats`, … no camelCase flags.
 
@@ -77,7 +78,7 @@ concordance with Picard MarkDuplicates.
 [faust-hall]: https://doi.org/10.1093/bioinformatics/btu314
 [bwa-mem3]: https://github.com/fg-labs/bwa-mem3
 
-**Jump to:** [Install](#install) · [Quick start](#quick-start) · [Recipes](#recipes) · [Input assumptions](#important-assumptions) · [CLI summary](#cli-summary) · [Algorithm](#algorithm-sketch) · [Benchmarks](#benchmarks) · [Limitations](#limitations)
+**Jump to:** [Install](#install) · [Quick start](#quick-start) · [Recipes](#recipes) · [Input assumptions](#important-assumptions) · [CLI summary](#cli-summary) · [Stats](#stats-output---stats) · [Complexity metrics](#complexity-metrics---complexity-metrics) · [Algorithm](#algorithm-sketch) · [Benchmarks](#benchmarks) · [Limitations](#limitations)
 
 ## Install
 
@@ -648,6 +649,10 @@ suite, and release flow.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Citing dupblaster
+
+Every release is archived on Zenodo. Cite the concept DOI [10.5281/zenodo.21445780](https://doi.org/10.5281/zenodo.21445780), which always resolves to the latest release, or the version-specific DOI from that record if you need to pin the exact version you ran (`dupblaster --version` reports it). Please also cite the samblaster paper, whose algorithm dupblaster adapts — see [§ Acknowledgements](#acknowledgements).
 
 ## Acknowledgements
 
