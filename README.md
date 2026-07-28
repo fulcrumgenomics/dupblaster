@@ -2,7 +2,7 @@
 [![Version at crates.io](https://img.shields.io/crates/v/dupblaster)](https://crates.io/crates/dupblaster)
 [![Bioconda](https://img.shields.io/conda/vn/bioconda/dupblaster.svg?label=bioconda)](https://bioconda.github.io/recipes/dupblaster/README.html)
 [![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fulcrumgenomics/dupblaster/blob/main/LICENSE)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21445780.svg)](https://doi.org/10.5281/zenodo.21445780)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21445780-blue.svg)](https://doi.org/10.5281/zenodo.21445780)
 
 # dupblaster
 
@@ -62,8 +62,8 @@ more about how we can power your bioinformatics with dupblaster and beyond.
 
 dupblaster is also the fastest option in the suite: on a compute-bound 8× WGS
 benchmark it marks duplicates ~14× faster than Picard MarkDuplicates and
-`samtools markdup` on x86, and ~21–25× faster on Graviton4, at a fraction of the
-memory.
+`samtools markdup` (run single-threaded) on x86, and ~21–25× faster on
+Graviton4, at a fraction of the memory.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/fulcrumgenomics/dupblaster/main/docs/img/benchmark-walltime.png"
@@ -512,11 +512,11 @@ raw collated reports are committed in
 `samtools markdup`'s timed window excludes the `fixmate -m` + coordinate-sort
 prep it requires; the other tools consume the query-grouped input directly.
 
-dupblaster is ~14× faster than Picard and samtools markdup on x86 and ~21–25×
-faster on Graviton4. The margin is larger on Graviton4: dupblaster's lighter
-per-record work scales across the cores (40 s vs 60 s on x86), while Picard's
-heavier per-read cost does not (1006 s vs 825 s). Resident memory differs
-similarly — dupblaster holds ~1.2 GB versus Picard's ~8.5 GB.
+dupblaster is ~14× faster than Picard and single-threaded samtools markdup on
+x86 and ~21–25× faster on Graviton4. The margin is larger on Graviton4:
+dupblaster's lighter per-record work scales across the cores (40 s vs 60 s on
+x86), while Picard's heavier per-read cost does not (1006 s vs 825 s). Resident
+memory differs similarly — dupblaster holds ~1.2 GB versus Picard's ~8.5 GB.
 
 dupblaster exposes two orthogonal options. **Input format** affects only speed: BAM
 is the native on-disk shape, while the SAM path must text-parse the stream
