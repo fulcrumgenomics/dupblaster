@@ -18,9 +18,16 @@ publish = true
 # recipes typically grep for.
 tag-name = "v{{version}}"
 
-# Match the commit-message style used for past version bumps. Use
-# `{{version}}` (the version being released); `{{next_version}}` is not
-# bound in the pre-release commit context and renders as a literal.
+# Commit each released crate's version bump on its own, rather than in one
+# consolidated workspace commit. This is what makes `{{version}}` interpolate:
+# in the consolidated-commit context cargo-release binds only `{{date}}`, so
+# every version variable (`{{version}}`, `{{next_version}}`, `{{prev_version}}`)
+# renders as a literal — that is how v0.1.1 landed with the commit message
+# "Bump version to {{next_version}}". Only dupblaster is ever released here
+# (bench-compare sets `publish = false`), so "per-crate" still means one commit.
+consolidate-commits = false
+
+# Match the commit-message style used for past version bumps.
 pre-release-commit-message = "Bump version to {{version}}"
 
 # Rewrite CHANGELOG.md at release time:

@@ -51,9 +51,14 @@ job, always:
 - After the human publishes, create the matching **GitHub release from the tag**
   (`gh release create vX.Y.Z --notes-file ...`) using that version's CHANGELOG
   section as the notes.
-- `release.toml` templates use `{{version}}` (the version being released), NOT
-  `{{next_version}}` — the latter is unbound in the pre-release commit context
-  and renders as a literal.
+- `release.toml` uses `{{version}}` (the version being released) in the
+  pre-release commit message, and that only interpolates because
+  `consolidate-commits = false` is set. In a workspace's *consolidated* commit
+  context cargo-release binds only `{{date}}` — `{{version}}`,
+  `{{next_version}}`, and `{{prev_version}}` all render as literals (how v0.1.1
+  got the message "Bump version to {{next_version}}"). If the dry run prints
+  `Unrendered {{...}} present in template`, the commit message is broken —
+  don't hand the human the `--execute` command until it's clean.
 
 ## Testing conventions
 

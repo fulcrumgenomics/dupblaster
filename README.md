@@ -2,7 +2,7 @@
 [![Version at crates.io](https://img.shields.io/crates/v/dupblaster)](https://crates.io/crates/dupblaster)
 [![Bioconda](https://img.shields.io/conda/vn/bioconda/dupblaster.svg?label=bioconda)](https://bioconda.github.io/recipes/dupblaster/README.html)
 [![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fulcrumgenomics/dupblaster/blob/main/LICENSE)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21445780.svg)](https://doi.org/10.5281/zenodo.21445780)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21445780-blue.svg)](https://doi.org/10.5281/zenodo.21445780)
 
 # dupblaster
 
@@ -56,13 +56,14 @@ more about how we can power your bioinformatics with dupblaster and beyond.
 - **A per-library stats TSV, ready for QC pipelines.** `--stats <PATH>` writes a
   wide TSV — one row per library — with sample, template/duplicate counts,
   Picard-style `frac_duplicates`, and a Lander-Waterman library-size estimate.
+- **Opt-in library-complexity QC.** `--complexity-metrics <PREFIX>` adds a duplicate-rate-vs-depth ladder and a group-size histogram (η_k) per library — TSVs plus ready-made PDF plots — to answer "how complex is this library, and would sequencing deeper pay off?". Off by default, and free when unset. See [§ Complexity metrics](#complexity-metrics---complexity-metrics).
 - **Modern, gnu-style CLI.** `--remove-dups`, `--add-mate-tags`,
   `--ignore-unmated`, `--max-read-length`, `--stats`, … no camelCase flags.
 
 dupblaster is also the fastest option in the suite: on a compute-bound 8× WGS
 benchmark it marks duplicates ~14× faster than Picard MarkDuplicates and
-`samtools markdup` on x86, and ~21–25× faster on Graviton4, at a fraction of the
-memory.
+`samtools markdup` (run single-threaded) on x86, and ~21–25× faster on
+Graviton4, at a fraction of the memory.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/fulcrumgenomics/dupblaster/main/docs/img/benchmark-walltime.png"
@@ -77,7 +78,7 @@ concordance with Picard MarkDuplicates.
 [faust-hall]: https://doi.org/10.1093/bioinformatics/btu314
 [bwa-mem3]: https://github.com/fg-labs/bwa-mem3
 
-**Jump to:** [Install](#install) · [Quick start](#quick-start) · [Recipes](#recipes) · [Input assumptions](#important-assumptions) · [CLI summary](#cli-summary) · [Algorithm](#algorithm-sketch) · [Benchmarks](#benchmarks) · [Limitations](#limitations)
+**Jump to:** [Install](#install) · [Quick start](#quick-start) · [Recipes](#recipes) · [Input assumptions](#important-assumptions) · [CLI summary](#cli-summary) · [Stats](#stats-output---stats) · [Complexity metrics](#complexity-metrics---complexity-metrics) · [Algorithm](#algorithm-sketch) · [Benchmarks](#benchmarks) · [Limitations](#limitations)
 
 ## Install
 
@@ -511,11 +512,11 @@ raw collated reports are committed in
 `samtools markdup`'s timed window excludes the `fixmate -m` + coordinate-sort
 prep it requires; the other tools consume the query-grouped input directly.
 
-dupblaster is ~14× faster than Picard and samtools markdup on x86 and ~21–25×
-faster on Graviton4. The margin is larger on Graviton4: dupblaster's lighter
-per-record work scales across the cores (40 s vs 60 s on x86), while Picard's
-heavier per-read cost does not (1006 s vs 825 s). Resident memory differs
-similarly — dupblaster holds ~1.2 GB versus Picard's ~8.5 GB.
+dupblaster is ~14× faster than Picard and single-threaded samtools markdup on
+x86 and ~21–25× faster on Graviton4. The margin is larger on Graviton4:
+dupblaster's lighter per-record work scales across the cores (40 s vs 60 s on
+x86), while Picard's heavier per-read cost does not (1006 s vs 825 s). Resident
+memory differs similarly — dupblaster holds ~1.2 GB versus Picard's ~8.5 GB.
 
 dupblaster exposes two orthogonal options. **Input format** affects only speed: BAM
 is the native on-disk shape, while the SAM path must text-parse the stream
@@ -648,6 +649,10 @@ suite, and release flow.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Citing dupblaster
+
+Every release is archived on Zenodo. Cite the concept DOI [10.5281/zenodo.21445780](https://doi.org/10.5281/zenodo.21445780), which always resolves to the latest release, or the version-specific DOI from that record if you need to pin the exact version you ran (`dupblaster --version` reports it). Please also cite the samblaster paper, whose algorithm dupblaster adapts — see [§ Acknowledgements](#acknowledgements).
 
 ## Acknowledgements
 
