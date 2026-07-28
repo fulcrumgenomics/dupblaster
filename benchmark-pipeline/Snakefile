@@ -175,9 +175,13 @@ def _cram_url(sample: str) -> str:
 #     into the key for same-strand pairs; Picard and dupblaster are
 #     coordinate-canonical and R1/R2-agnostic, the closer analogue to `-m s`.
 #     This row tests whether `-m s` tightens pair concordance with Picard.
-#     Both flag variants exist to price a *flag*, not to be swept, so they
-#     run at one mid-sweep thread point and are read against the default
-#     markdup at that same point.
+#     `-m s -S` is the variant swept for markdup, because it is the one whose
+#     output most closely matches Picard's (100% paired-set concordance and
+#     Picard-like supplementary propagation, vs 99.87% for the default `-m t`)
+#     — a thread curve is only worth having for the configuration you would
+#     actually deploy against Picard-equivalent output. The other two variants
+#     exist to price a *flag*, not to be swept, so they run at one mid-sweep
+#     point and are read against the swept variant at that same point.
 #   - dupsifter (huishenlab): samblaster-lineage, single-pass, streams a
 #     read-name-grouped BAM. Run in `-W` (WGS-only) mode here since our
 #     bench data is unconverted WGS; its WGBS strand-coupling is irrelevant.
@@ -190,9 +194,11 @@ def _cram_url(sample: str) -> str:
 #     libdeflate level-6 deflate. Its numbers carry that penalty; the
 #     benchmark README says so where they are reported.
 
-# Thread points for the coordinate class, as total CPU slots claimed.
+# Thread points for the coordinate class, as total CPU slots claimed. Exactly
+# one command-line variant per tool is swept — the one whose output best
+# matches Picard's.
 COORD_SWEEP = [1, 4, 8, 16]
-# Mid-sweep point at which the markdup flag variants are priced.
+# Mid-sweep point at which the non-swept markdup flag variants are priced.
 COORD_FLAG_POINT = [8]
 STOCK = ["stock"]
 
@@ -204,9 +210,9 @@ TOOLS = {
     "dupblaster-picard-exact":  dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK, slots=3),
     "dupsifter":                dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK, slots=1),
     "picard":                   dict(cls="coordinate", input="coord_bam",         sweep=STOCK, slots=1),
-    "samtools-markdup":         dict(cls="coordinate", input="fixmate_coord_bam", sweep=COORD_SWEEP),
+    "samtools-markdup":         dict(cls="coordinate", input="fixmate_coord_bam", sweep=COORD_FLAG_POINT),
     "samtools-markdup-S":       dict(cls="coordinate", input="fixmate_coord_bam", sweep=COORD_FLAG_POINT),
-    "samtools-markdup-seq-S":   dict(cls="coordinate", input="fixmate_coord_bam", sweep=COORD_FLAG_POINT),
+    "samtools-markdup-seq-S":   dict(cls="coordinate", input="fixmate_coord_bam", sweep=COORD_SWEEP),
     "fastdup":                  dict(cls="coordinate", input="coord_bam",         sweep=COORD_SWEEP),
 }
 

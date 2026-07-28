@@ -65,14 +65,14 @@ Eleven tools are benchmarked (`TOOLS` registry in the Snakefile, which carries e
 | `dupblaster-picard-exact`  | streaming  | `--single-end-strategy picard-exact`  | name-sorted BAM            | stock           |
 | `dupsifter`                | streaming  | `-W` (WGS-only mode)                  | name-sorted BAM            | stock           |
 | `picard`                   | coordinate | `MarkDuplicates ASSUME_SORT_ORDER=coordinate` | coord-sorted BAM   | stock (no thread flag) |
-| `samtools-markdup`         | coordinate | default (no `-S`)                     | coord-sorted BAM + fixmate | 1 / 4 / 8 / 16  |
+| `samtools-markdup`         | coordinate | default (no `-S`)                     | coord-sorted BAM + fixmate | 8               |
 | `samtools-markdup-S`       | coordinate | `-S` (propagate to secondary/supp)    | coord-sorted BAM + fixmate | 8               |
-| `samtools-markdup-seq-S`   | coordinate | `-m s -S` (sequence mode + propagate) | coord-sorted BAM + fixmate | 8               |
+| `samtools-markdup-seq-S`   | coordinate | `-m s -S` (sequence mode + propagate) | coord-sorted BAM + fixmate | 1 / 4 / 8 / 16  |
 | `fastdup`                  | coordinate | `--num-threads N`                     | coord-sorted BAM           | 1 / 4 / 8 / 16  |
 
-Sweep points count **total CPU slots claimed**, not flag values: `samtools -@ N` takes N *additional* threads, so a sweep point of 8 passes `-@ 7`, while FastDup's `--num-threads` is a total and gets 8.
+Sweep points count **total CPU slots claimed**, not flag values: `samtools -@ N` is documented as "number of *additional* threads to use [0]", so a sweep point of 8 passes `-@ 7`, while FastDup's `--num-threads` is a total and gets 8 unmodified.
 
-The two markdup flag variants price a *flag*, not a thread curve, so they run at a single mid-sweep point (8) and are read against the default markdup at that same point.
+Exactly **one command-line variant per tool is swept**, and it is the variant whose output most closely matches Picard's — a thread curve is only worth having for the configuration you would actually deploy against Picard-equivalent output. For markdup that is `-m s -S`: sequence mode reaches 100% paired-set concordance with Picard (vs 99.87% for the default `-m t`) and `-S` propagates the dup flag to supplementary records as Picard does. The other two markdup rows price a *flag* rather than a thread curve, so they run at the single mid-sweep point (8) and are read against the swept variant at that same point.
 
 Picard is timed on coordinate-sorted input with `ASSUME_SORT_ORDER=coordinate` — the way it is actually deployed, after the sort, rather than paying an internal queryname→coordinate sort inside its own timed window. (`run_picard`, which produces the equivalence *reference*, still reads the name-sorted BAM: its name-ordered output is what lets `bench-compare` co-stream without a re-sort, and Picard's duplicate sets don't depend on which order it is handed.)
 
