@@ -134,14 +134,11 @@ Keeping that conversion out of the timed window means the *comparison*
 format never penalizes a tool, while every comparison still gets uniformly
 compressed, uniformly ordered input.
 
-### Two cost metrics
+### Cost metrics
 
-`results/bench.tsv` reports both, per run:
+Every run in `results/bench.tsv` reports `wall_s` and **`cpu_s`** — actual CPU consumed (user + sys), the work the tool really did regardless of how it spread that work across threads. Stock runs report only those two, on a single-CPU assumption.
 
-- **`cpu_s`** — actual CPU consumed (user + sys): the work the tool really did, independent of how it spread that work across threads.
-- **`reserved_cpu_s`** — `reserved_slots x wall_s`: the CPU you had to *claim* to run it, which is what a cloud instance or an SGE/Slurm reservation actually costs.
-
-The two diverge whenever threads don't convert into throughput. Threading `samtools markdup` leaves `cpu_s` roughly flat while wall time falls and `reserved_cpu_s` climbs — the same work, spread wider, at a higher reservation cost. dupblaster is charged for the 3 slots it always spawns even though it draws only ~1.1 cores of work, because its reader and writer threads exist to hide IO latency, not to add throughput. `reserved_slots` comes from the `TOOLS` registry for stock runs and from the sweep point itself for swept runs.
+Swept runs additionally report **`reserved_cpu_s`** (`nslots x wall_s`): the CPU you had to *claim* to run it, which is what a cloud instance or an SGE/Slurm reservation actually costs. It is the metric that prices a thread curve — `cpu_s` stays roughly flat as threads rise while wall time falls and `reserved_cpu_s` climbs, i.e. the same work spread wider at a higher reservation cost. The column is empty for stock runs, where the claim is one slot and the reserved cost is just `wall_s`.
 
 ## Comparison design
 
@@ -330,10 +327,11 @@ results/orphan_triage.tsv  # four-bucket orphan-discordance triage
 results/inheritance.tsv    # dup-flag consistency across primary+secondary+supplementary
 ```
 
-`bench.tsv` columns: `sample`, `tool`, `tool_class`, `nslots`,
-`reserved_slots`, `rep`, `wall_s`, `cpu_s`, `reserved_cpu_s`, `user_s`,
-`sys_s`, `cpu_percent`, `max_rss_kb`, `exit_status`. Compare runtimes only
-within a `tool_class` — see [Two classes of tool](#two-classes-of-tool).
+`bench.tsv` columns: `sample`, `tool`, `tool_class`, `nslots`, `rep`,
+`wall_s`, `cpu_s`, `reserved_cpu_s`, `user_s`, `sys_s`, `cpu_percent`,
+`max_rss_kb`, `exit_status` (`reserved_cpu_s` is populated for swept runs
+only). Compare runtimes only within a `tool_class` — see
+[Two classes of tool](#two-classes-of-tool).
 
 `setcmp.tsv` columns: `sample`, `partner`, `pe_sets`, `pe_concordant`,
 `pe_concord_pct`, `orphan_sets`, `orphan_concordant`, `orphan_concord_pct`,

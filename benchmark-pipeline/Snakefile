@@ -160,11 +160,10 @@ def _cram_url(sample: str) -> str:
 #            knob. `samtools -@ N` means N *additional* threads, so a sweep
 #            point of N passes `-@ N-1`; FastDup's `--num-threads N` is a
 #            total, so it gets N.
-#   slots  — CPU slots to charge for the "reserved CPU seconds" metric
-#            (slots x wall) in stock config; swept runs are charged their
-#            own sweep point. This is what you would claim from a scheduler,
-#            NOT what the tool manages to keep busy: dupblaster is charged
-#            for its 3 threads even though it only draws ~1.1 cores of work.
+#
+# Stock runs report wall time and CPU only, on a single-CPU assumption. The
+# "reserved CPU seconds" metric (slots x wall) applies to the thread sweep,
+# where the number of slots claimed is an explicit input rather than a guess.
 #
 # Notes on the less obvious ones:
 #   - samtools-markdup-S: `-S` propagates the dup flag to secondary /
@@ -203,13 +202,13 @@ COORD_FLAG_POINT = [8]
 STOCK = ["stock"]
 
 TOOLS = {
-    "samblaster":               dict(cls="streaming",  input="qnsort_sam",        sweep=STOCK, slots=1),
-    "dupblaster-sam":           dict(cls="streaming",  input="qnsort_sam",        sweep=STOCK, slots=3),
-    "dupblaster-bam":           dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK, slots=3),
-    "dupblaster-picard-approx": dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK, slots=3),
-    "dupblaster-picard-exact":  dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK, slots=3),
-    "dupsifter":                dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK, slots=1),
-    "picard":                   dict(cls="coordinate", input="coord_bam",         sweep=STOCK, slots=1),
+    "samblaster":               dict(cls="streaming",  input="qnsort_sam",        sweep=STOCK),
+    "dupblaster-sam":           dict(cls="streaming",  input="qnsort_sam",        sweep=STOCK),
+    "dupblaster-bam":           dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK),
+    "dupblaster-picard-approx": dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK),
+    "dupblaster-picard-exact":  dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK),
+    "dupsifter":                dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK),
+    "picard":                   dict(cls="coordinate", input="coord_bam",         sweep=STOCK),
     "samtools-markdup":         dict(cls="coordinate", input="fixmate_coord_bam", sweep=COORD_FLAG_POINT),
     "samtools-markdup-S":       dict(cls="coordinate", input="fixmate_coord_bam", sweep=COORD_FLAG_POINT),
     "samtools-markdup-seq-S":   dict(cls="coordinate", input="fixmate_coord_bam", sweep=COORD_SWEEP),
@@ -229,11 +228,6 @@ def timed_runs():
     directory)."""
     return [(tool, str(point)) for tool, spec in TOOLS.items()
             for point in spec["sweep"]]
-
-
-def reserved_slots(tool: str, nslots: str) -> int:
-    """CPU slots charged for the reserved-CPU-seconds metric."""
-    return TOOLS[tool]["slots"] if nslots == "stock" else int(nslots)
 
 
 # ---- targets -------------------------------------------------------------
@@ -1057,9 +1051,8 @@ rule collate_bench:
     (sample, tool, sweep point, rep).
 
     The tool registry drives the fan-out, so a tool's sweep points are
-    declared in exactly one place (TOOLS) and the class / reserved-slot
-    columns are handed to the collation script rather than re-derived
-    there."""
+    declared in exactly one place (TOOLS) and its class is handed to the
+    collation script rather than re-derived there."""
     input:
         [f"results/runs/{sample}/{tool}/t{nslots}/rep{rep}/time.devnull.txt"
          for sample in SAMPLE_NAMES
@@ -1069,9 +1062,9 @@ rule collate_bench:
         tsv = "results/bench.tsv",
     params:
         script = str(WORKDIR / "workflow" / "scripts" / "collate_bench.py"),
-        # tool:class:reserved-slots, one per timed (tool, sweep point).
+        # tool:nslots:class, one per timed (tool, sweep point).
         spec = lambda wc: " ".join(
-            f"{tool}:{nslots}:{TOOLS[tool]['cls']}:{reserved_slots(tool, nslots)}"
+            f"{tool}:{nslots}:{TOOLS[tool]['cls']}"
             for tool, nslots in timed_runs()),
     shell:
         r"""

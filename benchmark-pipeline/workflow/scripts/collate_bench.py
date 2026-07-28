@@ -1,18 +1,15 @@
 """Walk results/runs/{sample}/{tool}/t{nslots}/rep{N}/time.devnull.txt, parse
 each, emit one wide TSV row per (sample, tool, sweep point, rep).
 
-Two cost metrics are reported per run:
+Every run reports wall time and actual CPU (`cpu_s` = user + sys). Swept runs
+additionally report `reserved_cpu_s` (= sweep point x wall): the CPU you had
+to *claim* to run it, which is what a cloud instance or an SGE/Slurm
+reservation actually costs. It is left empty for stock runs, which are
+measured on a single-CPU assumption — there the claim would be 1 slot, so
+reserved cost is just `wall_s`.
 
-  cpu_s           actual CPU consumed (user + sys) — the work the tool really
-                  did, independent of how it spread that work over threads.
-  reserved_cpu_s  slots x wall — the CPU you had to *claim* to run it, which
-                  is what a cloud instance or an SGE/Slurm reservation
-                  actually costs. A tool whose threads hide IO latency rather
-                  than adding throughput pays here without gaining: dupblaster
-                  is charged for 3 slots while drawing ~1.1 cores of work.
-
-`--spec` carries the class and reserved-slot count for each (tool, sweep
-point) from the Snakefile's TOOLS registry, so those facts live in one place.
+`--spec` carries each timed (tool, sweep point) and its class from the
+Snakefile's TOOLS registry, so those facts live in one place.
 """
 
 import argparse
@@ -26,18 +23,18 @@ from parse_gnu_time import parse  # noqa: E402
 
 
 COLUMNS = [
-    "sample", "tool", "tool_class", "nslots", "reserved_slots", "rep",
+    "sample", "tool", "tool_class", "nslots", "rep",
     "wall_s", "cpu_s", "reserved_cpu_s",
     "user_s", "sys_s", "cpu_percent", "max_rss_kb", "exit_status",
 ]
 
 
-def parse_spec(entries: list[str]) -> dict[tuple[str, str], tuple[str, int]]:
-    """`tool:nslots:class:reserved_slots` -> {(tool, nslots): (class, slots)}."""
+def parse_spec(entries: list[str]) -> dict[tuple[str, str], str]:
+    """`tool:nslots:class` -> {(tool, nslots): class}."""
     spec = {}
     for entry in entries:
-        tool, nslots, cls, slots = entry.split(":")
-        spec[(tool, nslots)] = (cls, int(slots))
+        tool, nslots, cls = entry.split(":")
+        spec[(tool, nslots)] = cls
     return spec
 
 
@@ -47,8 +44,8 @@ def main() -> None:
                     help="Root of per-run outputs, e.g. results/runs")
     ap.add_argument("--output", required=True)
     ap.add_argument("--spec", nargs="*", default=[],
-                    help="tool:nslots:class:reserved_slots entries, from the "
-                         "Snakefile's TOOLS registry")
+                    help="tool:nslots:class entries, from the Snakefile's "
+                         "TOOLS registry")
     args = ap.parse_args()
 
     spec = parse_spec(args.spec)
@@ -59,17 +56,17 @@ def main() -> None:
         rep_dir, slots_dir, tool_dir, sample_dir = time_txt.parents[0:4]
         tool = tool_dir.name
         nslots = slots_dir.name.removeprefix("t")
-        cls, reserved = spec.get((tool, nslots), ("", 0))
         m = parse(time_txt)
         wall, user, sys_s = (m.get(k, "") for k in ("wall_s", "user_s", "sys_s"))
         cpu = round(user + sys_s, 2) if user != "" and sys_s != "" else ""
-        reserved_cpu = round(reserved * wall, 2) if wall != "" and reserved else ""
+        # Reserved cost only means something for a swept run, where the slots
+        # claimed are an explicit input; stock runs assume a single CPU.
+        reserved_cpu = round(int(nslots) * wall, 2) if nslots.isdigit() and wall != "" else ""
         rows.append({
             "sample": sample_dir.name,
             "tool": tool,
-            "tool_class": cls,
+            "tool_class": spec.get((tool, nslots), ""),
             "nslots": nslots,
-            "reserved_slots": reserved,
             "rep": int(rep_dir.name.removeprefix("rep")),
             "wall_s":         wall,
             "cpu_s":          cpu,
