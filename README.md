@@ -276,9 +276,9 @@ The split is **on by default**, assumes the Illumina read-name layout (see [§ C
 
 | | without | with | cost |
 |---|---|---|---|
-| wall time | 400.8 s | 429.1 s | **+7.1%** |
-| user CPU | 392.1 s | 415.1 s | +5.9% |
-| peak RSS | 6,494 MB | 6,429 MB | **none** |
+| wall time | 359.7 s | 385.6 s | **+7.2%** |
+| user CPU | 358.6 s | 381.4 s | +6.3% |
+| peak RSS | 5,419 MB | 5,386 MB | **none** |
 | temp disk | — | 4.95 GiB | 16 B per pair |
 
 So the cost is a few percent of runtime and no extra memory, against 16 bytes of temp disk per pair (about 5 GB for a 30x human genome — see `--tmp-dir`).
@@ -289,6 +289,8 @@ So the cost is a few percent of runtime and no extra memory, against 16 bytes of
 |---|---|---|
 | main pass — one dictionary lookup and a 16-byte append per pair (27 ns/pair) | +9.1 s | yes |
 | post-pass — read back 4.95 GiB, sort each bucket, walk groups | +16.9 s | **no** |
+
+Those two account for the whole 25.9 s above.
 
 In `bwa-mem … \| dupblaster … \| samtools sort`, the sort sees end-of-input as soon as the main pass ends and proceeds while dupblaster is still decomposing. The overhead the pipeline actually feels is the first row alone — about **+2.5%**.
 
@@ -303,9 +305,21 @@ library_duplicates    = n - 1      each extra tile is an independent molecule
 total                 = k - 1      the duplicates dupblaster already reports
 ```
 
-The two always sum to `duplicate_pairs` exactly.
+The two always sum to `duplicate_pairs` exactly. That is the **raw** rule, reported as `raw_sequencing_duplicates`.
 
-Large groups land on the same tile by coincidence sometimes, which would inflate `k - n`, so each group is compared against the number of tiles `k` *independent* molecules would be expected to occupy, `E[n|k] = Σ_t (1 - (1 - w_t)^k)`, where `w_t` is tile `t`'s share of templates. The correction is negligible on WGS (0.09 pp on our test sample) but removes over 20% of the naive count for groups above 100 members — so it is load-bearing for RNA-seq, amplicon and other data where large groups are normal. Both figures are reported, and their gap is itself a useful diagnostic.
+#### Correcting for chance
+
+Independent molecules sometimes land on the same tile by accident, so the tile count `n` under-states how many molecules a group really held, and the raw rule credits the difference to the flowcell. The reported `corrected_sequencing_duplicates` therefore does not use `k - n`. It asks instead **how many independent molecules would produce the `n` tiles we saw**, by inverting
+
+```
+E[n | m] = Σ_t (1 - (1 - w_t)^m)
+```
+
+for `m` (where `w_t` is tile `t`'s share of the library's templates), and reports `k - m`, bounded by `k`.
+
+Inverting is not the same as subtracting `E[n | k] - n`, which is the form that first suggests itself. Only the *independent* molecules can collide, and there are fewer of them than `k`, so subtracting the collisions expected of all `k` members over-corrects — by 0.2% of the count at `k = 20`, 3.8% at `k = 500` and **21% at `k = 3102`** on real tile shares. The gap between the raw and corrected columns is a useful diagnostic in its own right: it is 0.05 pp on our WGS sample and grows with group size, so it is where RNA-seq and amplicon data will differ most from WGS.
+
+A library on fewer than two tiles is a special case: `E[n | m]` is then constant, every duplicate is on "the" tile whether it was clustered or not, and no attribution is possible. Both counts are left blank, with `tile_count` and `tile_collision_rate` showing why.
 
 ### No pixel radius
 
@@ -317,7 +331,7 @@ Picard and `samtools markdup` call a duplicate optical when two reads fall withi
 | `markdup -d 2500` | 59.4% | 65.0% |
 | `markdup -d 100` | 33.2% | 10.3% |
 
-Working from identity also handles coincidental duplicates correctly with no special case: two distinct molecules at one locus land on independent tiles, so they read as `n = 2` → one library duplicate, zero sequencing. That is what makes the metric meaningful for RNA-seq and amplicon data, where such duplicates are the norm rather than the exception.
+Working from identity also handles coincidental duplicates with no special case, which is what makes the metric meaningful for RNA-seq and amplicon data where such duplicates are the norm. Two distinct molecules at one locus are imaged independently, so they usually occupy two tiles and read as one library duplicate and zero sequencing. They *can* collide on one tile — with probability `tile_collision_rate` — which is exactly what the correction above exists to account for, rather than something the raw rule gets right on its own.
 
 ### Choosing the format
 
