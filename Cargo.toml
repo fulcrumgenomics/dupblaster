@@ -40,6 +40,12 @@ memchr = "2"
 mimalloc = { version = "0.1", default-features = false }
 noodles-sam = "0.85"
 rawb-io = "0.1"
+# Only for `--read-name-format regex:<pattern>`, the escape hatch for platforms
+# without a preset (see src/readname.rs). Already in the tree via env_logger →
+# env_filter, so this adds no new crate; the feature set matches env_filter's
+# plus `unicode-perl` so users can write `\d`/`\w` in a pattern. The case-folding,
+# script, and segmentation tables stay off — read names are ASCII.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 wide = "1.4"

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--read-name-format <FORMAT>`: opt-in, off-by-default decomposition of duplicates into a **sequencing** component (copies made on the flowcell — cluster/ExAmp duplicates) and a **library** component (PCR copies, plus genuinely distinct molecules that happen to share a locus). Two duplicates imaged on the same tile are copies of one molecule; on different tiles they are independent. Adds `sequencing_duplicates`, `library_duplicates`, `frac_sequencing_duplicates`, `naive_sequencing_duplicates`, `tile_count` and `tile_collision_rate` to `--stats`, and writes a per-sequencing-unit table beside it (`<STATS>.sequencing-units.tsv`) with per-flowcell/lane template counts, tile counts and sequencing-duplicate rates. Both-ends-mapped pairs only. Validated against read-name ground truth on a 333M-template EM-seq sample: 62.78% of duplicate pairs sequencing, against 62.73% from an independent reference implementation.
+  - Accepted formats: `illumina` (`instrument:run:flowcell:lane:tile:x:y` — CASAVA 1.8+, bcl2fastq, BCL Convert), `element` (Element AVITI, the same layout), and `regex:<PATTERN>` with `(?<su>…)` and `(?<tile>…)` capture groups for platforms without a preset. The layout is never guessed — a read name the chosen format cannot parse is an error, because mis-parsing one would silently produce a confident wrong number.
+  - **Threshold-free**: uses tile *identity* only, never a pixel radius. Same-tile displacement distributions differ radically between runs (40.7% of same-tile pairs within 20 px on one sample versus 2.8% on another), so a fixed radius cannot generalize — `samtools markdup -d 2500` over-called one of our two test samples and under-called the other. It also handles coincidental duplicates correctly with no special case, which is what makes the metric meaningful for RNA-seq and amplicon data.
+  - Duplicate groups are corrected for tiles that collide **by chance**, reported alongside as `tile_collision_rate` (`q = Σ w_t²`). The correction is immaterial on WGS (0.09 pp) but removes over 20% of the naive count for groups above 100 members, so it is load-bearing wherever large groups are normal. A library on a single tile carries no information at all (`q = 1`); its counts are left blank rather than reported as zero, with `tile_count` and `tile_collision_rate` showing why.
+  - Costs ~16 bytes of temporary disk per pair (about 5 GB for a 30× human genome, under `--tmp-dir`). The temp spill is read back only after the output BAM is closed, so a downstream process is never left blocked on our stdout.
+
 ## [0.2.0] - 2026-07-28
 
 ### Added

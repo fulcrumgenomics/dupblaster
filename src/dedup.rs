@@ -26,6 +26,7 @@ use crate::sig::{
     BinIndex, FragmentDupTable, MethylationMode, PairDupTable, SingleEndStrategy,
     five_prime_aligned_pos, orphan_pos_override, single_end_slot,
 };
+use crate::tiles::TileSpiller;
 
 // ── SAM flag constants ──────────────────────────────────────────────────────
 
@@ -339,6 +340,12 @@ pub struct RecordProcessor {
     /// parallel to `dups`. `None` (the default) means no counting and no extra
     /// memory.
     counts: Option<Vec<CountsMap>>,
+    /// Spills every pair's `(signature, tile)` so duplicates can be split into
+    /// sequencing and library components after the output is closed. `Some` only
+    /// when `--read-name-format` was given; attached by
+    /// [`Self::attach_tile_spiller`] because it needs `bin_count`, which is not
+    /// known until the bins are built.
+    tiles: Option<TileSpiller>,
 }
 
 impl RecordProcessor {
@@ -382,6 +389,7 @@ impl RecordProcessor {
             opts,
             mate_cigar_scratch: Vec::with_capacity(64),
             counts,
+            tiles: None,
         }
     }
 
@@ -389,6 +397,22 @@ impl RecordProcessor {
     /// Indexed by library bucket, parallel to the `--stats` library rows.
     pub fn counts(&self) -> Option<&[CountsMap]> {
         self.counts.as_deref()
+    }
+
+    /// Attach the sequencing-vs-library duplicate spiller.
+    ///
+    /// Separate from construction because the spiller has to be sized against
+    /// [`Self::bin_count`], which is not known until the bins are built.
+    pub fn attach_tile_spiller(&mut self, spiller: TileSpiller) {
+        self.tiles = Some(spiller);
+    }
+
+    /// Take the spiller back for the post-pass, leaving none behind.
+    ///
+    /// Moving it out is deliberate: the decomposition consumes the spiller, and
+    /// it must not run until the output BAM is closed.
+    pub fn take_tile_spiller(&mut self) -> Option<TileSpiller> {
+        self.tiles.take()
     }
 
     /// Lazily get (allocating on first use) the pair table for `lib`.
@@ -676,6 +700,12 @@ impl RecordProcessor {
         // matches the dedup signature exactly.
         if let Some(counts) = self.counts.as_mut() {
             counts[lib as usize].observe_pair(slot, is_dup);
+        }
+        // Spill this pair's signature and tile for the sequencing-vs-library
+        // split. Reuses the same `slot`, so a spilled group is exactly a dedup
+        // group. Pairs only — orphans are neither spilled nor decomposed.
+        if let Some(tiles) = self.tiles.as_mut() {
+            tiles.observe_pair(lib, block[first].read_name(), slot)?;
         }
         Ok(is_dup)
     }

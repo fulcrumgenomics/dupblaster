@@ -16,7 +16,7 @@
 //! [picard]: https://github.com/broadinstitute/picard/blob/main/src/main/java/picard/sam/DuplicationMetrics.java
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use fgoxide::io::DelimFile;
@@ -26,6 +26,7 @@ use serde::Serialize;
 
 use crate::DUPBLASTER_BUILD;
 use crate::dedup::{LibraryStats, Stats};
+use crate::tiles::{Decomposition, SequencingUnitStats};
 
 /// Summary metrics for one library within a dupblaster run.
 ///
@@ -73,6 +74,39 @@ pub struct Metrics {
     /// `None` when no duplicate pairs were observed or there were no pairs
     /// to estimate from — written as an empty cell.
     pub estimated_library_size: Option<u64>,
+    /// Duplicate pairs that are copies of one molecule made on the flowcell
+    /// (cluster/ExAmp duplicates), counted as `E[tiles | k] − tiles` per group
+    /// and so already corrected for tiles that collide by chance.
+    ///
+    /// Deliberately *not* named `READ_PAIR_OPTICAL_DUPLICATES`: this is a
+    /// threshold-free, tile-identity definition rather than Picard's pixel-radius
+    /// one, and the two should not invite direct comparison.
+    ///
+    /// `None` — an empty cell — whenever the split was not computed:
+    /// `--read-name-format` was not given, the library has no pairs, or it sits
+    /// on a single tile and therefore carries no information. `tile_count` and
+    /// `tile_collision_rate` say which.
+    pub sequencing_duplicates: Option<u64>,
+    /// Duplicate pairs from independent molecules: PCR copies, plus genuinely
+    /// distinct molecules that happen to share a locus. The residual of
+    /// `duplicate_pairs − sequencing_duplicates`, so the two always sum exactly.
+    pub library_duplicates: Option<u64>,
+    /// `sequencing_duplicates / duplicate_pairs`, in [0, 1].
+    #[serde(serialize_with = "serialize_opt_f64_6dp")]
+    pub frac_sequencing_duplicates: Option<f64>,
+    /// Uncorrected `Σ (k − tiles)`. The gap to `sequencing_duplicates` is how
+    /// much of the naive count was chance tile collision: negligible on WGS,
+    /// over 20% for groups above 100 members.
+    pub naive_sequencing_duplicates: Option<u64>,
+    /// Distinct imaging tiles seen for this library. A misconfigured
+    /// `--read-name-format` shows up here as an implausibly large number.
+    pub tile_count: Option<usize>,
+    /// `q = Σ w_t²`: the chance two unrelated templates of this library share a
+    /// tile. The validity indicator for the split — at `q` near 1 there is only
+    /// one tile in play and no duplicate can be attributed, which is why it is
+    /// reported even when the counts are blank.
+    #[serde(serialize_with = "serialize_opt_f64_6dp")]
+    pub tile_collision_rate: Option<f64>,
 }
 
 /// Serialize an `f64` with 6 decimal places (fixed precision for the duplicate
@@ -85,11 +119,28 @@ pub(crate) fn serialize_f64_6dp<S: serde::Serializer>(
     serializer.serialize_str(&format!("{value:.6}"))
 }
 
+/// Serialize an optional `f64` with 6 decimal places, `None` as an empty cell.
+/// Plain `Option<u64>` already renders `None` as empty; a float needs this because
+/// the fixed-precision formatting has to be skipped rather than applied to a zero.
+fn serialize_opt_f64_6dp<S: serde::Serializer>(
+    value: &Option<f64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => serializer.serialize_str(&format!("{value:.6}")),
+        None => serializer.serialize_str(""),
+    }
+}
+
 impl Metrics {
     /// Build one TSV row from a single library's [`LibraryStats`] plus the
     /// already-resolved `sample` name. The library name comes from
     /// `library_stats.name`.
-    pub fn from_library_stats(library_stats: &LibraryStats, sample: &str) -> Self {
+    pub fn from_library_stats(
+        library_stats: &LibraryStats,
+        sample: &str,
+        decomposition: Option<&Decomposition>,
+    ) -> Self {
         let mapped_orphans = library_stats.mapped_orphan_id_count;
         let mapped_pairs = library_stats.both_mapped_id_count;
         let duplicate_orphans = library_stats.orphan_dup_count;
@@ -106,6 +157,11 @@ impl Metrics {
         // size than panic on u64 underflow.
         let estimated_library_size =
             estimate_library_size(mapped_pairs, mapped_pairs.saturating_sub(duplicate_pairs));
+        // A library on fewer than two tiles carries no information: every
+        // duplicate is on "the" tile whether it was clustered or not. Report the
+        // tile evidence so the reason is visible, but not counts that cannot mean
+        // anything. The same blanking covers a library with no pairs at all.
+        let estimable = decomposition.filter(|split| split.tile_count > 1 && mapped_pairs > 0);
         Self {
             sample: sample.to_string(),
             library: library_stats.name.clone(),
@@ -121,6 +177,15 @@ impl Metrics {
             unmapped_pairs: library_stats.both_unmapped_id_count,
             unmated_templates: library_stats.unmated_count,
             estimated_library_size,
+            sequencing_duplicates: estimable.map(|split| split.sequencing_duplicates),
+            library_duplicates: estimable.map(|split| split.library_duplicates),
+            frac_sequencing_duplicates: estimable.and_then(|split| {
+                (split.duplicate_pairs > 0)
+                    .then(|| split.sequencing_duplicates as f64 / split.duplicate_pairs as f64)
+            }),
+            naive_sequencing_duplicates: estimable.map(|split| split.naive_sequencing_duplicates),
+            tile_count: decomposition.map(|split| split.tile_count),
+            tile_collision_rate: decomposition.map(|split| split.tile_collision_rate),
         }
     }
 
@@ -133,19 +198,98 @@ impl Metrics {
         stats: &Stats,
         header: &Header,
         sample_override: Option<&str>,
+        decomposition: Option<&[Decomposition]>,
     ) -> Vec<Metrics> {
         let sample = resolve_sample(header, sample_override);
+        // Enumerate before filtering: `decomposition` is indexed by library
+        // bucket, but rows skip libraries that saw no templates, so the row
+        // position is not the bucket index.
         let mut rows: Vec<Metrics> = stats
             .libraries
             .iter()
-            .filter(|ls| ls.id_count > 0)
-            .map(|ls| Metrics::from_library_stats(ls, &sample))
+            .enumerate()
+            .filter(|(_, ls)| ls.id_count > 0)
+            .map(|(lib, ls)| {
+                Metrics::from_library_stats(ls, &sample, decomposition.and_then(|d| d.get(lib)))
+            })
             .collect();
         if rows.is_empty() {
-            rows.push(Metrics::from_library_stats(&stats.totals(), &sample));
+            // No library saw data, so there is nothing to decompose either.
+            rows.push(Metrics::from_library_stats(&stats.totals(), &sample, None));
         }
         rows
     }
+}
+
+/// One row of the per-sequencing-unit QC table written alongside `--stats` when
+/// `--read-name-format` is on.
+///
+/// Its own file because the granularity is different: a sequencing unit is a
+/// flowcell-and-lane, and one library spans many of them. The variation this
+/// exposes is large enough to matter — three flowcells of a single library
+/// measured 26.8%, 13.1% and 2.6% sequencing duplicates as a share of their own
+/// templates, a 9× spread invisible in the per-library row.
+#[derive(Debug, Clone, Serialize)]
+pub struct SequencingUnitMetrics {
+    /// Sample name, matching the `--stats` rows.
+    pub sample: String,
+    /// Library this unit's reads belong to.
+    pub library: String,
+    /// The unit as it appeared in the read names, e.g. `H72CFDSXF:2`.
+    pub sequencing_unit: String,
+    /// Templates observed on this unit.
+    pub templates: u64,
+    /// Distinct imaging tiles seen on this unit.
+    pub tiles: usize,
+    /// Sequencing duplicates credited to this unit. A duplicate group straddling
+    /// two units is credited whole to whichever holds most of its members — a
+    /// cluster duplicate physically happened on one flowcell, so splitting it
+    /// would be meaningless.
+    pub sequencing_duplicates: u64,
+    /// `sequencing_duplicates / templates`, in [0, 1] — the loading-density
+    /// signal, comparable across units.
+    #[serde(serialize_with = "serialize_f64_6dp")]
+    pub frac_sequencing_duplicates: f64,
+}
+
+impl SequencingUnitMetrics {
+    /// Build the per-unit rows, resolving library buckets to their names.
+    pub fn rows(units: &[SequencingUnitStats], stats: &Stats, sample: &str) -> Vec<Self> {
+        units
+            .iter()
+            .map(|unit| Self {
+                sample: sample.to_string(),
+                library: stats
+                    .libraries
+                    .get(unit.library as usize)
+                    .map_or_else(String::new, |ls| ls.name.clone()),
+                sequencing_unit: unit.unit.clone(),
+                templates: unit.templates,
+                tiles: unit.tiles,
+                sequencing_duplicates: unit.sequencing_duplicates,
+                frac_sequencing_duplicates: if unit.templates == 0 {
+                    0.0
+                } else {
+                    unit.sequencing_duplicates as f64 / unit.templates as f64
+                },
+            })
+            .collect()
+    }
+}
+
+/// Path of the per-sequencing-unit table, derived from the `--stats` path by
+/// inserting `.sequencing-units` before the extension. Derived rather than given
+/// its own flag so enabling the decomposition needs one option, not two.
+pub fn sequencing_units_path(stats_path: &Path) -> PathBuf {
+    let extension = stats_path.extension().and_then(|ext| ext.to_str()).unwrap_or("tsv");
+    stats_path.with_extension(format!("sequencing-units.{extension}"))
+}
+
+/// Write the per-sequencing-unit rows to `path` as a tab-separated file.
+pub fn write_unit_rows_to_path(rows: &[SequencingUnitMetrics], path: &Path) -> Result<()> {
+    DelimFile::default()
+        .write_tsv(path, rows.iter())
+        .with_context(|| format!("writing sequencing-unit TSV to {}", path.display()))
 }
 
 /// Write the metrics rows to `path` as a tab-separated file: a header row of
@@ -297,14 +441,14 @@ mod tests {
             orphan_dup_count: 10,
             ..Default::default()
         };
-        let m = Metrics::from_library_stats(&ls, "");
+        let m = Metrics::from_library_stats(&ls, "", None);
         assert!((m.frac_duplicates - 0.28).abs() < 1e-9, "got {}", m.frac_duplicates);
     }
 
     #[test]
     fn frac_duplicates_is_zero_when_no_mapped_data() {
         let ls = LibraryStats { id_count: 5, both_unmapped_id_count: 5, ..Default::default() };
-        let m = Metrics::from_library_stats(&ls, "");
+        let m = Metrics::from_library_stats(&ls, "", None);
         assert_eq!(m.frac_duplicates, 0.0);
     }
 
@@ -331,13 +475,15 @@ mod tests {
             both_mapped_dup_count: 1,
             ..Default::default()
         };
-        let m = Metrics::from_library_stats(&ls, "test");
+        let m = Metrics::from_library_stats(&ls, "test", None);
         let text = write_rows_to_string(&[m]);
         let mut lines = text.lines();
         let hdr_cols = lines.next().unwrap().split('\t').count();
         let val_cols = lines.next().unwrap().split('\t').count();
+        // Equality matters most for the trailing columns, which are `None` here:
+        // a writer that dropped empty cells would silently shorten the row.
         assert_eq!(hdr_cols, val_cols);
-        assert_eq!(hdr_cols, 14, "expected 14 metric columns");
+        assert_eq!(hdr_cols, 20, "expected 20 metric columns");
     }
 
     #[test]
@@ -363,7 +509,7 @@ mod tests {
             ],
             clamped_template_count: 0,
         };
-        let rows = Metrics::rows_from_stats(&stats, &Header::default(), None);
+        let rows = Metrics::rows_from_stats(&stats, &Header::default(), None, None);
         let names: Vec<&str> = rows.iter().map(|m| m.library.as_str()).collect();
         assert_eq!(names, ["libA", "libB"]);
         assert_eq!(rows[0].mapped_pairs, 3);
@@ -380,7 +526,7 @@ mod tests {
             both_mapped_dup_count: 0, // no dups → library size None
             ..Default::default()
         };
-        let m = Metrics::from_library_stats(&ls, "");
+        let m = Metrics::from_library_stats(&ls, "", None);
         assert!(m.estimated_library_size.is_none());
         let text = write_rows_to_string(&[m]);
         // The last column on the value row should be empty (rendered as

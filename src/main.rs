@@ -21,8 +21,10 @@ mod metrics;
 mod plots;
 mod raw_reader;
 mod raw_writer;
+mod readname;
 mod sam_reader;
 mod sig;
+mod tiles;
 
 use std::fs::File;
 use std::io::{BufRead, Write};
@@ -43,11 +45,16 @@ use rawb_io::ReadAhead;
 use crate::complexity::{LadderRecorder, ladder_path, write_ladder_rows};
 use crate::counts::{histogram_path, histogram_rows, write_histogram_rows};
 use crate::dedup::{LibraryIndex, ProcessorOptions, RecordProcessor, Stats};
-use crate::metrics::{Metrics, resolve_sample, write_rows_to_path};
+use crate::metrics::{
+    Metrics, SequencingUnitMetrics, resolve_sample, sequencing_units_path, write_rows_to_path,
+    write_unit_rows_to_path,
+};
 use crate::raw_reader::RawBamReader;
 use crate::raw_writer::RawBamWriter;
+use crate::readname::ReadNameFormat;
 use crate::sam_reader::SamReader;
 use crate::sig::{MethylationMode, SingleEndStrategy};
+use crate::tiles::{DEFAULT_SPILL_BUCKETS, TileSpiller};
 
 /// Crate-level build identifier shown in `--version` and the `@PG VN:` tag.
 const DUPBLASTER_BUILD: &str = env!("CARGO_PKG_VERSION");
@@ -277,6 +284,31 @@ pub struct Args {
           default_value_t = 1_000_000,
           value_parser = clap::value_parser!(u64).range(1..))]
     pub complexity_interval: u64,
+
+    /// Split duplicates into sequencing (on-flowcell cluster/ExAmp) and library
+    /// (PCR, or coincident molecules) components, by reading each template's
+    /// sequencing unit and imaging tile from its read name. Two duplicates on one
+    /// tile are copies of one molecule; on different tiles they are independent.
+    /// The value names the read-name layout:
+    ///   `illumina`      — instrument:run:flowcell:lane:tile:x:y (CASAVA 1.8+,
+    ///     bcl2fastq, BCL Convert)
+    ///   `element`       — Element AVITI, which shares that layout
+    ///   `regex:PATTERN` — a custom pattern with `(?<su>…)` and `(?<tile>…)`
+    ///     capture groups, for platforms without a preset
+    /// The layout is never guessed: a read name it cannot parse is an error, since
+    /// mis-parsing one would silently produce a confident wrong number. Adds
+    /// `sequencing_duplicates` / `library_duplicates` and the tile-collision rate
+    /// to `--stats`. Both-ends-mapped pairs only; needs ~16 bytes of temp space
+    /// per pair (about 5 GB for a 30x human genome). Off by default.
+    #[arg(long = "read-name-format", value_name = "FORMAT")]
+    pub read_name_format: Option<ReadNameFormat>,
+
+    /// Files the `--read-name-format` spill is split across. Clamped to the
+    /// process's open-file limit. Exposed only to measure the trade-off between
+    /// descriptor use and per-bucket sort size.
+    #[arg(long = "spill-buckets", hide = true, default_value_t = DEFAULT_SPILL_BUCKETS,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    pub spill_buckets: u32,
 
     /// Output fewer statistics.
     #[arg(short = 'q', long = "quiet")]
@@ -525,6 +557,18 @@ fn run(args: Args) -> Result<ExitCode> {
     let mut stats = Stats::new(&library_index);
     let mut processor =
         RecordProcessor::from_ref_lengths(&ref_lengths, opts, args.min_bins, library_index);
+    // Attached after construction because the spiller is sized against
+    // `bin_count`, which only exists once the bins are built.
+    if let Some(format) = args.read_name_format.clone() {
+        let spiller = TileSpiller::new(
+            format,
+            processor.bin_count(),
+            args.spill_buckets,
+            args.tmp_dir.as_deref(),
+        )
+        .context("preparing the sequencing-vs-library duplicate spill")?;
+        processor.attach_tile_spiller(spiller);
+    }
     if !args.quiet {
         eprintln!(
             "dupblaster: bin_shift={} bin_count={} (min-bins={}), partition cells ≈ {}",
@@ -601,9 +645,44 @@ fn run(args: Args) -> Result<ExitCode> {
     // that relying on `Drop` alone would silently swallow.
     out.finish().context("finishing main output")?;
 
+    // Only now that the output stream is closed may the decomposition read its
+    // spill back: it touches gigabytes and can take tens of seconds, and
+    // dupblaster sits in pipelines where a downstream sort or caller is blocked
+    // on our stdout. This ordering is a hard requirement, not a preference.
+    let decomposition = match processor.take_tile_spiller() {
+        Some(spiller) => {
+            if !args.quiet {
+                eprintln!(
+                    "dupblaster: decomposing duplicates from {:.1} MiB of spilled tile records",
+                    spiller.spilled_bytes() as f64 / (1024.0 * 1024.0),
+                );
+            }
+            Some(
+                spiller
+                    .decompose(num_libs)
+                    .context("decomposing sequencing vs library duplicates")?,
+            )
+        }
+        None => None,
+    };
+
     if let Some(stats_path) = args.stats.as_deref() {
-        let rows = Metrics::rows_from_stats(&stats, &header, args.sample.as_deref());
+        let rows = Metrics::rows_from_stats(
+            &stats,
+            &header,
+            args.sample.as_deref(),
+            decomposition.as_ref().map(|result| result.libraries.as_slice()),
+        );
         write_rows_to_path(&rows, stats_path).context("writing --stats TSV")?;
+
+        // The per-unit table is a different granularity (one flowcell-and-lane
+        // per row), so it gets its own file beside the per-library one.
+        if let Some(result) = decomposition.as_ref() {
+            let sample = resolve_sample(&header, args.sample.as_deref());
+            let rows = SequencingUnitMetrics::rows(&result.units, &stats, &sample);
+            write_unit_rows_to_path(&rows, &sequencing_units_path(stats_path))
+                .context("writing sequencing-unit TSV")?;
+        }
     }
 
     // `--complexity-metrics <PREFIX>`, shared by the two QC blocks below.
@@ -1058,6 +1137,8 @@ mod tests {
             sample: None,
             complexity_metrics: None,
             complexity_interval: 1_000_000,
+            read_name_format: None,
+            spill_buckets: DEFAULT_SPILL_BUCKETS,
             quiet: true,
             min_bins: 32,
             check_crc: false,

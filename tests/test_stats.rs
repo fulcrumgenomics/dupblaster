@@ -164,8 +164,46 @@ fn stats_tsv_has_all_expected_columns() {
         "unmapped_pairs",
         "unmated_templates",
         "estimated_library_size",
+        // Present regardless of `--read-name-format`; blank without it, so the
+        // column set does not change shape depending on the options used.
+        "sequencing_duplicates",
+        "library_duplicates",
+        "frac_sequencing_duplicates",
+        "naive_sequencing_duplicates",
+        "tile_count",
+        "tile_collision_rate",
     ];
     assert_eq!(cols, expected);
+}
+
+/// Without `--read-name-format` the decomposition columns are present but empty,
+/// so a consumer sees a stable schema and can tell "not measured" from "zero".
+#[test]
+fn decomposition_columns_are_blank_when_no_read_name_format_is_given() {
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    SamBuilder::new()
+        .sq("chr1", 1_000_000)
+        .rec_simple("r1", 99, "chr1", 100, "50M", "=", 200, 150)
+        .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150)
+        .write_to(&env.input);
+    run_with_stats(&env.input, &stats, &out, &[]);
+    let text = std::fs::read_to_string(&stats).unwrap();
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
+    let values: Vec<&str> = lines.next().unwrap().split('\t').collect();
+    for column in [
+        "sequencing_duplicates",
+        "library_duplicates",
+        "frac_sequencing_duplicates",
+        "naive_sequencing_duplicates",
+        "tile_count",
+        "tile_collision_rate",
+    ] {
+        let index = header.iter().position(|c| *c == column).expect("column present");
+        assert_eq!(values[index], "", "{column} should be blank");
+    }
 }
 
 /// `--remove-dups` drops duplicate records from the output but the `--stats`
