@@ -342,7 +342,7 @@ pub struct RecordProcessor {
     counts: Option<Vec<CountsMap>>,
     /// Spills every pair's `(signature, tile)` so duplicates can be split into
     /// sequencing and library components after the output is closed. `Some` only
-    /// when `--read-name-format` was given; attached by
+    /// unless `--no-sequencing-dups` was given; attached by
     /// [`Self::attach_tile_spiller`] because it needs `bin_count`, which is not
     /// known until the bins are built.
     tiles: Option<TileSpiller>,

@@ -22,14 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`estimated_library_size` now has sequencing duplicates removed from the observed total**, following Picard's `ESTIMATED_LIBRARY_SIZE` convention (subtracted from `n`, not from the unique count). Flowcell duplicates are not evidence a library is exhausted, so counting them as saturation understates it — worth 2.3x on one 30x WGS sample. Under `--no-sequencing-dups` the column falls back to the previous uncorrected value.
 
+### Fixed
+
+- A run that aborts part-way now leaves its partial BAM **without** the BGZF EOF marker, so `samtools quickcheck` and other readers correctly report it as truncated. Previously the writer's `Drop` emitted that marker on the way out, so a file missing records passed every integrity check it had. The partial output is still left on disk — discarding it would be its own surprise — it just no longer claims to be complete. Applies to every aborting run, independently of `--no-sequencing-dups`.
+
 ### Upgrading from 0.2.0
 
-Two consequences of the split being on by default. Both are one flag to resolve, and `--no-sequencing-dups` restores 0.2.0 behaviour exactly.
+Two consequences of the split being on by default. Both are one flag to resolve, and `--no-sequencing-dups` restores 0.2.0 behaviour for everything the split touches. (The partial-BAM change under **Fixed** applies regardless of that flag.)
 
 - **Temporary disk is now used on every run** — 16 bytes per both-ends-mapped pair under `--tmp-dir` (`$TMPDIR` by default): ~5 GB for a 30x human genome, ~50 GB at 300x. dupblaster deliberately does not try to predict the requirement, since with a streamed input it cannot know the shape of what is coming; a spill write that fails is a hard error rather than a silently dropped metric. Point `--tmp-dir` at a volume with room, or pass `--no-sequencing-dups`.
 - **Read names that are not Illumina/Element-shaped now fail the run.** MGI, Ultima, pre-CASAVA-1.8 Illumina, and anything whose names were rewritten (SRA accessions, simulated data) need either `--no-sequencing-dups` or `--read-name-format regex:PATTERN`. The error message names both.
-- A run that aborts part-way now leaves its partial BAM **without** the BGZF EOF marker, so `samtools quickcheck` and other readers correctly report it as truncated. Previously such a file looked complete.
-
 ## [0.2.0] - 2026-07-28
 
 ### Added

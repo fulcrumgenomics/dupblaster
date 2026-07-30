@@ -351,12 +351,12 @@ With `--stats <PATH>`, a companion `<PATH>.sequencing-units.tsv` breaks the same
 | `sequencing_unit` | Flowcell and lane, verbatim from the read names, e.g. `H72CFDSXF:2`. |
 | `templates` | Templates observed on this unit. |
 | `tiles` | Distinct tiles seen on this unit. |
-| `sequencing_duplicates` | Sequencing duplicates credited to this unit. A group straddling two units is credited whole to whichever holds most of its members — a cluster duplicate physically happened on one flowcell, so splitting it would be meaningless. |
+| `sequencing_duplicates` | Sequencing duplicates on this unit's own tiles — each tile contributes `members - 1` of any group it holds part of, so a group straddling two units splits across them exactly. Summed over all units this equals `raw_sequencing_duplicates`. |
 | `frac_sequencing_duplicates` | `sequencing_duplicates / templates` — the loading-density signal, comparable across units. |
 
 ### Corrected library size
 
-Flowcell duplicates are not evidence that a library is exhausted, so counting them as saturation makes it look smaller than it is. `estimated_library_size_corrected` re-runs the Lander-Waterman solve with sequencing duplicates removed from the observed total (Picard's convention: subtracted from `n`, not from the unique count). On one 30x WGS sample this raised the estimate 3.1x, from 73.0M to 226.4M molecules. The uncorrected `estimated_library_size` is kept alongside it so the plain column stays comparable across runs whether or not the split was computed.
+Flowcell duplicates are not evidence that a library is exhausted, so counting them as saturation makes it look smaller than it is. `estimated_library_size` therefore runs the Lander-Waterman solve with sequencing duplicates removed from the observed total — Picard's `ESTIMATED_LIBRARY_SIZE` convention, subtracted from `n` and not from the unique count. On one 30x WGS sample that raised the estimate 2.3x. There is deliberately only one such column: under `--no-sequencing-dups`, or wherever the split is not estimable, it falls back to the uncorrected value rather than appearing beside a second one.
 
 ### Upgrading from 0.2.0
 
@@ -365,7 +365,9 @@ Two things changed for existing pipelines, both because the split is now on by d
 1. **dupblaster reads temporary disk on every run** — 16 bytes per both-ends-mapped pair under `--tmp-dir` (`$TMPDIR` by default), so ~5 GB for a 30x human genome and ~50 GB at 300x. It does not try to predict the requirement, because with a streamed input it cannot know the shape of what is coming; a spill write that fails is a hard error rather than a silently dropped metric.
 2. **Read names that are not Illumina/Element-shaped now fail the run.** If your BAMs come from MGI or Ultima, predate CASAVA 1.8, or had their names rewritten (SRA accessions, simulated data), add `--no-sequencing-dups` — or describe the layout with `--read-name-format regex:PATTERN` to get the metric.
 
-Both are single-flag fixes, and `--no-sequencing-dups` restores 0.2.0 behaviour exactly.
+Both are single-flag fixes; `--no-sequencing-dups` restores 0.2.0 behaviour for everything the split touches.
+
+One change applies regardless of that flag: a run that aborts part-way now leaves its partial BAM **without** the BGZF EOF marker, so `samtools quickcheck` and other readers report it as truncated. Previously such a file looked complete while missing records.
 
 ### Known limitation
 

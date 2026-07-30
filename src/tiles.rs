@@ -367,14 +367,13 @@ pub(crate) struct SequencingUnitStats {
     pub templates: u64,
     /// Distinct tiles seen on this unit.
     pub tiles: usize,
-    /// Sequencing duplicates attributed to this unit.
+    /// Sequencing duplicates on this unit's own tiles.
     ///
-    /// A duplicate group can straddle units, and there is no principled way to
-    /// split a cluster duplicate between two flowcells — it physically happened
-    /// on one. Each group's sequencing duplicates are therefore credited whole to
-    /// the unit holding most of its members, which is the same attribution the
-    /// reference implementation uses. Exact per-unit quantities (`templates`,
-    /// `tiles`) carry no such caveat.
+    /// Exact, with no attribution heuristic: each tile of a duplicate group seeded
+    /// one molecule and copied the rest, so it contributes `members - 1` to
+    /// whichever unit holds it. A group straddling two units therefore splits
+    /// across them by construction, and summing this column over every unit gives
+    /// back `raw_sequencing_duplicates` precisely.
     pub sequencing_duplicates: u64,
 }
 

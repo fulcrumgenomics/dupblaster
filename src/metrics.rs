@@ -275,10 +275,10 @@ pub struct SequencingUnitMetrics {
     pub templates: u64,
     /// Distinct imaging tiles seen on this unit.
     pub tiles: usize,
-    /// Sequencing duplicates credited to this unit. A duplicate group straddling
-    /// two units is credited whole to whichever holds most of its members — a
-    /// cluster duplicate physically happened on one flowcell, so splitting it
-    /// would be meaningless.
+    /// Sequencing duplicates on this unit's own tiles: each tile contributes
+    /// `members - 1` of whatever duplicate group it holds part of. A group
+    /// straddling two units splits across them exactly, so this column sums over
+    /// all units to `raw_sequencing_duplicates` in the per-library file.
     pub sequencing_duplicates: u64,
     /// `sequencing_duplicates / templates`, in [0, 1] — the loading-density
     /// signal, comparable across units.
