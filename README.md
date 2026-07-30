@@ -279,9 +279,18 @@ This is **off by default** and covers **both-ends-mapped pairs only** — single
 | wall time | 400.8 s | 429.1 s | **+7.1%** |
 | user CPU | 392.1 s | 415.1 s | +5.9% |
 | peak RSS | 6,494 MB | 6,429 MB | **none** |
-| temp disk | — | 5.07 GiB | 16 B per pair |
+| temp disk | — | 4.95 GiB | 16 B per pair |
 
 So the cost is a few percent of runtime and no extra memory, against 16 bytes of temp disk per pair (about 5 GB for a 30x human genome — see `--tmp-dir`).
+
+**In a pipeline, most of that cost is invisible.** The work splits into a per-pair part during the main pass and a post-pass that reassembles the groups, and the post-pass runs only *after* the output stream is closed:
+
+| phase | cost | blocks a downstream process? |
+|---|---|---|
+| main pass — one dictionary lookup and a 16-byte append per pair (27 ns/pair) | +9.1 s | yes |
+| post-pass — read back 4.95 GiB, sort each bucket, walk groups | +16.9 s | **no** |
+
+In `bwa-mem … \| dupblaster … \| samtools sort`, the sort sees end-of-input as soon as the main pass ends and proceeds while dupblaster is still decomposing. The overhead the pipeline actually feels is the first row alone — about **+2.5%**.
 
 ### How it works
 

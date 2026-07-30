@@ -261,9 +261,18 @@ impl TileDictionary {
 /// into `stride²` cells) and `sig` is the pair of *within-bin* positions. Two
 /// templates are the same duplicate signature only if both agree.
 ///
-/// Field order is deliberate: `sig` first makes the struct exactly 16 bytes with
-/// no interior or trailing padding. Declaring `off` first would align `sig` to 8
-/// and pad the struct out to **24** bytes — a 50% larger spill for nothing.
+/// The **on-disk** width is fixed at [`SPILL_RECORD_BYTES`] by [`Self::to_bytes`],
+/// independent of how this struct happens to be laid out in memory.
+///
+/// The field order still matters, but for memory rather than disk: the post-pass
+/// loads a whole bucket into a `Vec<SpillRecord>` to sort it, so a padding-free
+/// 16-byte element keeps that buffer at ~83 MB per bucket for a 333M-template
+/// file instead of ~125 MB. Putting the `u64` first is what achieves that —
+/// declaring `off` first under `#[repr(C)]` would pad to 24 (4 bytes before `sig`
+/// to align it, 4 more at the tail to keep the size an 8-multiple). There is no
+/// `repr(C)` here, so rustc reorders fields itself and would reach 16 either way;
+/// the declaration order and the assertion below simply make it explicit rather
+/// than dependent on a layout rustc leaves unspecified.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SpillRecord {
     /// Within-cell signature: `(bin_pos1 << 32) | bin_pos2`.
@@ -279,7 +288,7 @@ const SPILL_RECORD_BYTES: usize = 16;
 
 const _: () = assert!(
     size_of::<SpillRecord>() == SPILL_RECORD_BYTES,
-    "SpillRecord must stay padding-free — see the note on field order"
+    "SpillRecord must stay padding-free so a bucket's sort buffer stays 16 B/record"
 );
 
 impl SpillRecord {
