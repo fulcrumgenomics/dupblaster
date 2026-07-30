@@ -242,10 +242,18 @@ pub struct Args {
     #[arg(long = "methylation-mode", value_enum)]
     pub methylation_mode: Option<MethylationModeCli>,
 
-    /// Directory for the temporary uncompressed BAM that `--single-end-strategy
-    /// picard-exact` uses to buffer orphan / single-end reads between its two
-    /// passes. Defaults to the system temp dir (`$TMPDIR`). The file is
-    /// deleted when dupblaster exits. No effect under other strategies.
+    /// Directory for dupblaster's temporary files. Defaults to the system temp
+    /// dir (`$TMPDIR`). Everything written here is deleted when dupblaster exits.
+    /// Two features use it, and neither writes anything when it is not enabled:
+    ///
+    /// `--single-end-strategy picard-exact` buffers orphan / single-end reads to
+    /// an uncompressed BAM here between its two passes — a small fraction of
+    /// paired data.
+    ///
+    /// `--read-name-format` spills 16 bytes per both-ends-mapped pair into a
+    /// subdirectory here, which it reads back after the output BAM is closed.
+    /// This is the larger of the two by far: roughly 5 GB for a 30x human genome
+    /// and 50 GB at 300x, so point it at a volume with room.
     #[arg(long = "tmp-dir")]
     pub tmp_dir: Option<PathBuf>,
 

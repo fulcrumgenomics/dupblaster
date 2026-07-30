@@ -215,7 +215,7 @@ The most common flags:
 | `--compression-level <N>` | BGZF compression level for output (0-12). Default 0 = uncompressed. |
 | `--single-end-strategy <NAME>` | How to key single-end / orphan reads. `strand-aware` (default), `picard-approx`, `picard-exact`, or `samblaster-legacy`. See [§ Single-end / orphan handling](#single-end--orphan-handling). |
 | `--methylation-mode <MODE>` | Methylation-aware keying for bisulfite / enzymatic-conversion data. Off by default. `directional` keeps the two original strands (OT/OB) of a fragment distinct. See [§ Methylation mode](#methylation-mode). |
-| `--tmp-dir <DIR>` | Directory for the temp BAM used by `--single-end-strategy picard-exact` (default: `$TMPDIR`). |
+| `--tmp-dir <DIR>` | Directory for dupblaster's temporary files, deleted on exit (default: `$TMPDIR`). Used by `--single-end-strategy picard-exact` for its orphan buffer, and by `--read-name-format` for its per-pair spill — the latter needs ~5 GB per 30x human genome, so point this at a volume with room. Nothing is written here unless one of those is enabled. |
 | `--library-unaware` | Disable library-aware marking; use one dedup table across all reads (samblaster behavior). No effect when the header has ≤1 library. See [§ Library awareness](#library-awareness). |
 | `--stats <PATH>` | Write a per-library TSV of run-summary metrics (one row per library). |
 | `--sample <NAME>` | Override the `sample` column in `--stats` (and `--complexity-metrics`) output. |
