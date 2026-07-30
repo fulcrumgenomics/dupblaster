@@ -57,6 +57,7 @@ more about how we can power your bioinformatics with dupblaster and beyond.
   wide TSV — one row per library — with sample, template/duplicate counts,
   Picard-style `frac_duplicates`, and a Lander-Waterman library-size estimate.
 - **Opt-in library-complexity QC.** `--complexity-metrics <PREFIX>` adds a duplicate-rate-vs-depth ladder and a group-size histogram (η_k) per library — TSVs plus ready-made PDF plots — to answer "how complex is this library, and would sequencing deeper pay off?". Off by default, and free when unset. See [§ Complexity metrics](#complexity-metrics---complexity-metrics).
+- **Sequencing vs. library duplicates, with no pixel threshold.** `--read-name-format` splits duplicates into those made on the flowcell (optical/ExAmp — "the flowcell was loaded too densely") and those from independent molecules ("the library was over-amplified"), which call for opposite responses. It uses imaging-tile *identity* rather than a fixed pixel radius, because same-tile displacement distributions differ radically between runs, and it corrects for tiles that collide by chance — so it stays honest on RNA-seq and amplicon data too. Off by default. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---read-name-format).
 - **Modern, gnu-style CLI.** `--remove-dups`, `--add-mate-tags`,
   `--ignore-unmated`, `--max-read-length`, `--stats`, … no camelCase flags.
 
@@ -220,6 +221,7 @@ The most common flags:
 | `--sample <NAME>` | Override the `sample` column in `--stats` (and `--complexity-metrics`) output. |
 | `--complexity-metrics <PREFIX>` | Write per-library duplication-complexity QC: a duplicate-rate ladder and a group-size histogram. Off by default. See [§ Complexity metrics](#complexity-metrics---complexity-metrics). |
 | `--complexity-interval <N>` | Snapshot cadence (in templates) for the complexity ladder. Default 1,000,000. |
+| `--read-name-format <FORMAT>` | Split duplicates into sequencing (on-flowcell) and library components, reading each template's sequencing unit and tile from its read name. `illumina`, `element`, or `regex:PATTERN`. Off by default. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---read-name-format). |
 
 Run `dupblaster --help` for the full list, including tuning knobs for
 the IO ring buffers (`--read-buffer-mb`, `--write-buffer-mb`) and
@@ -250,6 +252,91 @@ DuckDB. Give `--stats` a `.gz` (or `.bgz`) suffix to gzip-compress the file.
 | `unmapped_pairs` | Templates with both reads unmapped. |
 | `unmated_templates` | Templates with a stray half (skipped unless `--ignore-unmated`). |
 | `estimated_library_size` | Lander-Waterman estimate of unique molecules; empty when not estimable. |
+| `sequencing_duplicates` | Duplicate pairs made on the flowcell. Empty unless `--read-name-format` is given. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---read-name-format). |
+| `library_duplicates` | Duplicate pairs from independent molecules; the residual of `duplicate_pairs - sequencing_duplicates`. |
+| `frac_sequencing_duplicates` | `sequencing_duplicates / duplicate_pairs`. |
+| `naive_sequencing_duplicates` | The same count before correcting for chance tile collisions. |
+| `tile_count` | Distinct imaging tiles seen for this library. |
+| `tile_collision_rate` | `q = Σ w_t²`, the chance two unrelated templates share a tile. |
+| `estimated_library_size_corrected` | Library size re-estimated with sequencing duplicates removed. |
+
+## Sequencing vs. library duplicates (`--read-name-format`)
+
+Not all duplicates mean the same thing. A **library duplicate** is a second copy of a molecule that existed before sequencing — a PCR product, or two genuinely distinct molecules that happen to share a locus — and it tells you the library was over-amplified or under-complex. A **sequencing duplicate** is made *on the flowcell*, when one cluster is read as two (optical duplicates on unpatterned flowcells, ExAmp duplicates on patterned ones). It tells you the flowcell was loaded too densely and says nothing at all about the library.
+
+They call for opposite responses, and a single duplicate rate cannot distinguish them. `--read-name-format` does, using the one place the input records where a read was imaged: its name.
+
+```bash
+dupblaster -i in.bam -o out.bam \
+  --read-name-format illumina \
+  --stats sample.dupblaster.tsv
+```
+
+This is **off by default**. It costs ~16 bytes of temporary disk per pair (about 5 GB for a 30x human genome — see `--tmp-dir`) and roughly 25-30% wall time, so it is opt-in rather than something you pay for silently. It covers **both-ends-mapped pairs only**; single-end and orphan reads are not decomposed.
+
+### How it works
+
+Two duplicates imaged on the same tile are copies of one molecule. On different tiles they are independent, because one cluster cannot span two tiles. So for a duplicate group of `k` templates spread over `n` distinct tiles:
+
+```
+sequencing_duplicates = k - n      one molecule seeds each tile; the rest are copies
+library_duplicates    = n - 1      each extra tile is an independent molecule
+                        ─────
+total                 = k - 1      the duplicates dupblaster already reports
+```
+
+The two always sum to `duplicate_pairs` exactly.
+
+Large groups land on the same tile by coincidence sometimes, which would inflate `k - n`, so each group is compared against the number of tiles `k` *independent* molecules would be expected to occupy, `E[n|k] = Σ_t (1 - (1 - w_t)^k)`, where `w_t` is tile `t`'s share of templates. The correction is negligible on WGS (0.09 pp on our test sample) but removes over 20% of the naive count for groups above 100 members — so it is load-bearing for RNA-seq, amplicon and other data where large groups are normal. Both figures are reported, and their gap is itself a useful diagnostic.
+
+### No pixel radius
+
+Picard and `samtools markdup` call a duplicate optical when two reads fall within a fixed pixel distance. dupblaster uses tile **identity** only, and reads no x/y coordinates at all, because same-tile displacement distributions differ radically between runs. On one of our two labelled samples 40.7% of same-tile pairs were within 20 px and 2.5% were beyond 2500 px; on the other, 2.8% were within 20 px and **10.7%** were beyond 2500 px. A single radius cannot serve both — `markdup -d 2500` over-called one and under-called the other:
+
+| | sample A | sample B |
+|---|---|---|
+| truth (tile identity) | 62.8% of dups | 71.5% |
+| `markdup -d 2500` | 59.4% | 65.0% |
+| `markdup -d 100` | 33.2% | 10.3% |
+
+Working from identity also handles coincidental duplicates correctly with no special case: two distinct molecules at one locus land on independent tiles, so they read as `n = 2` → one library duplicate, zero sequencing. That is what makes the metric meaningful for RNA-seq and amplicon data, where such duplicates are the norm rather than the exception.
+
+### Choosing the format
+
+dupblaster never guesses the layout — read-name formats differ between platforms in ways that *mis-parse* rather than fail (the pre-CASAVA-1.8 Illumina layout puts a y coordinate exactly where the modern one puts a tile), and a confident wrong number is worse than an error. A read name the chosen format cannot parse aborts the run.
+
+| Value | Layout |
+|---|---|
+| `illumina` | `instrument:run:flowcell:lane:tile:x:y` — CASAVA 1.8+, bcl2fastq, BCL Convert. Extra trailing fields (an appended UMI) are ignored. |
+| `element` | Element AVITI, which uses the same seven-field layout. |
+| `regex:PATTERN` | A pattern with `(?<su>…)` and `(?<tile>…)` named capture groups, for platforms without a preset — including undelimited layouts such as MGI DNBSEQ, e.g. `regex:^(?<su>F\w+L\d)(?<tile>C\d{3}R\d{3})`. |
+
+The sequencing unit and tile are treated as **opaque tokens** and never parsed as numbers, so an instrument widening its tile numbering cannot break extraction. The unit is flowcell *and* lane, so a tile number reused across flowcells or lanes is correctly seen as a different physical place — a mistake that causes `samtools markdup` to call cross-flowcell duplicates optical ([samtools#1996](https://github.com/samtools/samtools/issues/1996)), which we measured at 1.98% of duplicates on real data.
+
+### When it can't be estimated
+
+A library on a single tile carries no information: every duplicate is on "the" tile whether it was clustered or not. dupblaster reports `tile_collision_rate` (`q`) always, and leaves the duplicate counts **blank** rather than zero when `q = 1`, so a missing number is visibly a missing number. An implausibly large `tile_count` is the signal that `--read-name-format` is pointed at the wrong field; past a million distinct tiles dupblaster warns, and past 16,777,216 it fails.
+
+### Per-sequencing-unit table
+
+With `--stats <PATH>`, a companion `<PATH>.sequencing-units.tsv` breaks the same numbers down per flowcell-and-lane, with real flowcell names. This is where the metric earns its keep — sequencing-duplicate rate varies enormously *within* one sample, so a per-library average hides it. Three flowcells of one library measured 26.0%, 12.6% and **2.4%** of their own templates, and one of those flowcells ranged from 3.9% to 19.1% across its four lanes.
+
+| Column | Meaning |
+|---|---|
+| `sample`, `library` | As in `--stats`. |
+| `sequencing_unit` | Flowcell and lane, verbatim from the read names, e.g. `H72CFDSXF:2`. |
+| `templates` | Templates observed on this unit. |
+| `tiles` | Distinct tiles seen on this unit. |
+| `sequencing_duplicates` | Sequencing duplicates credited to this unit. A group straddling two units is credited whole to whichever holds most of its members — a cluster duplicate physically happened on one flowcell, so splitting it would be meaningless. |
+| `frac_sequencing_duplicates` | `sequencing_duplicates / templates` — the loading-density signal, comparable across units. |
+
+### Corrected library size
+
+Flowcell duplicates are not evidence that a library is exhausted, so counting them as saturation makes it look smaller than it is. `estimated_library_size_corrected` re-runs the Lander-Waterman solve with sequencing duplicates removed from the observed total (Picard's convention: subtracted from `n`, not from the unique count). On one 30x WGS sample this raised the estimate 3.1x, from 73.0M to 226.4M molecules. The uncorrected `estimated_library_size` is kept alongside it so the plain column stays comparable across runs whether or not the split was computed.
+
+### Known limitation
+
+A cluster duplicate that straddles a tile boundary reads as a library duplicate, because the two copies are on different tiles. We measured this at 1.4-1.9% of duplicates on two samples. The direction is known (it under-estimates sequencing duplicates), and fixing it would need flowcell geometry that Illumina does not publish.
 
 ## Complexity metrics (`--complexity-metrics`)
 

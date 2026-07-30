@@ -291,6 +291,52 @@ fn the_tile_collision_rate_is_reported_for_an_ordinary_library() {
 }
 
 #[test]
+fn removing_sequencing_duplicates_raises_the_library_size_estimate() {
+    // Flowcell duplicates say nothing about how many distinct molecules the
+    // library held, so counting them as evidence of saturation makes the library
+    // look smaller than it is. The corrected column sits beside the plain one.
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut run = Run::new();
+    run.spread_over_tiles(200);
+    for group in 0..20 {
+        for _ in 0..3 {
+            run.pair("FC", 1, 1101, 500_000 + 1_000 * group);
+        }
+    }
+    run.write_to(&env.input);
+    run_ok(&env.input, &stats, &out, &[]);
+
+    let row = parse_row(&stats);
+    let plain: u64 = row["estimated_library_size"].parse().unwrap();
+    let corrected: u64 = row["estimated_library_size_corrected"].parse().unwrap();
+    assert!(
+        corrected > plain,
+        "corrected {corrected} should exceed uncorrected {plain} once flowcell \
+         duplicates stop counting as saturation"
+    );
+}
+
+#[test]
+fn the_corrected_library_size_is_blank_when_the_split_is_not_estimable() {
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut run = Run::new();
+    for _ in 0..3 {
+        run.pair("FC", 1, 1101, 500_000);
+    }
+    run.write_to(&env.input);
+    run_ok(&env.input, &stats, &out, &[]);
+
+    let row = parse_row(&stats);
+    assert_eq!(row["tile_count"], "1");
+    assert_eq!(row["estimated_library_size_corrected"], "");
+    assert!(!row["estimated_library_size"].is_empty(), "the plain estimate still stands");
+}
+
+#[test]
 fn a_read_name_the_chosen_format_cannot_parse_is_a_hard_error() {
     let env = TestEnv::new();
     let stats = env._tmp.path().join("stats.tsv");

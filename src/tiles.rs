@@ -57,6 +57,13 @@ const BUCKET_BUFFER_BYTES: usize = 64 * 1024;
 /// record ever straddles two reads.
 const BUCKET_READ_RECORDS: usize = 64 * 1024;
 
+/// Fraction of the input's size the temp volume should have free before starting.
+///
+/// The spill is 16 bytes per pair against roughly 141 bytes per template of
+/// input BAM measured on our test file, so it needs about 8.5% of the input's
+/// size. The margin covers compression ratios well away from that sample's.
+const SPILL_SIZE_FRACTION_OF_INPUT: f64 = 0.15;
+
 /// Distinct triples above which the extractor is very likely misconfigured.
 ///
 /// Real geometry does not come close: a NovaSeq S4 run has 704 tiles per lane,
@@ -384,6 +391,7 @@ impl TileSpiller {
         bin_count: u32,
         buckets: u32,
         tmp_dir: Option<&Path>,
+        input_bytes: Option<u64>,
     ) -> Result<Self> {
         let stride = u64::from(stride_for(bin_count));
         if stride * stride > u64::from(u32::MAX) {
@@ -400,6 +408,7 @@ impl TileSpiller {
             None => TempDir::new(),
         }
         .context("creating temp directory for the duplicate-decomposition spill")?;
+        check_free_space(dir.path(), input_bytes)?;
 
         let mut writers = Vec::with_capacity(bucket_count as usize);
         for bucket in 0..bucket_count {
@@ -795,6 +804,54 @@ fn clamp_buckets(requested: u32) -> u32 {
     clamped
 }
 
+/// Fail before the main pass if `dir` plainly cannot hold the spill.
+///
+/// A courtesy rather than a guarantee, and deliberately not load-bearing: a write
+/// failure mid-run is already a hard error. It earns its keep in the one
+/// configuration where that error comes too late to be cheap — temp and output on
+/// *different* volumes, where the run would otherwise do all its work before
+/// discovering the problem. Skipped when the input size is unknown (a stream), and
+/// skipped rather than failed when the volume cannot be interrogated.
+fn check_free_space(dir: &Path, input_bytes: Option<u64>) -> Result<()> {
+    let (Some(input_bytes), Some(available)) = (input_bytes, available_bytes(dir)) else {
+        return Ok(());
+    };
+    let needed = (input_bytes as f64 * SPILL_SIZE_FRACTION_OF_INPUT) as u64;
+    if available < needed {
+        bail!(
+            "{} has {:.1} GiB free but the duplicate-decomposition spill needs about {:.1} GiB \
+             for a {:.1} GiB input; free some space, point --tmp-dir elsewhere, or drop \
+             --read-name-format",
+            dir.display(),
+            gibibytes(available),
+            gibibytes(needed),
+            gibibytes(input_bytes),
+        );
+    }
+    Ok(())
+}
+
+/// Bytes available to this user on the volume holding `dir`.
+fn available_bytes(dir: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a valid NUL-terminated C string that outlives the call,
+    // and `statvfs` only writes into `stat`, reporting failure via its return
+    // value rather than leaving `stat` partly written.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+/// Render a byte count in GiB, for messages about disk space.
+fn gibibytes(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
 /// The process's soft limit on open file descriptors.
 ///
 /// Read rather than assumed: the usual defaults (256 on macOS, 1,024 on Linux)
@@ -995,6 +1052,7 @@ mod tests {
             "illumina".parse().expect("illumina is a valid format"),
             TEST_BIN_COUNT,
             DEFAULT_SPILL_BUCKETS,
+            None,
             None,
         )
         .expect("spiller opens")
@@ -1263,6 +1321,28 @@ mod tests {
     }
 
     #[test]
+    fn an_input_too_large_for_the_temp_volume_fails_before_the_main_pass() {
+        let dir = TempDir::new().expect("temp dir");
+        let err = check_free_space(dir.path(), Some(u64::MAX)).expect_err("must not start");
+        let message = err.to_string();
+        assert!(message.contains("--tmp-dir"), "should say how to fix it: {message}");
+    }
+
+    #[test]
+    fn a_plausible_input_size_passes_the_space_check() {
+        let dir = TempDir::new().expect("temp dir");
+        assert!(check_free_space(dir.path(), Some(1024)).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_input_size_skips_the_space_check() {
+        // A streamed input has no size to size the check from; that is a reason to
+        // skip it, not to refuse to run.
+        let dir = TempDir::new().expect("temp dir");
+        assert!(check_free_space(dir.path(), None).is_ok());
+    }
+
+    #[test]
     fn buckets_stay_balanced_when_every_record_shares_one_partition_cell() {
         // A single-contig input has just one or two distinct `off` values, so
         // bucketing on `off` alone would pile the whole spill into one file.
@@ -1299,6 +1379,7 @@ mod tests {
                 "illumina".parse().expect("valid format"),
                 TEST_BIN_COUNT,
                 buckets,
+                None,
                 None,
             )
             .expect("spiller opens");

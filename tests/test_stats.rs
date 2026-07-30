@@ -172,6 +172,7 @@ fn stats_tsv_has_all_expected_columns() {
         "naive_sequencing_duplicates",
         "tile_count",
         "tile_collision_rate",
+        "estimated_library_size_corrected",
     ];
     assert_eq!(cols, expected);
 }
@@ -200,6 +201,7 @@ fn decomposition_columns_are_blank_when_no_read_name_format_is_given() {
         "naive_sequencing_duplicates",
         "tile_count",
         "tile_collision_rate",
+        "estimated_library_size_corrected",
     ] {
         let index = header.iter().position(|c| *c == column).expect("column present");
         assert_eq!(values[index], "", "{column} should be blank");

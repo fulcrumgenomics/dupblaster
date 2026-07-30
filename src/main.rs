@@ -560,11 +560,20 @@ fn run(args: Args) -> Result<ExitCode> {
     // Attached after construction because the spiller is sized against
     // `bin_count`, which only exists once the bins are built.
     if let Some(format) = args.read_name_format.clone() {
+        // The input's size sizes the pre-flight free-space check; a stream has
+        // none, in which case the check is skipped.
+        let input_bytes = args
+            .input
+            .as_deref()
+            .filter(|path| *path != Path::new("-"))
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|meta| meta.len());
         let spiller = TileSpiller::new(
             format,
             processor.bin_count(),
             args.spill_buckets,
             args.tmp_dir.as_deref(),
+            input_bytes,
         )
         .context("preparing the sequencing-vs-library duplicate spill")?;
         processor.attach_tile_spiller(spiller);
