@@ -57,7 +57,7 @@ more about how we can power your bioinformatics with dupblaster and beyond.
   wide TSV — one row per library — with sample, template/duplicate counts,
   Picard-style `frac_duplicates`, and a Lander-Waterman library-size estimate.
 - **Opt-in library-complexity QC.** `--complexity-metrics <PREFIX>` adds a duplicate-rate-vs-depth ladder and a group-size histogram (η_k) per library — TSVs plus ready-made PDF plots — to answer "how complex is this library, and would sequencing deeper pay off?". Off by default, and free when unset. See [§ Complexity metrics](#complexity-metrics---complexity-metrics).
-- **Sequencing vs. library duplicates, with no pixel threshold.** `--read-name-format` splits duplicates into those made on the flowcell (optical/ExAmp — "the flowcell was loaded too densely") and those from independent molecules ("the library was over-amplified"), which call for opposite responses. It uses imaging-tile *identity* rather than a fixed pixel radius, because same-tile displacement distributions differ radically between runs, and it corrects for tiles that collide by chance — so it stays honest on RNA-seq and amplicon data too. Off by default. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---read-name-format).
+- **Sequencing vs. library duplicates, with no pixel threshold.** dupblaster splits duplicates into those made on the flowcell (optical/ExAmp — "the flowcell was loaded too densely") and those from independent molecules ("the library was over-amplified"), which call for opposite responses. It uses imaging-tile *identity* rather than a fixed pixel radius, because same-tile displacement distributions differ radically between runs, and it corrects for tiles that collide by chance — so it stays honest on RNA-seq and amplicon data too. **On by default** at ~7% wall time, of which only a third is felt by a downstream process; `--no-sequencing-dups` turns it off. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---no-sequencing-dups).
 - **Modern, gnu-style CLI.** `--remove-dups`, `--add-mate-tags`,
   `--ignore-unmated`, `--max-read-length`, `--stats`, … no camelCase flags.
 
@@ -215,13 +215,14 @@ The most common flags:
 | `--compression-level <N>` | BGZF compression level for output (0-12). Default 0 = uncompressed. |
 | `--single-end-strategy <NAME>` | How to key single-end / orphan reads. `strand-aware` (default), `picard-approx`, `picard-exact`, or `samblaster-legacy`. See [§ Single-end / orphan handling](#single-end--orphan-handling). |
 | `--methylation-mode <MODE>` | Methylation-aware keying for bisulfite / enzymatic-conversion data. Off by default. `directional` keeps the two original strands (OT/OB) of a fragment distinct. See [§ Methylation mode](#methylation-mode). |
-| `--tmp-dir <DIR>` | Directory for dupblaster's temporary files, deleted on exit (default: `$TMPDIR`). Used by `--single-end-strategy picard-exact` for its orphan buffer, and by `--read-name-format` for its per-pair spill — the latter needs ~5 GB per 30x human genome, so point this at a volume with room. Nothing is written here unless one of those is enabled. |
+| `--tmp-dir <DIR>` | Directory for dupblaster's temporary files, deleted on exit (default: `$TMPDIR`). **The sequencing-vs-library duplicate split writes here on every run** — 16 bytes per pair, so ~5 GB for a 30x human genome and ~50 GB at 300x. Point this at a volume with room, or pass `--no-sequencing-dups`. Also used by `--single-end-strategy picard-exact` for its orphan buffer. |
 | `--library-unaware` | Disable library-aware marking; use one dedup table across all reads (samblaster behavior). No effect when the header has ≤1 library. See [§ Library awareness](#library-awareness). |
 | `--stats <PATH>` | Write a per-library TSV of run-summary metrics (one row per library). |
 | `--sample <NAME>` | Override the `sample` column in `--stats` (and `--complexity-metrics`) output. |
 | `--complexity-metrics <PREFIX>` | Write per-library duplication-complexity QC: a duplicate-rate ladder and a group-size histogram. Off by default. See [§ Complexity metrics](#complexity-metrics---complexity-metrics). |
 | `--complexity-interval <N>` | Snapshot cadence (in templates) for the complexity ladder. Default 1,000,000. |
-| `--read-name-format <FORMAT>` | Split duplicates into sequencing (on-flowcell) and library components, reading each template's sequencing unit and tile from its read name. `illumina`, `element`, or `regex:PATTERN`. Off by default. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---read-name-format). |
+| `--no-sequencing-dups` | Don't split duplicates into sequencing (on-flowcell) and library components. The split is on by default; it classifies duplicates rather than changing which reads are marked. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---no-sequencing-dups). |
+| `--read-name-format <FORMAT>` | Read-name layout the split takes the sequencing unit and tile from: `illumina` (default), `element`, or `regex:PATTERN`. Naming it explicitly also makes an unparseable read name a hard error instead of a skipped metric. |
 
 Run `dupblaster --help` for the full list, including tuning knobs for
 the IO ring buffers (`--read-buffer-mb`, `--write-buffer-mb`) and
@@ -252,7 +253,7 @@ DuckDB. Give `--stats` a `.gz` (or `.bgz`) suffix to gzip-compress the file.
 | `unmapped_pairs` | Templates with both reads unmapped. |
 | `unmated_templates` | Templates with a stray half (skipped unless `--ignore-unmated`). |
 | `estimated_library_size` | Lander-Waterman estimate of unique molecules; empty when not estimable. |
-| `sequencing_duplicates` | Duplicate pairs made on the flowcell. Empty unless `--read-name-format` is given. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---read-name-format). |
+| `sequencing_duplicates` | Duplicate pairs made on the flowcell. Empty under `--no-sequencing-dups`, or when the read names can't be parsed. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---no-sequencing-dups). |
 | `library_duplicates` | Duplicate pairs from independent molecules; the residual of `duplicate_pairs - sequencing_duplicates`. |
 | `frac_sequencing_duplicates` | `sequencing_duplicates / duplicate_pairs`. |
 | `naive_sequencing_duplicates` | The same count before correcting for chance tile collisions. |
@@ -260,19 +261,18 @@ DuckDB. Give `--stats` a `.gz` (or `.bgz`) suffix to gzip-compress the file.
 | `tile_collision_rate` | `q = Σ w_t²`, the chance two unrelated templates share a tile. |
 | `estimated_library_size_corrected` | Library size re-estimated with sequencing duplicates removed. |
 
-## Sequencing vs. library duplicates (`--read-name-format`)
+## Sequencing vs. library duplicates (`--no-sequencing-dups`)
 
 Not all duplicates mean the same thing. A **library duplicate** is a second copy of a molecule that existed before sequencing — a PCR product, or two genuinely distinct molecules that happen to share a locus — and it tells you the library was over-amplified or under-complex. A **sequencing duplicate** is made *on the flowcell*, when one cluster is read as two (optical duplicates on unpatterned flowcells, ExAmp duplicates on patterned ones). It tells you the flowcell was loaded too densely and says nothing at all about the library.
 
-They call for opposite responses, and a single duplicate rate cannot distinguish them. `--read-name-format` does, using the one place the input records where a read was imaged: its name.
+They call for opposite responses, and a single duplicate rate cannot distinguish them. dupblaster does, using the one place the input records where a read was imaged: its name.
 
 ```bash
-dupblaster -i in.bam -o out.bam \
-  --read-name-format illumina \
-  --stats sample.dupblaster.tsv
+# On by default — nothing to enable.
+dupblaster -i in.bam -o out.bam --stats sample.dupblaster.tsv
 ```
 
-This is **off by default** and covers **both-ends-mapped pairs only** — single-end and orphan reads are not decomposed. Measured on a 333M-template (50 GB) name-sorted BAM:
+The split is **on by default**, assumes the Illumina read-name layout (see [§ Choosing the format](#choosing-the-format)), and covers **both-ends-mapped pairs only** — single-end and orphan reads are not decomposed. Pass `--no-sequencing-dups` to turn it off; it only ever *classifies* duplicates, so turning it off never changes which reads get marked. Measured on a 333M-template (50 GB) name-sorted BAM:
 
 | | without | with | cost |
 |---|---|---|---|
@@ -321,7 +321,14 @@ Working from identity also handles coincidental duplicates correctly with no spe
 
 ### Choosing the format
 
-dupblaster never guesses the layout — read-name formats differ between platforms in ways that *mis-parse* rather than fail (the pre-CASAVA-1.8 Illumina layout puts a y coordinate exactly where the modern one puts a tile), and a confident wrong number is worse than an error. A read name the chosen format cannot parse aborts the run.
+The layout defaults to `illumina`, and dupblaster never *guesses* beyond that — read-name formats differ between platforms in ways that **mis-parse rather than fail** (the pre-CASAVA-1.8 Illumina layout puts a y coordinate exactly where the modern one puts a tile), and a confident wrong number is worse than no number.
+
+What happens to a read name the format cannot parse therefore depends on whether you asserted the layout:
+
+- **You didn't pass `--read-name-format`.** dupblaster warns, skips the split, and finishes the run normally. Duplicate marking is unaffected and the decomposition columns are left blank. This is what lets the split be on by default without breaking MGI, Ultima, pre-CASAVA-1.8 or SRA-renamed inputs.
+- **You passed `--read-name-format`.** A mismatch is a hard error. You asserted the layout, so quietly dropping the metric would hide the mistake.
+
+Either way, names that parse for a while and then stop are a hard error: that means data from two platforms has been merged, and a split computed from the parseable prefix would silently describe only part of the file.
 
 | Value | Layout |
 |---|---|
@@ -333,7 +340,9 @@ The sequencing unit and tile are treated as **opaque tokens** and never parsed a
 
 ### When it can't be estimated
 
-A library on a single tile carries no information: every duplicate is on "the" tile whether it was clustered or not. dupblaster reports `tile_collision_rate` (`q`) always, and leaves the duplicate counts **blank** rather than zero when `q = 1`, so a missing number is visibly a missing number. An implausibly large `tile_count` is the signal that `--read-name-format` is pointed at the wrong field; past a million distinct tiles dupblaster warns, and past 16,777,216 it fails.
+The split is left **blank** rather than zero whenever it cannot mean anything, so a missing number is visibly a missing number rather than a measurement. That happens when `--no-sequencing-dups` was passed, when the read names could not be parsed (see above), when a library has no both-ends-mapped pairs, or when a library sits on a single tile.
+
+That last case is worth understanding: with one tile, every duplicate is on "the" tile whether it was clustered or not, so `q = 1` and no duplicate can be attributed. dupblaster reports `tile_collision_rate` (`q`) and `tile_count` whenever it looked at all, precisely so you can see *why* a blank is blank. An implausibly large `tile_count` is the signal that `--read-name-format` is pointed at the wrong field — past a million distinct tiles dupblaster warns, and past 16,777,216 it fails.
 
 ### Per-sequencing-unit table
 

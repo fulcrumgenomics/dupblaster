@@ -164,8 +164,8 @@ fn stats_tsv_has_all_expected_columns() {
         "unmapped_pairs",
         "unmated_templates",
         "estimated_library_size",
-        // Present regardless of `--read-name-format`; blank without it, so the
-        // column set does not change shape depending on the options used.
+        // Present whether or not the split ran, so the column set does not change
+        // shape depending on the options used; blank when it did not.
         "sequencing_duplicates",
         "library_duplicates",
         "frac_sequencing_duplicates",
@@ -177,10 +177,10 @@ fn stats_tsv_has_all_expected_columns() {
     assert_eq!(cols, expected);
 }
 
-/// Without `--read-name-format` the decomposition columns are present but empty,
+/// Under `--no-sequencing-dups` the decomposition columns are present but empty,
 /// so a consumer sees a stable schema and can tell "not measured" from "zero".
 #[test]
-fn decomposition_columns_are_blank_when_no_read_name_format_is_given() {
+fn decomposition_columns_are_blank_when_the_split_is_disabled() {
     let env = TestEnv::new();
     let stats = env._tmp.path().join("stats.tsv");
     let out = env._tmp.path().join("out.bam");
@@ -189,7 +189,7 @@ fn decomposition_columns_are_blank_when_no_read_name_format_is_given() {
         .rec_simple("r1", 99, "chr1", 100, "50M", "=", 200, 150)
         .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
-    run_with_stats(&env.input, &stats, &out, &[]);
+    run_with_stats(&env.input, &stats, &out, &["--no-sequencing-dups"]);
     let text = std::fs::read_to_string(&stats).unwrap();
     let mut lines = text.lines();
     let header: Vec<&str> = lines.next().unwrap().split('\t').collect();

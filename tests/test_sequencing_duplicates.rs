@@ -535,27 +535,126 @@ fn the_per_unit_sequencing_duplicates_sum_to_the_per_library_figure() {
     );
 }
 
+/// Run without `--read-name-format`, so the layout defaults to Illumina.
+fn run_default(input: &Path, stats: &Path, output: &Path, extra: &[&str]) -> std::process::Output {
+    Command::new(rust_binary())
+        .args(["-i"])
+        .arg(input)
+        .args(["-o"])
+        .arg(output)
+        .args(["--stats"])
+        .arg(stats)
+        .args(extra)
+        .output()
+        .expect("dupblaster ran")
+}
+
 #[test]
-fn no_sequencing_unit_table_is_written_without_the_read_name_format() {
+fn the_split_runs_by_default_with_no_flags_at_all() {
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut run = Run::new();
+    run.spread_over_tiles(200);
+    for _ in 0..4 {
+        run.pair("FC", 1, 1101, 500_000);
+    }
+    run.write_to(&env.input);
+    let result = run_default(&env.input, &stats, &out, &[]);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+
+    let row = parse_row(&stats);
+    assert_eq!(row["sequencing_duplicates"], "3", "the split should be on by default");
+    assert_eq!(row["library_duplicates"], "0");
+    assert!(env._tmp.path().join("stats.sequencing-units.tsv").exists());
+}
+
+#[test]
+fn no_sequencing_dups_turns_the_split_off() {
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut run = Run::new();
+    run.spread_over_tiles(200);
+    for _ in 0..4 {
+        run.pair("FC", 1, 1101, 500_000);
+    }
+    run.write_to(&env.input);
+    let result = run_default(&env.input, &stats, &out, &["--no-sequencing-dups"]);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+
+    let row = parse_row(&stats);
+    assert_eq!(row["duplicate_pairs"], "3", "duplicates are still marked and counted");
+    assert_eq!(row["sequencing_duplicates"], "", "but not classified");
+    assert_eq!(row["library_duplicates"], "");
+    assert_eq!(row["tile_count"], "");
+    assert!(!env._tmp.path().join("stats.sequencing-units.tsv").exists());
+}
+
+#[test]
+fn unparseable_read_names_skip_the_split_instead_of_failing_the_run() {
+    // The consequence of defaulting the layout to Illumina: a platform without a
+    // preset — MGI, Ultima, or anything whose names were rewritten — must still
+    // get its duplicates marked. The metric is dropped, loudly, and the run
+    // succeeds.
     let env = TestEnv::new();
     let stats = env._tmp.path().join("stats.tsv");
     let out = env._tmp.path().join("out.bam");
     SamBuilder::new()
         .sq("chr1", 1_000_000)
-        .rec_simple("r1", 99, "chr1", 100, "50M", "=", 200, 150)
-        .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150)
+        .rec_simple("SRR1234567.1", 99, "chr1", 100, "50M", "=", 200, 150)
+        .rec_simple("SRR1234567.1", 147, "chr1", 200, "50M", "=", 100, -150)
+        .rec_simple("SRR1234567.2", 99, "chr1", 100, "50M", "=", 200, 150)
+        .rec_simple("SRR1234567.2", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
-    let result = Command::new(rust_binary())
-        .args(["-i"])
-        .arg(&env.input)
-        .args(["-o"])
-        .arg(&out)
-        .args(["--stats"])
-        .arg(&stats)
-        .output()
-        .expect("dupblaster ran");
-    assert!(result.status.success());
+    let result = run_default(&env.input, &stats, &out, &[]);
+    assert!(result.status.success(), "must not fail: {}", String::from_utf8_lossy(&result.stderr));
+
+    let row = parse_row(&stats);
+    assert_eq!(row["duplicate_pairs"], "1", "duplicate marking is unaffected");
+    assert_eq!(row["sequencing_duplicates"], "", "the split is skipped");
     assert!(!env._tmp.path().join("stats.sequencing-units.tsv").exists());
+
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("SRR1234567"), "should quote the name: {stderr}");
+    assert!(stderr.contains("--read-name-format"), "should say how to fix it: {stderr}");
+    assert!(stderr.contains("--no-sequencing-dups"), "should say how to silence it: {stderr}");
+}
+
+#[test]
+fn naming_the_format_explicitly_makes_an_unparseable_name_fatal() {
+    // Same input as above, but the user asserted the layout — so silently
+    // dropping the metric would hide their mistake.
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    SamBuilder::new()
+        .sq("chr1", 1_000_000)
+        .rec_simple("SRR1234567.1", 99, "chr1", 100, "50M", "=", 200, 150)
+        .rec_simple("SRR1234567.1", 147, "chr1", 200, "50M", "=", 100, -150)
+        .write_to(&env.input);
+    let result = run(&env.input, &stats, &out, &[]);
+    assert!(!result.status.success(), "an explicitly named format must fail loudly");
+}
+
+#[test]
+fn read_names_that_stop_parsing_partway_are_fatal_even_by_default() {
+    // Parseable names then unparseable ones means two platforms' data got merged.
+    // Reporting a split computed from the parseable prefix would silently describe
+    // part of the file, so this fails however the format was chosen.
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut run = Run::new();
+    run.spread_over_tiles(20);
+    run.builder = std::mem::replace(&mut run.builder, SamBuilder::new())
+        .rec_simple("SRR1234567.1", 99, "chr1", 900_000, "50M", "=", 900_100, 150)
+        .rec_simple("SRR1234567.1", 147, "chr1", 900_100, "50M", "=", 900_000, -150);
+    run.write_to(&env.input);
+    let result = run_default(&env.input, &stats, &out, &[]);
+    assert!(!result.status.success(), "a mid-file format change must not pass silently");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("SRR1234567"), "{stderr}");
 }
 
 #[test]

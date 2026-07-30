@@ -54,7 +54,7 @@ use crate::raw_writer::RawBamWriter;
 use crate::readname::ReadNameFormat;
 use crate::sam_reader::SamReader;
 use crate::sig::{MethylationMode, SingleEndStrategy};
-use crate::tiles::{DEFAULT_SPILL_BUCKETS, TileSpiller};
+use crate::tiles::{DEFAULT_SPILL_BUCKETS, OnUnparseable, TileSpiller};
 
 /// Crate-level build identifier shown in `--version` and the `@PG VN:` tag.
 const DUPBLASTER_BUILD: &str = env!("CARGO_PKG_VERSION");
@@ -244,16 +244,16 @@ pub struct Args {
 
     /// Directory for dupblaster's temporary files. Defaults to the system temp
     /// dir (`$TMPDIR`). Everything written here is deleted when dupblaster exits.
-    /// Two features use it, and neither writes anything when it is not enabled:
     ///
-    /// `--single-end-strategy picard-exact` buffers orphan / single-end reads to
-    /// an uncompressed BAM here between its two passes — a small fraction of
-    /// paired data.
+    /// The sequencing-vs-library duplicate split writes here on EVERY run, since
+    /// it is on by default: 16 bytes per both-ends-mapped pair, spilled to a
+    /// subdirectory and read back once the output BAM is closed. That is roughly
+    /// 5 GB for a 30x human genome and 50 GB at 300x, so point this at a volume
+    /// with room — or pass `--no-sequencing-dups` if you don't want the metric.
     ///
-    /// `--read-name-format` spills 16 bytes per both-ends-mapped pair into a
-    /// subdirectory here, which it reads back after the output BAM is closed.
-    /// This is the larger of the two by far: roughly 5 GB for a 30x human genome
-    /// and 50 GB at 300x, so point it at a volume with room.
+    /// `--single-end-strategy picard-exact` also buffers orphan / single-end reads
+    /// to an uncompressed BAM here between its two passes, which is much smaller —
+    /// a fraction of paired data.
     #[arg(long = "tmp-dir")]
     pub tmp_dir: Option<PathBuf>,
 
@@ -293,25 +293,35 @@ pub struct Args {
           value_parser = clap::value_parser!(u64).range(1..))]
     pub complexity_interval: u64,
 
-    /// Split duplicates into sequencing (on-flowcell cluster/ExAmp) and library
-    /// (PCR, or coincident molecules) components, by reading each template's
-    /// sequencing unit and imaging tile from its read name. Two duplicates on one
-    /// tile are copies of one molecule; on different tiles they are independent.
+    /// Don't split duplicates into sequencing and library components.
     ///
-    /// FORMAT names the read-name layout. Use `illumina` for
-    /// instrument:run:flowcell:lane:tile:x:y (CASAVA 1.8+, bcl2fastq, BCL
-    /// Convert); `element` for Element AVITI, which shares that layout; or
-    /// `regex:PATTERN`, a pattern with `(?<su>...)` and `(?<tile>...)` capture
-    /// groups, for platforms without a preset.
+    /// The split is on by default. It classifies duplicates dupblaster has already
+    /// marked — it never changes which reads are marked — so turning it off only
+    /// blanks the `sequencing_duplicates` / `library_duplicates` columns and skips
+    /// the per-sequencing-unit table. See `--read-name-format`.
     ///
-    /// The layout is never guessed: a read name it cannot parse is an error, since
-    /// mis-parsing one would silently produce a confident wrong number.
+    /// Worth passing to reclaim the ~16 bytes of temp space per pair (about 5 GB
+    /// for a 30x human genome) or the ~7% wall time, of which only about a third
+    /// is felt by a downstream process in a pipeline.
+    #[arg(long = "no-sequencing-dups")]
+    pub no_sequencing_dups: bool,
+
+    /// Read-name layout to take each template's sequencing unit and imaging tile
+    /// from, for the sequencing-vs-library duplicate split. Two duplicates imaged
+    /// on one tile are copies of one molecule; on different tiles they are
+    /// independent.
     ///
-    /// Adds `sequencing_duplicates` / `library_duplicates` and the tile-collision
-    /// rate to `--stats`, plus a per-sequencing-unit table beside it.
-    /// Both-ends-mapped pairs only. Needs ~16 bytes of temp space per pair (about
-    /// 5 GB for a 30x human genome) and costs ~7% wall time; peak memory is
-    /// unchanged. Off by default.
+    /// Use `illumina` for instrument:run:flowcell:lane:tile:x:y (CASAVA 1.8+,
+    /// bcl2fastq, BCL Convert); `element` for Element AVITI, which shares that
+    /// layout; or `regex:PATTERN`, a pattern with `(?<su>...)` and `(?<tile>...)`
+    /// capture groups, for platforms without a preset. [default: illumina]
+    ///
+    /// The layout is never guessed, because mis-parsing one would silently produce
+    /// a confident wrong number. What happens to a read name it cannot parse
+    /// depends on whether you named the layout: passing this flag makes a
+    /// mismatch a hard error, while leaving it at the default makes dupblaster
+    /// skip the split with a warning — so data from platforms without a preset
+    /// still processes.
     #[arg(long = "read-name-format", value_name = "FORMAT")]
     pub read_name_format: Option<ReadNameFormat>,
 
@@ -571,7 +581,13 @@ fn run(args: Args) -> Result<ExitCode> {
         RecordProcessor::from_ref_lengths(&ref_lengths, opts, args.min_bins, library_index);
     // Attached after construction because the spiller is sized against
     // `bin_count`, which only exists once the bins are built.
-    if let Some(format) = args.read_name_format.clone() {
+    if !args.no_sequencing_dups {
+        // Naming the layout makes a mismatch fatal; leaving it defaulted makes it
+        // merely skip the split, so a platform without a preset still processes.
+        let (format, on_unparseable) = match args.read_name_format.clone() {
+            Some(format) => (format, OnUnparseable::Fail),
+            None => (ReadNameFormat::default(), OnUnparseable::Disable),
+        };
         // The input's size sizes the pre-flight free-space check; a stream has
         // none, in which case the check is skipped.
         let input_bytes = args
@@ -582,6 +598,7 @@ fn run(args: Args) -> Result<ExitCode> {
             .map(|meta| meta.len());
         let spiller = TileSpiller::new(
             format,
+            on_unparseable,
             processor.bin_count(),
             args.spill_buckets,
             args.tmp_dir.as_deref(),
@@ -670,8 +687,10 @@ fn run(args: Args) -> Result<ExitCode> {
     // spill back: it touches gigabytes and can take tens of seconds, and
     // dupblaster sits in pipelines where a downstream sort or caller is blocked
     // on our stdout. This ordering is a hard requirement, not a preference.
+    // `is_active` is false when an unparseable read name retired the split, in
+    // which case there is nothing spilled to read back.
     let decomposition = match processor.take_tile_spiller() {
-        Some(spiller) => {
+        Some(spiller) if spiller.is_active() => {
             if !args.quiet {
                 eprintln!(
                     "dupblaster: decomposing duplicates from {:.1} MiB of spilled tile records",
@@ -684,7 +703,7 @@ fn run(args: Args) -> Result<ExitCode> {
                     .context("decomposing sequencing vs library duplicates")?,
             )
         }
-        None => None,
+        _ => None,
     };
 
     if let Some(stats_path) = args.stats.as_deref() {
@@ -1158,6 +1177,7 @@ mod tests {
             sample: None,
             complexity_metrics: None,
             complexity_interval: 1_000_000,
+            no_sequencing_dups: true,
             read_name_format: None,
             spill_buckets: DEFAULT_SPILL_BUCKETS,
             quiet: true,

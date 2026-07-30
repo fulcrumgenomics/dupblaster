@@ -337,6 +337,25 @@ pub(crate) struct Decomposition {
     pub tile_count: usize,
 }
 
+/// What to do about a read name the chosen format cannot parse.
+///
+/// The severity follows whether the user asked for this format, which is what
+/// lets the decomposition be on by default without breaking platforms it does not
+/// understand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OnUnparseable {
+    /// Fail the run. Used when `--read-name-format` was given explicitly: the user
+    /// named that layout, so a name that does not fit it means the wrong one was
+    /// chosen or the data is not what it claims to be, and quietly producing no
+    /// metric would hide their mistake.
+    Fail,
+    /// Abandon the decomposition with a warning and let the run finish. Used when
+    /// the format was defaulted rather than chosen, so MGI, Ultima,
+    /// pre-CASAVA-1.8 and SRA-renamed inputs still process — a QC metric nobody
+    /// asked for must not be able to fail a duplicate-marking run.
+    Disable,
+}
+
 /// Per-sequencing-unit rollup: the QC view that exposes loading differences
 /// between flowcells and lanes.
 ///
@@ -387,8 +406,14 @@ pub(crate) struct TileSpiller {
     dir: TempDir,
     /// `buckets.len()`, cached as a `u32` for the hot-path modulo.
     bucket_count: u32,
-    /// Records appended so far, for reporting how much temp space was used.
+    /// Records appended so far, for reporting how much temp space was used. Also
+    /// distinguishes "nothing parsed yet" from "parsed for a while, then stopped".
     spilled: u64,
+    /// How to treat a read name the format cannot parse.
+    on_unparseable: OnUnparseable,
+    /// Set once the decomposition has been abandoned. Every later observation is
+    /// then a no-op and [`Self::decompose`] reports nothing.
+    disabled: bool,
 }
 
 impl TileSpiller {
@@ -400,6 +425,7 @@ impl TileSpiller {
     /// `u32` without a per-template check.
     pub(crate) fn new(
         format: ReadNameFormat,
+        on_unparseable: OnUnparseable,
         bin_count: u32,
         buckets: u32,
         tmp_dir: Option<&Path>,
@@ -436,6 +462,8 @@ impl TileSpiller {
             dir,
             bucket_count,
             spilled: 0,
+            on_unparseable,
+            disabled: false,
         })
     }
 
@@ -451,7 +479,13 @@ impl TileSpiller {
     /// the temp volume is full there is a good chance the output volume is too,
     /// and the user should hear about it while they can still act.
     pub(crate) fn observe_pair(&mut self, library: u32, name: &[u8], slot: PairSlot) -> Result<()> {
-        let id = self.dictionary.observe(library, name)?;
+        if self.disabled {
+            return Ok(());
+        }
+        let id = match self.dictionary.observe(library, name) {
+            Ok(id) => id,
+            Err(error) => return self.give_up_or_fail(error),
+        };
         // Narrowing is checked in `new` via the partition cell count.
         let record = SpillRecord { sig: slot.sig, off: slot.off as u32, id };
         let bucket = self.bucket_of(record);
@@ -460,6 +494,34 @@ impl TileSpiller {
             .context("writing to the duplicate-decomposition spill (is the temp volume full?)")?;
         self.spilled += 1;
         Ok(())
+    }
+
+    /// Handle a read name the format could not parse, per [`OnUnparseable`].
+    ///
+    /// Giving up is only offered for the *first* observation. If names parsed for a
+    /// while and then stopped, the input is internally inconsistent — two
+    /// platforms' data merged, say — and that is worth failing on however the
+    /// format was chosen, because the metric computed from the parseable prefix
+    /// would silently describe only part of the file.
+    fn give_up_or_fail(&mut self, error: anyhow::Error) -> Result<()> {
+        if self.on_unparseable == OnUnparseable::Fail || self.spilled > 0 {
+            return Err(error);
+        }
+        self.disabled = true;
+        log::warn!(
+            "not splitting sequencing from library duplicates: {error:#}. Duplicate marking is \
+             unaffected. Pass --read-name-format to name this platform's layout, or \
+             --no-sequencing-dups to skip the split without this warning."
+        );
+        Ok(())
+    }
+
+    /// Whether the decomposition is still going to produce anything.
+    ///
+    /// `false` once an unparseable read name has retired it, so the caller can
+    /// skip both the post-pass and its progress message.
+    pub(crate) fn is_active(&self) -> bool {
+        !self.disabled
     }
 
     /// Rebuild duplicate groups from the spill and decompose them.
@@ -1076,6 +1138,7 @@ mod tests {
     fn spiller() -> TileSpiller {
         TileSpiller::new(
             "illumina".parse().expect("illumina is a valid format"),
+            OnUnparseable::Fail,
             TEST_BIN_COUNT,
             DEFAULT_SPILL_BUCKETS,
             None,
@@ -1364,6 +1427,7 @@ mod tests {
         assert!(
             TileSpiller::new(
                 "illumina".parse().expect("valid format"),
+                OnUnparseable::Fail,
                 TEST_BIN_COUNT,
                 DEFAULT_SPILL_BUCKETS,
                 None,
@@ -1383,6 +1447,7 @@ mod tests {
         for buckets in [1, 2, 16, 64] {
             let mut spiller = TileSpiller::new(
                 "illumina".parse().expect("valid format"),
+                OnUnparseable::Fail,
                 TEST_BIN_COUNT,
                 buckets,
                 None,

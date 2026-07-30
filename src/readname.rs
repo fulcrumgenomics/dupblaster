@@ -78,6 +78,16 @@ pub enum ReadNameFormat {
     Custom(CustomReadNameRegex),
 }
 
+impl Default for ReadNameFormat {
+    /// [`Self::ColonDelimited`] — the layout of every Illumina instrument since
+    /// CASAVA 1.8, and of Element AVITI, so the overwhelmingly common case needs
+    /// no flag. A file it cannot parse does not fail the run unless the user named
+    /// a format explicitly; see [`crate::tiles::OnUnparseable`].
+    fn default() -> Self {
+        Self::ColonDelimited
+    }
+}
+
 impl ReadNameFormat {
     /// Extract the imaging location from `name`, or `None` if `name` does not
     /// fit this format. A `None` here is a hard error at the call site: the user
