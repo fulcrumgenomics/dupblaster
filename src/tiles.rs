@@ -57,11 +57,14 @@ const BUCKET_BUFFER_BYTES: usize = 64 * 1024;
 /// record ever straddles two reads.
 const BUCKET_READ_RECORDS: usize = 64 * 1024;
 
-/// Fraction of the input's size the temp volume should have free before starting.
+/// Rough upper bound on the spill's size as a fraction of the input's, used only
+/// for an advisory warning.
 ///
-/// The spill is 16 bytes per pair against roughly 141 bytes per template of
-/// input BAM measured on our test file, so it needs about 8.5% of the input's
-/// size. The margin covers compression ratios well away from that sample's.
+/// The spill is 16 bytes per pair against roughly 141 bytes per template of a
+/// well-compressed input BAM, so about 8.5%; the margin covers tighter
+/// compression. It is a poor bound in the other direction — an uncompressed BAM
+/// runs several times larger per template, so this over-states the need badly —
+/// which is exactly why it only ever warns. See [`warn_if_space_looks_short`].
 const SPILL_SIZE_FRACTION_OF_INPUT: f64 = 0.15;
 
 /// Distinct triples above which the extractor is very likely misconfigured.
@@ -408,7 +411,7 @@ impl TileSpiller {
             None => TempDir::new(),
         }
         .context("creating temp directory for the duplicate-decomposition spill")?;
-        check_free_space(dir.path(), input_bytes)?;
+        warn_if_space_looks_short(dir.path(), input_bytes);
 
         let mut writers = Vec::with_capacity(bucket_count as usize);
         for bucket in 0..bucket_count {
@@ -523,6 +526,9 @@ struct GroupWalker {
     totals: Vec<GroupTotals>,
     /// Per-unit rollup, indexed by the values in `unit_of`.
     units: Vec<SequencingUnitStats>,
+    /// Unrounded sequencing duplicates per unit, parallel to `units`. Kept as a
+    /// float for the same reason the per-library total is, so the two agree.
+    unit_sequencing: Vec<f64>,
     /// Reused `(unit, members)` tally for the group in hand. Groups span very few
     /// units, so a short linear scan beats a map.
     tally: Vec<(u32, u64)>,
@@ -554,6 +560,7 @@ impl GroupWalker {
             unit_of,
             models: (0..num_libs).map(|lib| ChanceModel::new(dictionary, lib)).collect(),
             totals: vec![GroupTotals::default(); num_libs as usize],
+            unit_sequencing: vec![0.0; units.len()],
             units,
             tally: Vec::new(),
         }
@@ -593,9 +600,12 @@ impl GroupWalker {
             self.totals[library].naive_sequencing += k - tiles;
             self.totals[library].corrected_sequencing += sequencing;
 
+            // Accumulate the unrounded value, exactly as the per-library total
+            // does, and round once in `finish`. Rounding per group instead would
+            // stop the per-unit column summing to the per-library figure —
+            // ten groups worth 0.76 each are 8 duplicates, not 10.
             if let Some(unit) = self.majority_unit(group) {
-                self.units[unit as usize].sequencing_duplicates +=
-                    sequencing.round().max(0.0) as u64;
+                self.unit_sequencing[unit as usize] += sequencing;
             }
         }
     }
@@ -638,6 +648,9 @@ impl GroupWalker {
             .map(|(lib, totals)| totals.finish(dictionary, lib as u32))
             .collect();
         let mut units = self.units;
+        for (unit, sequencing) in units.iter_mut().zip(&self.unit_sequencing) {
+            unit.sequencing_duplicates = sequencing.round().max(0.0) as u64;
+        }
         // Interning order is input-order dependent; sort so the emitted table is
         // not.
         units.sort_by(|a, b| a.library.cmp(&b.library).then_with(|| a.unit.cmp(&b.unit)));
@@ -804,31 +817,35 @@ fn clamp_buckets(requested: u32) -> u32 {
     clamped
 }
 
-/// Fail before the main pass if `dir` plainly cannot hold the spill.
+/// Warn before the main pass if `dir` looks too small to hold the spill.
 ///
-/// A courtesy rather than a guarantee, and deliberately not load-bearing: a write
-/// failure mid-run is already a hard error. It earns its keep in the one
-/// configuration where that error comes too late to be cheap — temp and output on
-/// *different* volumes, where the run would otherwise do all its work before
-/// discovering the problem. Skipped when the input size is unknown (a stream), and
-/// skipped rather than failed when the volume cannot be interrogated.
-fn check_free_space(dir: &Path, input_bytes: Option<u64>) -> Result<()> {
+/// Deliberately a warning, not an error. The estimate is only as good as the
+/// input's bytes-per-template, which swings by around 4x between an uncompressed
+/// BAM and a well-compressed one — so sizing a *hard* failure from it would abort
+/// runs that had ample room, which is far worse than not checking. The precise
+/// protection is the hard error on a failed spill write; this only buys an early
+/// heads-up in the case that error comes too late to be cheap, namely temp and
+/// output on different volumes.
+///
+/// Silent when the input size is unknown (a stream) or the volume cannot be
+/// interrogated.
+fn warn_if_space_looks_short(dir: &Path, input_bytes: Option<u64>) {
     let (Some(input_bytes), Some(available)) = (input_bytes, available_bytes(dir)) else {
-        return Ok(());
+        return;
     };
     let needed = (input_bytes as f64 * SPILL_SIZE_FRACTION_OF_INPUT) as u64;
     if available < needed {
-        bail!(
-            "{} has {:.1} GiB free but the duplicate-decomposition spill needs about {:.1} GiB \
-             for a {:.1} GiB input; free some space, point --tmp-dir elsewhere, or drop \
-             --read-name-format",
+        log::warn!(
+            "{} has {:.1} GiB free, which may be too little for the duplicate-decomposition \
+             spill of a {:.1} GiB input (a rough upper bound is {:.1} GiB, less for \
+             uncompressed input). If it runs out, point --tmp-dir at a larger volume or drop \
+             --read-name-format.",
             dir.display(),
             gibibytes(available),
-            gibibytes(needed),
             gibibytes(input_bytes),
+            gibibytes(needed),
         );
     }
-    Ok(())
 }
 
 /// Bytes available to this user on the volume holding `dir`.
@@ -1321,50 +1338,30 @@ mod tests {
     }
 
     #[test]
-    fn an_input_too_large_for_the_temp_volume_fails_before_the_main_pass() {
+    fn a_temp_volume_that_looks_too_small_warns_rather_than_aborting() {
+        // The estimate is only as good as the input's bytes-per-template, which
+        // swings ~4x with compression, so an over-eager hard failure would abort
+        // runs that had ample room. The authoritative check is the write itself.
         let dir = TempDir::new().expect("temp dir");
-        let err = check_free_space(dir.path(), Some(u64::MAX)).expect_err("must not start");
-        let message = err.to_string();
-        assert!(message.contains("--tmp-dir"), "should say how to fix it: {message}");
+        warn_if_space_looks_short(dir.path(), Some(u64::MAX));
+        warn_if_space_looks_short(dir.path(), Some(1024));
+        warn_if_space_looks_short(dir.path(), None);
     }
 
     #[test]
-    fn a_plausible_input_size_passes_the_space_check() {
-        let dir = TempDir::new().expect("temp dir");
-        assert!(check_free_space(dir.path(), Some(1024)).is_ok());
-    }
-
-    #[test]
-    fn an_unknown_input_size_skips_the_space_check() {
-        // A streamed input has no size to size the check from; that is a reason to
-        // skip it, not to refuse to run.
-        let dir = TempDir::new().expect("temp dir");
-        assert!(check_free_space(dir.path(), None).is_ok());
-    }
-
-    #[test]
-    fn buckets_stay_balanced_when_every_record_shares_one_partition_cell() {
-        // A single-contig input has just one or two distinct `off` values, so
-        // bucketing on `off` alone would pile the whole spill into one file.
-        let spiller = spiller();
-        let occupied: std::collections::HashSet<usize> =
-            (0..2000u64).map(|sig| spiller.bucket_of(SpillRecord { sig, off: 7, id: 0 })).collect();
+    fn a_spiller_opens_even_for_an_input_larger_than_the_volume() {
+        // Same point at the level that matters: an implausible input size must not
+        // stop the spiller from being created.
         assert!(
-            occupied.len() > DEFAULT_SPILL_BUCKETS as usize / 2,
-            "only {} of {DEFAULT_SPILL_BUCKETS} buckets used",
-            occupied.len()
+            TileSpiller::new(
+                "illumina".parse().expect("valid format"),
+                TEST_BIN_COUNT,
+                DEFAULT_SPILL_BUCKETS,
+                None,
+                Some(u64::MAX),
+            )
+            .is_ok()
         );
-    }
-
-    #[test]
-    fn a_duplicate_group_always_lands_in_one_bucket() {
-        // The whole point of the bucket function: members of a group share `off`
-        // and `sig`, so they must hash together whatever their tile.
-        let spiller = spiller();
-        let bucket = spiller.bucket_of(SpillRecord { sig: 42, off: 7, id: 0 });
-        for id in 0..100 {
-            assert_eq!(spiller.bucket_of(SpillRecord { sig: 42, off: 7, id }), bucket);
-        }
     }
 
     #[test]

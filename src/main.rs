@@ -289,17 +289,21 @@ pub struct Args {
     /// (PCR, or coincident molecules) components, by reading each template's
     /// sequencing unit and imaging tile from its read name. Two duplicates on one
     /// tile are copies of one molecule; on different tiles they are independent.
-    /// The value names the read-name layout:
-    ///   `illumina`      — instrument:run:flowcell:lane:tile:x:y (CASAVA 1.8+,
-    ///     bcl2fastq, BCL Convert)
-    ///   `element`       — Element AVITI, which shares that layout
-    ///   `regex:PATTERN` — a custom pattern with `(?<su>…)` and `(?<tile>…)`
-    ///     capture groups, for platforms without a preset
+    ///
+    /// FORMAT names the read-name layout. Use `illumina` for
+    /// instrument:run:flowcell:lane:tile:x:y (CASAVA 1.8+, bcl2fastq, BCL
+    /// Convert); `element` for Element AVITI, which shares that layout; or
+    /// `regex:PATTERN`, a pattern with `(?<su>...)` and `(?<tile>...)` capture
+    /// groups, for platforms without a preset.
+    ///
     /// The layout is never guessed: a read name it cannot parse is an error, since
-    /// mis-parsing one would silently produce a confident wrong number. Adds
-    /// `sequencing_duplicates` / `library_duplicates` and the tile-collision rate
-    /// to `--stats`. Both-ends-mapped pairs only; needs ~16 bytes of temp space
-    /// per pair (about 5 GB for a 30x human genome). Off by default.
+    /// mis-parsing one would silently produce a confident wrong number.
+    ///
+    /// Adds `sequencing_duplicates` / `library_duplicates` and the tile-collision
+    /// rate to `--stats`, plus a per-sequencing-unit table beside it.
+    /// Both-ends-mapped pairs only. Needs ~16 bytes of temp space per pair (about
+    /// 5 GB for a 30x human genome) and costs ~7% wall time; peak memory is
+    /// unchanged. Off by default.
     #[arg(long = "read-name-format", value_name = "FORMAT")]
     pub read_name_format: Option<ReadNameFormat>,
 

@@ -196,7 +196,12 @@ impl Metrics {
             }),
             naive_sequencing_duplicates: estimable.map(|split| split.naive_sequencing_duplicates),
             tile_count: decomposition.map(|split| split.tile_count),
-            tile_collision_rate: decomposition.map(|split| split.tile_collision_rate),
+            // Only meaningful once a tile has actually been seen: a library with
+            // no pairs has no tile shares, and reporting `q = 0` there would
+            // suggest limitless tiles rather than no data.
+            tile_collision_rate: decomposition
+                .filter(|split| split.tile_count > 0)
+                .map(|split| split.tile_collision_rate),
             estimated_library_size_corrected: estimable.and_then(|split| {
                 estimate_library_size(
                     mapped_pairs.saturating_sub(split.sequencing_duplicates),

@@ -497,6 +497,45 @@ fn the_per_sequencing_unit_table_attributes_sequencing_duplicates_to_its_flowcel
 }
 
 #[test]
+fn the_per_unit_sequencing_duplicates_sum_to_the_per_library_figure() {
+    // Two numbers in the same output that a user would naturally add up. They
+    // reconcile only because both accumulate the unrounded per-group value and
+    // round once; rounding per group inflates the per-unit column instead.
+    // Few tiles here on purpose, so the correction leaves fractional values.
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut run = Run::new();
+    let mut pos = 10_000;
+    for flowcell in ["FCA", "FCB"] {
+        for tile in 0..6 {
+            run.pair(flowcell, 1, tile, pos);
+            pos += 1_000;
+        }
+    }
+    for flowcell in ["FCA", "FCB"] {
+        for group in 0..10 {
+            for _ in 0..3 {
+                run.pair(flowcell, 1, 2, 5_000_000 + 1_000 * group);
+            }
+        }
+    }
+    run.write_to(&env.input);
+    run_ok(&env.input, &stats, &out, &[]);
+
+    let library: u64 = parse_row(&stats)["sequencing_duplicates"].parse().unwrap();
+    let per_unit: u64 = parse_rows(&env._tmp.path().join("stats.sequencing-units.tsv"))
+        .iter()
+        .map(|r| r["sequencing_duplicates"].parse::<u64>().unwrap())
+        .sum();
+    assert!(library > 0, "the test data should produce some sequencing duplicates");
+    assert!(
+        library.abs_diff(per_unit) <= 1,
+        "per-unit total {per_unit} should reconcile with per-library {library}"
+    );
+}
+
+#[test]
 fn no_sequencing_unit_table_is_written_without_the_read_name_format() {
     let env = TestEnv::new();
     let stats = env._tmp.path().join("stats.tsv");
@@ -547,6 +586,49 @@ fn the_split_is_identical_under_every_spill_bucket_count() {
         seen.push(format!("{sequencing}/{library}"));
     }
     assert!(seen.windows(2).all(|w| w[0] == w[1]), "bucket count changed the answer: {seen:?}");
+}
+
+#[test]
+fn the_split_is_unchanged_under_every_single_end_strategy() {
+    // Only pairs are spilled, so the orphan-keying strategy must not touch the
+    // split. `picard-exact` is the one that matters: it runs a second pass over
+    // buffered orphan blocks, and a pair counted in both passes would break the
+    // seq + lib == duplicate_pairs identity.
+    let env = TestEnv::new();
+    let out = env._tmp.path().join("out.bam");
+    let mut run = Run::new();
+    run.spread_over_tiles(100);
+    for _ in 0..3 {
+        run.pair("FC", 1, 1101, 500_000);
+    }
+    // A mapped orphan, so the deferred-fragment path actually has work to do.
+    run.builder = std::mem::replace(&mut run.builder, SamBuilder::new()).rec_simple(
+        &read_name("FC", 1, 1101, 90_001),
+        73,
+        "chr1",
+        700_000,
+        "50M",
+        "*",
+        0,
+        0,
+    );
+    run.write_to(&env.input);
+
+    let mut seen: Vec<String> = Vec::new();
+    for strategy in ["strand-aware", "picard-approx", "picard-exact", "samblaster-legacy"] {
+        let stats = env._tmp.path().join(format!("stats-{strategy}.tsv"));
+        run_ok(&env.input, &stats, &out, &["--single-end-strategy", strategy, "--ignore-unmated"]);
+        let row = parse_row(&stats);
+        let total: u64 = row["duplicate_pairs"].parse().unwrap();
+        let sequencing: u64 = row["sequencing_duplicates"].parse().unwrap();
+        let library: u64 = row["library_duplicates"].parse().unwrap();
+        assert_eq!(sequencing + library, total, "identity broken under {strategy}");
+        seen.push(format!("{sequencing}/{library}/{total}"));
+    }
+    assert!(
+        seen.windows(2).all(|w| w[0] == w[1]),
+        "orphan strategy changed the pair split: {seen:?}"
+    );
 }
 
 #[test]

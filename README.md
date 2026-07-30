@@ -272,7 +272,16 @@ dupblaster -i in.bam -o out.bam \
   --stats sample.dupblaster.tsv
 ```
 
-This is **off by default**. It costs ~16 bytes of temporary disk per pair (about 5 GB for a 30x human genome — see `--tmp-dir`) and roughly 25-30% wall time, so it is opt-in rather than something you pay for silently. It covers **both-ends-mapped pairs only**; single-end and orphan reads are not decomposed.
+This is **off by default** and covers **both-ends-mapped pairs only** — single-end and orphan reads are not decomposed. Measured on a 333M-template (50 GB) name-sorted BAM:
+
+| | without | with | cost |
+|---|---|---|---|
+| wall time | 400.8 s | 429.1 s | **+7.1%** |
+| user CPU | 392.1 s | 415.1 s | +5.9% |
+| peak RSS | 6,494 MB | 6,429 MB | **none** |
+| temp disk | — | 5.07 GiB | 16 B per pair |
+
+So the cost is a few percent of runtime and no extra memory, against 16 bytes of temp disk per pair (about 5 GB for a 30x human genome — see `--tmp-dir`).
 
 ### How it works
 
