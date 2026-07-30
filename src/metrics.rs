@@ -58,6 +58,51 @@ pub struct Metrics {
     pub mapped_pairs: u64,
     /// Duplicates among `mapped_pairs`.
     pub duplicate_pairs: u64,
+    /// Duplicate pairs that are copies made on the flowcell (cluster/ExAmp
+    /// duplicates), counted as `Σ (k − tiles)` over duplicate groups: a tile
+    /// holding `c` members of a group seeded one molecule and copied the rest.
+    ///
+    /// Uncorrected, so it slightly over-states the count wherever a group's
+    /// molecules collide on a tile by chance — negligible on WGS, material for
+    /// groups of hundreds. The companion `<STATS>.sequencing-units.tsv` sums to
+    /// exactly this figure.
+    ///
+    /// `None` — an empty cell — whenever the split was not computed:
+    /// `--no-sequencing-dups` was passed, the library has no both-ends-mapped
+    /// pairs, or it sits on a single tile and so carries no information.
+    /// `tile_count` and `tile_collision_rate` say which.
+    pub raw_sequencing_duplicates: Option<u64>,
+    /// `raw_sequencing_duplicates` corrected for tiles that collide by chance,
+    /// by inferring how many independent molecules the observed tile count
+    /// implies. This is the figure to use.
+    ///
+    /// Deliberately *not* named `READ_PAIR_OPTICAL_DUPLICATES`: this is a
+    /// threshold-free, tile-identity definition rather than Picard's pixel-radius
+    /// one, and the two should not invite direct comparison.
+    pub corrected_sequencing_duplicates: Option<u64>,
+    /// Duplicate pairs from independent molecules: PCR copies, plus genuinely
+    /// distinct molecules that happen to share a locus. The residual of
+    /// `duplicate_pairs − corrected_sequencing_duplicates`, so the two sum exactly.
+    pub library_duplicates: Option<u64>,
+    /// `duplicate_pairs / mapped_pairs`, in [0, 1] — the pair-level duplicate
+    /// rate, as distinct from the read-level `frac_duplicates` above.
+    #[serde(serialize_with = "serialize_f64_6dp")]
+    pub frac_pair_duplicates: f64,
+    /// `corrected_sequencing_duplicates / duplicate_pairs`, in [0, 1]: how much of
+    /// the duplication came from the flowcell rather than the library.
+    #[serde(serialize_with = "serialize_opt_f64_6dp")]
+    pub frac_sequencing_duplicates: Option<f64>,
+    /// Lander-Waterman estimate of the library's distinct molecules, with
+    /// sequencing duplicates removed from the observed total — Picard's
+    /// convention for `ESTIMATED_LIBRARY_SIZE`, which subtracts them from `n` but
+    /// not from the unique count. Flowcell duplicates are not evidence a library
+    /// is exhausted, so counting them as saturation understates it badly.
+    ///
+    /// Empty when it cannot be estimated: no pairs, no duplicate pairs, or — a
+    /// degenerate case — when *every* duplicate is a sequencing duplicate, which
+    /// leaves the observed total equal to the unique count and nothing for the
+    /// estimator to work from.
+    pub estimated_library_size: Option<u64>,
     /// Templates where exactly one read is mapped (mate unmapped or absent).
     pub mapped_orphans: u64,
     /// Duplicates among `mapped_orphans`.
@@ -71,53 +116,13 @@ pub struct Metrics {
     /// Templates whose paired flag was set but the mate was missing (only
     /// under `--ignore-unmated`).
     pub unmated_templates: u64,
-    /// `None` when no duplicate pairs were observed or there were no pairs
-    /// to estimate from — written as an empty cell.
-    pub estimated_library_size: Option<u64>,
-    /// Duplicate pairs that are copies of one molecule made on the flowcell
-    /// (cluster/ExAmp duplicates), counted as `E[tiles | k] − tiles` per group
-    /// and so already corrected for tiles that collide by chance.
-    ///
-    /// Deliberately *not* named `READ_PAIR_OPTICAL_DUPLICATES`: this is a
-    /// threshold-free, tile-identity definition rather than Picard's pixel-radius
-    /// one, and the two should not invite direct comparison.
-    ///
-    /// `None` — an empty cell — whenever the split was not computed:
-    /// `--read-name-format` was not given, the library has no pairs, or it sits
-    /// on a single tile and therefore carries no information. `tile_count` and
-    /// `tile_collision_rate` say which.
-    pub sequencing_duplicates: Option<u64>,
-    /// Duplicate pairs from independent molecules: PCR copies, plus genuinely
-    /// distinct molecules that happen to share a locus. The residual of
-    /// `duplicate_pairs − sequencing_duplicates`, so the two always sum exactly.
-    pub library_duplicates: Option<u64>,
-    /// `sequencing_duplicates / duplicate_pairs`, in [0, 1].
-    #[serde(serialize_with = "serialize_opt_f64_6dp")]
-    pub frac_sequencing_duplicates: Option<f64>,
-    /// Uncorrected `Σ (k − tiles)`. The gap to `sequencing_duplicates` is how
-    /// much of the naive count was chance tile collision: negligible on WGS,
-    /// over 20% for groups above 100 members.
-    pub naive_sequencing_duplicates: Option<u64>,
     /// Distinct imaging tiles seen for this library. A misconfigured
     /// `--read-name-format` shows up here as an implausibly large number.
     pub tile_count: Option<usize>,
     /// `q = Σ w_t²`: the chance two unrelated templates of this library share a
-    /// tile. The validity indicator for the split — at `q` near 1 there is only
-    /// one tile in play and no duplicate can be attributed, which is why it is
-    /// reported even when the counts are blank.
+    /// tile. Reported even when the counts are blank, so a blank is explicable.
     #[serde(serialize_with = "serialize_opt_f64_6dp")]
     pub tile_collision_rate: Option<f64>,
-    /// Library size re-estimated with sequencing duplicates removed from the
-    /// observed total, following Picard's convention of subtracting optical
-    /// duplicates from `n` but not from the unique count.
-    ///
-    /// Flowcell duplicates say nothing about how many distinct molecules the
-    /// library held, so counting them as evidence of saturation makes a library
-    /// look far smaller than it is — worth 3.1x on one 30x WGS sample
-    /// (73.0M → 226.4M). Reported next to the uncorrected
-    /// `estimated_library_size` rather than replacing it, so the plain column
-    /// stays comparable across runs whether or not the split was computed.
-    pub estimated_library_size_corrected: Option<u64>,
 }
 
 /// Serialize an `f64` with 6 decimal places (fixed precision for the duplicate
@@ -166,13 +171,22 @@ impl Metrics {
         // in `mark_dups`, but use saturating_sub defensively — if a future
         // refactor introduces a bug, we'd rather emit a nonsensical library
         // size than panic on u64 underflow.
-        let estimated_library_size =
-            estimate_library_size(mapped_pairs, mapped_pairs.saturating_sub(duplicate_pairs));
         // A library on fewer than two tiles carries no information: every
         // duplicate is on "the" tile whether it was clustered or not. Report the
         // tile evidence so the reason is visible, but not counts that cannot mean
         // anything. The same blanking covers a library with no pairs at all.
         let estimable = decomposition.filter(|split| split.tile_count > 1 && mapped_pairs > 0);
+        // Picard's convention: sequencing duplicates come off the observed total,
+        // not off the unique count.
+        let estimated_library_size = match estimable {
+            Some(split) => estimate_library_size(
+                mapped_pairs.saturating_sub(split.corrected_sequencing_duplicates),
+                mapped_pairs.saturating_sub(duplicate_pairs),
+            ),
+            None => {
+                estimate_library_size(mapped_pairs, mapped_pairs.saturating_sub(duplicate_pairs))
+            }
+        };
         Self {
             sample: sample.to_string(),
             library: library_stats.name.clone(),
@@ -182,32 +196,30 @@ impl Metrics {
             frac_duplicates,
             mapped_pairs,
             duplicate_pairs,
+            raw_sequencing_duplicates: estimable.map(|s| s.raw_sequencing_duplicates),
+            corrected_sequencing_duplicates: estimable.map(|s| s.corrected_sequencing_duplicates),
+            library_duplicates: estimable.map(|s| s.library_duplicates),
+            frac_pair_duplicates: if mapped_pairs == 0 {
+                0.0
+            } else {
+                duplicate_pairs as f64 / mapped_pairs as f64
+            },
+            frac_sequencing_duplicates: estimable.and_then(|s| {
+                (s.duplicate_pairs > 0)
+                    .then(|| s.corrected_sequencing_duplicates as f64 / s.duplicate_pairs as f64)
+            }),
+            estimated_library_size,
             mapped_orphans,
             duplicate_orphans,
             unmapped_orphans: library_stats.unmapped_orphan_id_count,
             unmapped_pairs: library_stats.both_unmapped_id_count,
             unmated_templates: library_stats.unmated_count,
-            estimated_library_size,
-            sequencing_duplicates: estimable.map(|split| split.sequencing_duplicates),
-            library_duplicates: estimable.map(|split| split.library_duplicates),
-            frac_sequencing_duplicates: estimable.and_then(|split| {
-                (split.duplicate_pairs > 0)
-                    .then(|| split.sequencing_duplicates as f64 / split.duplicate_pairs as f64)
-            }),
-            naive_sequencing_duplicates: estimable.map(|split| split.naive_sequencing_duplicates),
             tile_count: decomposition.map(|split| split.tile_count),
-            // Only meaningful once a tile has actually been seen: a library with
-            // no pairs has no tile shares, and reporting `q = 0` there would
-            // suggest limitless tiles rather than no data.
+            // Only meaningful once a tile has actually been seen: reporting `q = 0`
+            // for a library with no pairs would suggest limitless tiles, not no data.
             tile_collision_rate: decomposition
                 .filter(|split| split.tile_count > 0)
                 .map(|split| split.tile_collision_rate),
-            estimated_library_size_corrected: estimable.and_then(|split| {
-                estimate_library_size(
-                    mapped_pairs.saturating_sub(split.sequencing_duplicates),
-                    mapped_pairs.saturating_sub(duplicate_pairs),
-                )
-            }),
         }
     }
 
@@ -276,15 +288,21 @@ pub struct SequencingUnitMetrics {
 
 impl SequencingUnitMetrics {
     /// Build the per-unit rows, resolving library buckets to their names.
+    ///
+    /// A library that produced no sequencing units — no both-ends-mapped pairs —
+    /// still gets a row, with zeros and an empty `sequencing_unit`. Emitting
+    /// nothing would leave a header-less empty file that every header-driven
+    /// reader chokes on, and a visible zero row says "measured, found nothing"
+    /// where an absent file says nothing at all.
     pub fn rows(units: &[SequencingUnitStats], stats: &Stats, sample: &str) -> Vec<Self> {
-        units
+        let name_of = |library: u32| {
+            stats.libraries.get(library as usize).map_or_else(String::new, |ls| ls.name.clone())
+        };
+        let mut rows: Vec<Self> = units
             .iter()
             .map(|unit| Self {
                 sample: sample.to_string(),
-                library: stats
-                    .libraries
-                    .get(unit.library as usize)
-                    .map_or_else(String::new, |ls| ls.name.clone()),
+                library: name_of(unit.library),
                 sequencing_unit: unit.unit.clone(),
                 templates: unit.templates,
                 tiles: unit.tiles,
@@ -295,15 +313,40 @@ impl SequencingUnitMetrics {
                     unit.sequencing_duplicates as f64 / unit.templates as f64
                 },
             })
-            .collect()
+            .collect();
+        for (library, library_stats) in stats.libraries.iter().enumerate() {
+            let library = library as u32;
+            if library_stats.id_count == 0 || units.iter().any(|unit| unit.library == library) {
+                continue;
+            }
+            rows.push(Self {
+                sample: sample.to_string(),
+                library: name_of(library),
+                sequencing_unit: String::new(),
+                templates: 0,
+                tiles: 0,
+                sequencing_duplicates: 0,
+                frac_sequencing_duplicates: 0.0,
+            });
+        }
+        rows
     }
 }
 
 /// Path of the per-sequencing-unit table, derived from the `--stats` path by
 /// inserting `.sequencing-units` before the extension. Derived rather than given
-/// its own flag so enabling the decomposition needs one option, not two.
+/// its own flag so enabling the split needs no second option.
+///
+/// A compression suffix is kept last, so `out.tsv.gz` yields
+/// `out.sequencing-units.tsv.gz` rather than burying `.gz` mid-name.
 pub fn sequencing_units_path(stats_path: &Path) -> PathBuf {
+    const COMPRESSED: [&str; 2] = ["gz", "bgz"];
     let extension = stats_path.extension().and_then(|ext| ext.to_str()).unwrap_or("tsv");
+    if COMPRESSED.contains(&extension) {
+        let stem = stats_path.with_extension("");
+        let inner = stem.extension().and_then(|ext| ext.to_str()).unwrap_or("tsv").to_string();
+        return stem.with_extension(format!("sequencing-units.{inner}.{extension}"));
+    }
     stats_path.with_extension(format!("sequencing-units.{extension}"))
 }
 

@@ -5,7 +5,6 @@ mod helpers;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
 
 use helpers::*;
 
@@ -18,7 +17,7 @@ fn run_and_read(
     extra: &[&str],
 ) -> Vec<HashMap<String, String>> {
     let out = prefix.with_extension("out.bam");
-    let status = Command::new(rust_binary())
+    let status = dupblaster()
         .args(["-i"])
         .arg(input)
         .args(["-o"])
@@ -312,7 +311,7 @@ fn complexity_metrics_unwritable_dir_fails_early_with_clear_error() {
     write_pe_triple_plus_two_singletons(&env.input);
     let out = env._tmp.path().join("out.bam");
     let bad_prefix = env._tmp.path().join("no-such-dir").join("pfx");
-    let res = Command::new(rust_binary())
+    let res = dupblaster()
         .args(["-i"])
         .arg(&env.input)
         .args(["-o"])

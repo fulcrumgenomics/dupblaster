@@ -222,7 +222,7 @@ The most common flags:
 | `--complexity-metrics <PREFIX>` | Write per-library duplication-complexity QC: a duplicate-rate ladder and a group-size histogram. Off by default. See [§ Complexity metrics](#complexity-metrics---complexity-metrics). |
 | `--complexity-interval <N>` | Snapshot cadence (in templates) for the complexity ladder. Default 1,000,000. |
 | `--no-sequencing-dups` | Don't split duplicates into sequencing (on-flowcell) and library components. The split is on by default; it classifies duplicates rather than changing which reads are marked. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---no-sequencing-dups). |
-| `--read-name-format <FORMAT>` | Read-name layout the split takes the sequencing unit and tile from: `illumina` (default), `element`, or `regex:PATTERN`. Naming it explicitly also makes an unparseable read name a hard error instead of a skipped metric. |
+| `--read-name-format <FORMAT>` | Read-name layout the split takes the sequencing unit and tile from: `illumina` (default), `element`, or `regex:PATTERN`. A name the layout cannot parse is a hard error. |
 
 Run `dupblaster --help` for the full list, including tuning knobs for
 the IO ring buffers (`--read-buffer-mb`, `--write-buffer-mb`) and
@@ -252,14 +252,14 @@ DuckDB. Give `--stats` a `.gz` (or `.bgz`) suffix to gzip-compress the file.
 | `unmapped_orphans` | Templates with one read present and unmapped (no mapped mate). |
 | `unmapped_pairs` | Templates with both reads unmapped. |
 | `unmated_templates` | Templates with a stray half (skipped unless `--ignore-unmated`). |
-| `estimated_library_size` | Lander-Waterman estimate of unique molecules; empty when not estimable. |
-| `sequencing_duplicates` | Duplicate pairs made on the flowcell. Empty under `--no-sequencing-dups`, or when the read names can't be parsed. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---no-sequencing-dups). |
-| `library_duplicates` | Duplicate pairs from independent molecules; the residual of `duplicate_pairs - sequencing_duplicates`. |
-| `frac_sequencing_duplicates` | `sequencing_duplicates / duplicate_pairs`. |
-| `naive_sequencing_duplicates` | The same count before correcting for chance tile collisions. |
-| `tile_count` | Distinct imaging tiles seen for this library. |
+| `estimated_library_size` | Lander-Waterman estimate of the library's distinct molecules, with sequencing duplicates removed from the observed total (Picard's `ESTIMATED_LIBRARY_SIZE` convention). Empty when not estimable — including the degenerate case where *every* duplicate is a sequencing duplicate, which leaves no resampling to infer from. |
+| `raw_sequencing_duplicates` | Duplicate pairs made on the flowcell, uncorrected: `Σ (tile members − 1)` over duplicate groups. The per-sequencing-unit table sums to exactly this. Empty under `--no-sequencing-dups`, or when a library has no pairs or sits on one tile. |
+| `corrected_sequencing_duplicates` | The same count corrected for tiles that collide by chance. **This is the figure to use.** |
+| `library_duplicates` | The residual `duplicate_pairs − corrected_sequencing_duplicates`; the two sum exactly. |
+| `frac_pair_duplicates` | `duplicate_pairs / mapped_pairs` — the pair-level rate, as distinct from the read-level `frac_duplicates`. |
+| `frac_sequencing_duplicates` | `corrected_sequencing_duplicates / duplicate_pairs`. |
+| `tile_count` | Distinct imaging tiles seen for this library. An implausible value means `--read-name-format` is pointed at the wrong field. |
 | `tile_collision_rate` | `q = Σ w_t²`, the chance two unrelated templates share a tile. |
-| `estimated_library_size_corrected` | Library size re-estimated with sequencing duplicates removed. |
 
 ## Sequencing vs. library duplicates (`--no-sequencing-dups`)
 
@@ -323,12 +323,9 @@ Working from identity also handles coincidental duplicates correctly with no spe
 
 The layout defaults to `illumina`, and dupblaster never *guesses* beyond that — read-name formats differ between platforms in ways that **mis-parse rather than fail** (the pre-CASAVA-1.8 Illumina layout puts a y coordinate exactly where the modern one puts a tile), and a confident wrong number is worse than no number.
 
-What happens to a read name the format cannot parse therefore depends on whether you asserted the layout:
+**A read name the layout cannot parse is a hard error.** dupblaster will not quietly drop a metric that is switched on, so a platform without a preset needs one of two things from you: `--read-name-format regex:PATTERN` to describe its layout, or `--no-sequencing-dups` to skip the split. The error names both.
 
-- **You didn't pass `--read-name-format`.** dupblaster warns, skips the split, and finishes the run normally. Duplicate marking is unaffected and the decomposition columns are left blank. This is what lets the split be on by default without breaking MGI, Ultima, pre-CASAVA-1.8 or SRA-renamed inputs.
-- **You passed `--read-name-format`.** A mismatch is a hard error. You asserted the layout, so quietly dropping the metric would hide the mistake.
-
-Either way, names that parse for a while and then stop are a hard error: that means data from two platforms has been merged, and a split computed from the parseable prefix would silently describe only part of the file.
+That applies to MGI, Ultima, pre-CASAVA-1.8 Illumina, and anything whose names were rewritten (SRA accessions, for instance) — see [§ Upgrading](#upgrading-from-020).
 
 | Value | Layout |
 |---|---|
@@ -340,7 +337,7 @@ The sequencing unit and tile are treated as **opaque tokens** and never parsed a
 
 ### When it can't be estimated
 
-The split is left **blank** rather than zero whenever it cannot mean anything, so a missing number is visibly a missing number rather than a measurement. That happens when `--no-sequencing-dups` was passed, when the read names could not be parsed (see above), when a library has no both-ends-mapped pairs, or when a library sits on a single tile.
+The split is left **blank** rather than zero whenever it cannot mean anything, so a missing number is visibly a missing number rather than a measurement. That happens when `--no-sequencing-dups` was passed, when a library has no both-ends-mapped pairs, or when a library sits on a single tile.
 
 That last case is worth understanding: with one tile, every duplicate is on "the" tile whether it was clustered or not, so `q = 1` and no duplicate can be attributed. dupblaster reports `tile_collision_rate` (`q`) and `tile_count` whenever it looked at all, precisely so you can see *why* a blank is blank. An implausibly large `tile_count` is the signal that `--read-name-format` is pointed at the wrong field — past a million distinct tiles dupblaster warns, and past 16,777,216 it fails.
 
@@ -360,6 +357,15 @@ With `--stats <PATH>`, a companion `<PATH>.sequencing-units.tsv` breaks the same
 ### Corrected library size
 
 Flowcell duplicates are not evidence that a library is exhausted, so counting them as saturation makes it look smaller than it is. `estimated_library_size_corrected` re-runs the Lander-Waterman solve with sequencing duplicates removed from the observed total (Picard's convention: subtracted from `n`, not from the unique count). On one 30x WGS sample this raised the estimate 3.1x, from 73.0M to 226.4M molecules. The uncorrected `estimated_library_size` is kept alongside it so the plain column stays comparable across runs whether or not the split was computed.
+
+### Upgrading from 0.2.0
+
+Two things changed for existing pipelines, both because the split is now on by default:
+
+1. **dupblaster reads temporary disk on every run** — 16 bytes per both-ends-mapped pair under `--tmp-dir` (`$TMPDIR` by default), so ~5 GB for a 30x human genome and ~50 GB at 300x. It does not try to predict the requirement, because with a streamed input it cannot know the shape of what is coming; a spill write that fails is a hard error rather than a silently dropped metric.
+2. **Read names that are not Illumina/Element-shaped now fail the run.** If your BAMs come from MGI or Ultima, predate CASAVA 1.8, or had their names rewritten (SRA accessions, simulated data), add `--no-sequencing-dups` — or describe the layout with `--read-name-format regex:PATTERN` to get the metric.
+
+Both are single-flag fixes, and `--no-sequencing-dups` restores 0.2.0 behaviour exactly.
 
 ### Known limitation
 

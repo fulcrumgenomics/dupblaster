@@ -5,14 +5,13 @@
 mod helpers;
 
 use std::path::Path;
-use std::process::Command;
 
 use helpers::*;
 
 /// Run the Rust binary writing BAM, then return its `@PG` header lines
 /// (read in-process via noodles).
 fn run_and_get_pg_lines(sam_in: &Path, bam_out: &Path) -> Vec<String> {
-    let out = Command::new(rust_binary())
+    let out = dupblaster()
         .args(["-i"])
         .arg(sam_in)
         .args(["-o"])
@@ -94,7 +93,7 @@ fn rerunning_dupblaster_disambiguates_pg_id() {
     // Second pass: feed pass1.bam back in. The existing header already has
     // @PG ID:DUPBLASTER from pass 1, so noodles must disambiguate.
     let pass2 = env._tmp.path().join("pass2.bam");
-    let out = Command::new(rust_binary())
+    let out = dupblaster()
         .args(["-i"])
         .arg(&pass1)
         .args(["-o"])
@@ -130,13 +129,7 @@ fn input_with_broken_pp_pointer_fails_with_clear_error() {
         .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150);
     sb.write_to(&env.input);
 
-    let r = Command::new(rust_binary())
-        .args(["-i"])
-        .arg(&env.input)
-        .args(["-o"])
-        .arg(&out_bam)
-        .output()
-        .unwrap();
+    let r = dupblaster().args(["-i"]).arg(&env.input).args(["-o"]).arg(&out_bam).output().unwrap();
     assert!(!r.status.success(), "expected non-zero exit on broken PP chain");
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(

@@ -4,12 +4,11 @@ mod helpers;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
 
 use helpers::*;
 
 fn run_with_stats(input: &Path, stats: &Path, output: &Path, extra: &[&str]) {
-    let mut cmd = Command::new(rust_binary());
+    let mut cmd = dupblaster();
     cmd.args(["-i"]).arg(input).args(["-o"]).arg(output).args(["--stats"]).arg(stats).args(extra);
     let out = cmd.output().expect("rust dupblaster ran");
     assert!(
@@ -158,21 +157,21 @@ fn stats_tsv_has_all_expected_columns() {
         "frac_duplicates",
         "mapped_pairs",
         "duplicate_pairs",
+        // The split's own block, present whether or not it ran so the schema does
+        // not change shape with the options used; blank when it did not.
+        "raw_sequencing_duplicates",
+        "corrected_sequencing_duplicates",
+        "library_duplicates",
+        "frac_pair_duplicates",
+        "frac_sequencing_duplicates",
+        "estimated_library_size",
         "mapped_orphans",
         "duplicate_orphans",
         "unmapped_orphans",
         "unmapped_pairs",
         "unmated_templates",
-        "estimated_library_size",
-        // Present whether or not the split ran, so the column set does not change
-        // shape depending on the options used; blank when it did not.
-        "sequencing_duplicates",
-        "library_duplicates",
-        "frac_sequencing_duplicates",
-        "naive_sequencing_duplicates",
         "tile_count",
         "tile_collision_rate",
-        "estimated_library_size_corrected",
     ];
     assert_eq!(cols, expected);
 }
@@ -189,19 +188,19 @@ fn decomposition_columns_are_blank_when_the_split_is_disabled() {
         .rec_simple("r1", 99, "chr1", 100, "50M", "=", 200, 150)
         .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
-    run_with_stats(&env.input, &stats, &out, &["--no-sequencing-dups"]);
+    // The shared helper already passes --no-sequencing-dups.
+    run_with_stats(&env.input, &stats, &out, &[]);
     let text = std::fs::read_to_string(&stats).unwrap();
     let mut lines = text.lines();
     let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
     let values: Vec<&str> = lines.next().unwrap().split('\t').collect();
     for column in [
-        "sequencing_duplicates",
+        "raw_sequencing_duplicates",
+        "corrected_sequencing_duplicates",
         "library_duplicates",
         "frac_sequencing_duplicates",
-        "naive_sequencing_duplicates",
         "tile_count",
         "tile_collision_rate",
-        "estimated_library_size_corrected",
     ] {
         let index = header.iter().position(|c| *c == column).expect("column present");
         assert_eq!(values[index], "", "{column} should be blank");

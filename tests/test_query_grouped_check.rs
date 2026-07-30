@@ -6,7 +6,6 @@
 //! dupblaster should fail loudly with a message that names the cause.
 
 mod helpers;
-use std::process::Command;
 
 use helpers::*;
 
@@ -28,13 +27,7 @@ fn fails_when_block_has_only_supplementary_records() {
         .sq("chr1", 1_000_000)
         .rec_simple("r1", PAIRED | FIRST_SEGMENT | SUPPLEMENTARY, "chr1", 100, "50M", "=", 200, 150)
         .write_to(&env.input);
-    let r = Command::new(rust_binary())
-        .args(["-i"])
-        .arg(&env.input)
-        .args(["-o"])
-        .arg(&out)
-        .output()
-        .unwrap();
+    let r = dupblaster().args(["-i"]).arg(&env.input).args(["-o"]).arg(&out).output().unwrap();
     assert!(!r.status.success(), "should have failed on non-query-grouped input");
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(stderr.contains("not query-grouped"), "stderr was: {stderr}");
@@ -48,13 +41,7 @@ fn fails_when_block_has_only_secondary_records() {
         .sq("chr1", 1_000_000)
         .rec_simple("r1", PAIRED | LAST_SEGMENT | SECONDARY, "chr1", 100, "50M", "=", 200, 150)
         .write_to(&env.input);
-    let r = Command::new(rust_binary())
-        .args(["-i"])
-        .arg(&env.input)
-        .args(["-o"])
-        .arg(&out)
-        .output()
-        .unwrap();
+    let r = dupblaster().args(["-i"]).arg(&env.input).args(["-o"]).arg(&out).output().unwrap();
     assert!(!r.status.success(), "should have failed on non-query-grouped input");
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(stderr.contains("not query-grouped"), "stderr was: {stderr}");
@@ -70,7 +57,7 @@ fn fails_even_with_ignore_unmated() {
         .sq("chr1", 1_000_000)
         .rec_simple("r1", PAIRED | FIRST_SEGMENT | SUPPLEMENTARY, "chr1", 100, "50M", "=", 200, 150)
         .write_to(&env.input);
-    let r = Command::new(rust_binary())
+    let r = dupblaster()
         .args(["-i"])
         .arg(&env.input)
         .args(["-o"])

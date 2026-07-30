@@ -3,8 +3,6 @@
 
 mod helpers;
 
-use std::process::Command;
-
 use helpers::*;
 
 #[test]
@@ -19,13 +17,7 @@ fn single_paired_primary_with_no_mate_aborts_without_ignore_unmated() {
         .rec_simple("r1", 99, "chr1", 100, "50M", "=", 200, 150)
         .write_to(&env.input);
 
-    let r = Command::new(rust_binary())
-        .args(["-i"])
-        .arg(&env.input)
-        .args(["-o"])
-        .arg(&out_bam)
-        .output()
-        .unwrap();
+    let r = dupblaster().args(["-i"]).arg(&env.input).args(["-o"]).arg(&out_bam).output().unwrap();
     assert!(!r.status.success(), "expected dupblaster to fail on unmated input");
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(
@@ -48,7 +40,7 @@ fn single_paired_primary_with_no_mate_succeeds_under_ignore_unmated() {
         .rec_simple("r2", 99, "chr1", 500, "50M", "=", 600, 150)
         .write_to(&env.input);
 
-    let r = Command::new(rust_binary())
+    let r = dupblaster()
         .args(["-i"])
         .arg(&env.input)
         .args(["-o"])

@@ -16,12 +16,16 @@
 //! plausible wrong answer.
 //!
 //! IDs are assigned in first-seen order, so the *order* of assignment depends on
-//! the input's order — but the equality relations between triples do not, and
-//! every metric depends only on those. The reported numbers are therefore
-//! order-invariant even though the ID values are not.
+//! the input's order — but the equality relations between triples do not, and the
+//! metrics depend only on those. Integer counts are therefore exactly
+//! order-invariant. The floating-point figures (`q`, and the chance-corrected
+//! count) sum in ID order and so can differ in their last bits between orderings
+//! of the same file; they are stable to far more precision than the six decimals
+//! reported.
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
@@ -57,15 +61,14 @@ const BUCKET_BUFFER_BYTES: usize = 64 * 1024;
 /// record ever straddles two reads.
 const BUCKET_READ_RECORDS: usize = 64 * 1024;
 
-/// Rough upper bound on the spill's size as a fraction of the input's, used only
-/// for an advisory warning.
-///
-/// The spill is 16 bytes per pair against roughly 141 bytes per template of a
-/// well-compressed input BAM, so about 8.5%; the margin covers tighter
-/// compression. It is a poor bound in the other direction — an uncompressed BAM
-/// runs several times larger per template, so this over-states the need badly —
-/// which is exactly why it only ever warns. See [`warn_if_space_looks_short`].
-const SPILL_SIZE_FRACTION_OF_INPUT: f64 = 0.15;
+/// Bisection steps used to invert `E[n_tiles | m]`. Well past `f64` resolution
+/// for the magnitudes involved; the loop breaks early once the bracket is tight,
+/// so this is only a backstop.
+const BISECTION_STEPS: usize = 60;
+
+/// Ceiling on the molecule count the inverse searches to, so a group occupying
+/// nearly every tile cannot send the bracket search unbounded.
+const INVERSE_SEARCH_CEILING: f64 = 1e12;
 
 /// Distinct triples above which the extractor is very likely misconfigured.
 ///
@@ -99,18 +102,67 @@ pub(crate) struct TileEntry {
     pub templates: u64,
 }
 
+/// FNV-1a over a dictionary key.
+///
+/// std's SipHash buys DoS resistance that is wasted here — the keys are read-name
+/// tokens, not attacker-controlled — while costing several times more per probe on
+/// a path walked once per template. This matches the codebase's existing
+/// preference for fast non-cryptographic hashing on per-record paths (see
+/// [`crate::sig::U64Hasher`]). Not benchmarked in isolation: the one-entry memo
+/// already absorbs most probes on name-sorted input.
+struct FnvHasher(u64);
+
+impl Default for FnvHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for FnvHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = self.0;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        self.0 = hash;
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Tile aggregates for one library, all derived from the same single pass.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LibraryTiles {
+    /// Templates observed for this library across all of its tiles.
+    pub templates: u64,
+    /// Distinct tiles seen for this library.
+    pub tiles: usize,
+    /// `q = Σ w_t²`: the chance two unrelated templates share a tile. The
+    /// validity indicator for the whole split — a library on one tile has `q = 1`
+    /// and carries no information, since every duplicate is on "the" tile whether
+    /// it was clustered or not.
+    pub collision_rate: f64,
+    /// The shares `w_t` themselves, for the chance model.
+    pub shares: Vec<f64>,
+}
+
 /// Interns imaging locations and accumulates per-tile template counts.
 pub(crate) struct TileDictionary {
     /// How to pull the unit and tile out of a read name; chosen by the user.
     format: ReadNameFormat,
     /// Packed triple key → serial ID. See [`Self::pack_key`] for the encoding.
-    ids: HashMap<Box<[u8]>, u32>,
+    ids: HashMap<Box<[u8]>, u32, BuildHasherDefault<FnvHasher>>,
     /// Interned triples, indexed by ID.
     entries: Vec<TileEntry>,
     /// Reused buffer for the lookup key, so probing allocates nothing.
     key: Vec<u8>,
-    /// The previous template's triple and ID.
-    memo: Option<Memo>,
+    /// The previous template's triple and ID, reused in place.
+    memo: Memo,
     /// Whether [`CARDINALITY_WARN`] has already been reported.
     warned: bool,
 }
@@ -120,10 +172,10 @@ impl TileDictionary {
     pub(crate) fn new(format: ReadNameFormat) -> Self {
         Self {
             format,
-            ids: HashMap::new(),
+            ids: HashMap::default(),
             entries: Vec::new(),
             key: Vec::new(),
-            memo: None,
+            memo: Memo::default(),
             warned: false,
         }
     }
@@ -148,10 +200,8 @@ impl TileDictionary {
         // tile, so this one-entry memo skips both the key build and the hash
         // probe on the common case. It degrades to nothing on coordinate-sorted
         // input, where the map carries the load.
-        if let Some(memo) = &self.memo
-            && memo.matches(library, location)
-        {
-            return Ok(memo.id);
+        if self.memo.matches(library, location) {
+            return Ok(self.memo.id);
         }
 
         self.pack_key(library, location)?;
@@ -159,7 +209,7 @@ impl TileDictionary {
             Some(&id) => id,
             None => self.insert(library, location)?,
         };
-        self.memo = Some(Memo::new(library, location, id));
+        self.memo.store(library, location, id);
         Ok(id)
     }
 
@@ -214,43 +264,30 @@ impl TileDictionary {
         &self.entries
     }
 
-    /// The chance that two unrelated templates of `library` land on one tile:
-    /// `q = Σ w_t²`, over that library's tile shares `w_t`.
+    /// Per-library tile aggregates, in one pass over the dictionary.
     ///
-    /// This is the validity indicator for the whole decomposition. A single-tile
-    /// or single-unit library has `q ≈ 1` and carries no information — every
-    /// duplicate looks like a sequencing duplicate — so the estimate must be
-    /// suppressed rather than reported. It is also the basis of the chance
-    /// correction for large groups, which collide on tiles by accident.
-    ///
-    /// `None` when the library has no templates.
-    pub(crate) fn collision_rate(&self, library: u32) -> Option<f64> {
-        let total = self.template_count(library);
-        if total == 0 {
-            return None;
+    /// One pass rather than a scan per statistic per library: the post-pass needs
+    /// template counts, tile counts and collision rates for every library, and
+    /// computing them separately made it `O(entries x libraries)`.
+    pub(crate) fn library_tiles(&self, num_libs: u32) -> Vec<LibraryTiles> {
+        let mut stats = vec![LibraryTiles::default(); num_libs as usize];
+        for entry in &self.entries {
+            if let Some(library) = stats.get_mut(entry.library as usize) {
+                library.templates += entry.templates;
+                library.tiles += 1;
+            }
         }
-        let total = total as f64;
-        Some(
-            self.entries
-                .iter()
-                .filter(|entry| entry.library == library)
-                .map(|entry| (entry.templates as f64 / total).powi(2))
-                .sum(),
-        )
-    }
-
-    /// Templates observed for `library` across all of its tiles.
-    pub(crate) fn template_count(&self, library: u32) -> u64 {
-        self.entries
-            .iter()
-            .filter(|entry| entry.library == library)
-            .map(|entry| entry.templates)
-            .sum()
-    }
-
-    /// Distinct tiles seen for `library`.
-    pub(crate) fn tile_count(&self, library: u32) -> usize {
-        self.entries.iter().filter(|entry| entry.library == library).count()
+        // `q` needs the totals, so shares can only be formed on a second look.
+        for entry in &self.entries {
+            if let Some(library) = stats.get_mut(entry.library as usize)
+                && library.templates > 0
+            {
+                let share = entry.templates as f64 / library.templates as f64;
+                library.collision_rate += share * share;
+                library.shares.push(share);
+            }
+        }
+        stats
     }
 }
 
@@ -323,37 +360,19 @@ pub(crate) struct Decomposition {
     /// equal the run's `duplicate_pairs` for this library.
     pub duplicate_pairs: u64,
     /// Chance-corrected sequencing duplicates.
-    pub sequencing_duplicates: u64,
+    pub corrected_sequencing_duplicates: u64,
     /// The residual `duplicate_pairs − sequencing_duplicates`, so the two always
     /// sum to the total exactly.
     pub library_duplicates: u64,
     /// Uncorrected `Σ (k − n_tiles)`. Kept because the gap between this and the
     /// corrected figure is the diagnostic for large-group data: negligible on
-    /// WGS, over 20% for groups with `k > 100`.
-    pub naive_sequencing_duplicates: u64,
+    /// WGS, material wherever groups are large. Also the figure the
+    /// per-sequencing-unit table sums to exactly.
+    pub raw_sequencing_duplicates: u64,
     /// `q = Σ w_t²`, the chance two unrelated templates share a tile.
     pub tile_collision_rate: f64,
     /// Distinct tiles seen for this library.
     pub tile_count: usize,
-}
-
-/// What to do about a read name the chosen format cannot parse.
-///
-/// The severity follows whether the user asked for this format, which is what
-/// lets the decomposition be on by default without breaking platforms it does not
-/// understand.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OnUnparseable {
-    /// Fail the run. Used when `--read-name-format` was given explicitly: the user
-    /// named that layout, so a name that does not fit it means the wrong one was
-    /// chosen or the data is not what it claims to be, and quietly producing no
-    /// metric would hide their mistake.
-    Fail,
-    /// Abandon the decomposition with a warning and let the run finish. Used when
-    /// the format was defaulted rather than chosen, so MGI, Ultima,
-    /// pre-CASAVA-1.8 and SRA-renamed inputs still process — a QC metric nobody
-    /// asked for must not be able to fail a duplicate-marking run.
-    Disable,
 }
 
 /// Per-sequencing-unit rollup: the QC view that exposes loading differences
@@ -406,14 +425,8 @@ pub(crate) struct TileSpiller {
     dir: TempDir,
     /// `buckets.len()`, cached as a `u32` for the hot-path modulo.
     bucket_count: u32,
-    /// Records appended so far, for reporting how much temp space was used. Also
-    /// distinguishes "nothing parsed yet" from "parsed for a while, then stopped".
+    /// Records appended so far, for reporting how much temp space was used.
     spilled: u64,
-    /// How to treat a read name the format cannot parse.
-    on_unparseable: OnUnparseable,
-    /// Set once the decomposition has been abandoned. Every later observation is
-    /// then a no-op and [`Self::decompose`] reports nothing.
-    disabled: bool,
 }
 
 impl TileSpiller {
@@ -425,17 +438,15 @@ impl TileSpiller {
     /// `u32` without a per-template check.
     pub(crate) fn new(
         format: ReadNameFormat,
-        on_unparseable: OnUnparseable,
         bin_count: u32,
         buckets: u32,
         tmp_dir: Option<&Path>,
-        input_bytes: Option<u64>,
     ) -> Result<Self> {
         let stride = u64::from(stride_for(bin_count));
         if stride * stride > u64::from(u32::MAX) {
             bail!(
                 "partition cell count {} exceeds what a spill record can address; \
-                 lower --min-bins-per-side",
+                 lower --min-bins",
                 stride * stride
             );
         }
@@ -446,7 +457,6 @@ impl TileSpiller {
             None => TempDir::new(),
         }
         .context("creating temp directory for the duplicate-decomposition spill")?;
-        warn_if_space_looks_short(dir.path(), input_bytes);
 
         let mut writers = Vec::with_capacity(bucket_count as usize);
         for bucket in 0..bucket_count {
@@ -462,8 +472,6 @@ impl TileSpiller {
             dir,
             bucket_count,
             spilled: 0,
-            on_unparseable,
-            disabled: false,
         })
     }
 
@@ -479,13 +487,13 @@ impl TileSpiller {
     /// the temp volume is full there is a good chance the output volume is too,
     /// and the user should hear about it while they can still act.
     pub(crate) fn observe_pair(&mut self, library: u32, name: &[u8], slot: PairSlot) -> Result<()> {
-        if self.disabled {
-            return Ok(());
-        }
-        let id = match self.dictionary.observe(library, name) {
-            Ok(id) => id,
-            Err(error) => return self.give_up_or_fail(error),
-        };
+        // The split is on by default, so a read name it cannot parse stops a run
+        // the user may not have realised was doing this work at all. The error has
+        // to name both ways forward.
+        let id = self.dictionary.observe(library, name).context(
+            "cannot split sequencing from library duplicates. Pass --read-name-format to name \
+             this platform's read-name layout, or --no-sequencing-dups to skip the split",
+        )?;
         // Narrowing is checked in `new` via the partition cell count.
         let record = SpillRecord { sig: slot.sig, off: slot.off as u32, id };
         let bucket = self.bucket_of(record);
@@ -494,34 +502,6 @@ impl TileSpiller {
             .context("writing to the duplicate-decomposition spill (is the temp volume full?)")?;
         self.spilled += 1;
         Ok(())
-    }
-
-    /// Handle a read name the format could not parse, per [`OnUnparseable`].
-    ///
-    /// Giving up is only offered for the *first* observation. If names parsed for a
-    /// while and then stopped, the input is internally inconsistent — two
-    /// platforms' data merged, say — and that is worth failing on however the
-    /// format was chosen, because the metric computed from the parseable prefix
-    /// would silently describe only part of the file.
-    fn give_up_or_fail(&mut self, error: anyhow::Error) -> Result<()> {
-        if self.on_unparseable == OnUnparseable::Fail || self.spilled > 0 {
-            return Err(error);
-        }
-        self.disabled = true;
-        log::warn!(
-            "not splitting sequencing from library duplicates: {error:#}. Duplicate marking is \
-             unaffected. Pass --read-name-format to name this platform's layout, or \
-             --no-sequencing-dups to skip the split without this warning."
-        );
-        Ok(())
-    }
-
-    /// Whether the decomposition is still going to produce anything.
-    ///
-    /// `false` once an unparseable read name has retired it, so the caller can
-    /// skip both the post-pass and its progress message.
-    pub(crate) fn is_active(&self) -> bool {
-        !self.disabled
     }
 
     /// Rebuild duplicate groups from the spill and decompose them.
@@ -548,7 +528,7 @@ impl TileSpiller {
             });
             walker.walk(&records);
         }
-        Ok(walker.finish(&self.dictionary))
+        Ok(walker.finish())
     }
 
     /// Which bucket a record belongs in.
@@ -595,14 +575,10 @@ struct GroupWalker {
     models: Vec<ChanceModel>,
     /// Running tallies per library.
     totals: Vec<GroupTotals>,
+    /// Tile aggregates per library, computed once up front.
+    library_tiles: Vec<LibraryTiles>,
     /// Per-unit rollup, indexed by the values in `unit_of`.
     units: Vec<SequencingUnitStats>,
-    /// Unrounded sequencing duplicates per unit, parallel to `units`. Kept as a
-    /// float for the same reason the per-library total is, so the two agree.
-    unit_sequencing: Vec<f64>,
-    /// Reused `(unit, members)` tally for the group in hand. Groups span very few
-    /// units, so a short linear scan beats a map.
-    tally: Vec<(u32, u64)>,
 }
 
 impl GroupWalker {
@@ -626,22 +602,25 @@ impl GroupWalker {
             units[unit as usize].tiles += 1;
             unit_of.push(unit);
         }
+        let library_tiles = dictionary.library_tiles(num_libs);
         Self {
             library_of: dictionary.entries().iter().map(|entry| entry.library).collect(),
             unit_of,
-            models: (0..num_libs).map(|lib| ChanceModel::new(dictionary, lib)).collect(),
+            models: library_tiles
+                .iter()
+                .map(|library| ChanceModel::new(library.shares.clone()))
+                .collect(),
             totals: vec![GroupTotals::default(); num_libs as usize],
-            unit_sequencing: vec![0.0; units.len()],
+            library_tiles,
             units,
-            tally: Vec::new(),
         }
     }
 
     /// Accumulate every duplicate group in one sorted bucket.
     ///
     /// Records arrive sorted by `(library, off, sig, id)`, so a duplicate group is
-    /// a maximal run of equal `(library, off, sig)`, and within it the distinct
-    /// tiles are the runs of equal `id`.
+    /// a maximal run of equal `(library, off, sig)`, and within it a tile is a run
+    /// of equal `id`.
     fn walk(&mut self, records: &[SpillRecord]) {
         let mut start = 0;
         while start < records.len() {
@@ -653,31 +632,46 @@ impl GroupWalker {
             let group = &records[start..end];
             start = end;
 
-            // A signature seen once is not a duplicate group. Skipping it is not
-            // only an optimization: it avoids one model lookup for each of the
-            // hundreds of millions of unique templates, and avoids accumulating
-            // the float residue of `E[n_tiles | 1] − 1`, which is zero only up to
-            // the rounding of a sum of shares.
+            // A signature seen once is not a duplicate group. Skipping it also
+            // keeps the inverse solve off the path of every unique template.
             let k = group.len() as u64;
             if k < 2 {
                 continue;
             }
-            let tiles =
-                1 + group.windows(2).filter(|adjacent| adjacent[0].id != adjacent[1].id).count()
-                    as u64;
-            let library = key.0 as usize;
-            let sequencing = self.models[library].expected_tiles(k) - tiles as f64;
-            self.totals[library].duplicates += k - 1;
-            self.totals[library].naive_sequencing += k - tiles;
-            self.totals[library].corrected_sequencing += sequencing;
 
-            // Accumulate the unrounded value, exactly as the per-library total
-            // does, and round once in `finish`. Rounding per group instead would
-            // stop the per-unit column summing to the per-library figure —
-            // ten groups worth 0.76 each are 8 duplicates, not 10.
-            if let Some(unit) = self.majority_unit(group) {
-                self.unit_sequencing[unit as usize] += sequencing;
+            // A tile holding `members` of the group seeded one molecule and copied
+            // the rest, so it contributed exactly `members - 1` sequencing
+            // duplicates. Summed over the group's tiles that is `k - tiles`, the
+            // group's own total — so the per-unit column is exact integer
+            // arithmetic that reconciles with the per-library raw figure, with no
+            // attribution heuristic and nothing to round.
+            let mut tiles = 0u64;
+            let mut raw_sequencing = 0u64;
+            let mut run = 0;
+            while run < group.len() {
+                let id = group[run].id;
+                let mut run_end = run + 1;
+                while run_end < group.len() && group[run_end].id == id {
+                    run_end += 1;
+                }
+                let members = (run_end - run) as u64;
+                tiles += 1;
+                raw_sequencing += members - 1;
+                let unit = self.unit_of[id as usize] as usize;
+                self.units[unit].sequencing_duplicates += members - 1;
+                run = run_end;
             }
+
+            let library = key.0 as usize;
+            // Chance-correct by asking how many *independent* molecules the
+            // observed tile count implies, rather than by subtracting the
+            // collisions expected of all `k` members. Only the independent
+            // molecules can collide, so the latter over-corrects — by 21% for a
+            // 3,102-member group on real tile shares.
+            let independent = self.models[library].independent_molecules(tiles).min(k as f64);
+            self.totals[library].duplicates += k - 1;
+            self.totals[library].raw_sequencing += raw_sequencing;
+            self.totals[library].corrected_sequencing += k as f64 - independent;
         }
     }
 
@@ -687,41 +681,15 @@ impl GroupWalker {
         (self.library_of[record.id as usize], record.off, record.sig)
     }
 
-    /// The sequencing unit holding most of `group`'s members.
-    ///
-    /// Ties break on the lexicographically smallest unit name rather than on the
-    /// unit index, because indices are assigned in first-seen order and would
-    /// make the attribution depend on the input's order.
-    fn majority_unit(&mut self, group: &[SpillRecord]) -> Option<u32> {
-        self.tally.clear();
-        for record in group {
-            let unit = self.unit_of[record.id as usize];
-            match self.tally.iter_mut().find(|(tallied, _)| *tallied == unit) {
-                Some((_, members)) => *members += 1,
-                None => self.tally.push((unit, 1)),
-            }
-        }
-        let units = &self.units;
-        self.tally
-            .iter()
-            .max_by(|a, b| {
-                a.1.cmp(&b.1).then_with(|| units[b.0 as usize].unit.cmp(&units[a.0 as usize].unit))
-            })
-            .map(|(unit, _)| *unit)
-    }
-
     /// Resolve the accumulators into the reported result.
-    fn finish(self, dictionary: &TileDictionary) -> DecompositionResult {
+    fn finish(self) -> DecompositionResult {
         let libraries = self
             .totals
             .iter()
-            .enumerate()
-            .map(|(lib, totals)| totals.finish(dictionary, lib as u32))
+            .zip(&self.library_tiles)
+            .map(|(totals, tiles)| totals.finish(tiles))
             .collect();
         let mut units = self.units;
-        for (unit, sequencing) in units.iter_mut().zip(&self.unit_sequencing) {
-            unit.sequencing_duplicates = sequencing.round().max(0.0) as u64;
-        }
         // Interning order is input-order dependent; sort so the emitted table is
         // not.
         units.sort_by(|a, b| a.library.cmp(&b.library).then_with(|| a.unit.cmp(&b.unit)));
@@ -734,8 +702,8 @@ impl GroupWalker {
 struct GroupTotals {
     /// `Σ (k − 1)` over groups.
     duplicates: u64,
-    /// `Σ (k − n_tiles)` over groups.
-    naive_sequencing: u64,
+    /// `Σ (k − n_tiles)` over groups: the uncorrected count.
+    raw_sequencing: u64,
     /// `Σ (E[n_tiles | k] − n_tiles)` over groups, accumulated as a float
     /// because the per-group correction is fractional. Individual terms may go
     /// slightly negative when a group's tiles happen to spread more than chance
@@ -749,82 +717,136 @@ impl GroupTotals {
     /// The sequencing count is rounded and bounded by the duplicate total, and
     /// the library count is then taken as the residual, so the two always sum to
     /// the total exactly however the float accumulation landed.
-    fn finish(self, dictionary: &TileDictionary, library: u32) -> Decomposition {
+    fn finish(&self, tiles: &LibraryTiles) -> Decomposition {
         let sequencing = (self.corrected_sequencing.round().max(0.0) as u64).min(self.duplicates);
         Decomposition {
             duplicate_pairs: self.duplicates,
-            sequencing_duplicates: sequencing,
+            corrected_sequencing_duplicates: sequencing,
             library_duplicates: self.duplicates - sequencing,
-            naive_sequencing_duplicates: self.naive_sequencing,
-            tile_collision_rate: dictionary.collision_rate(library).unwrap_or(0.0),
-            tile_count: dictionary.tile_count(library),
+            raw_sequencing_duplicates: self.raw_sequencing,
+            tile_collision_rate: tiles.collision_rate,
+            tile_count: tiles.tiles,
         }
     }
 }
 
-/// `E[n_tiles | k]` for one library, memoized per group size.
+/// Infers how many independent molecules a group's observed tile count implies.
 struct ChanceModel {
     /// Tile shares `w_t` for this library.
     shares: Vec<f64>,
-    /// `E[n_tiles | k]`, cached per distinct `k`. Group sizes repeat heavily —
-    /// nearly every group is small — so this collapses the cost to one
-    /// evaluation per distinct size.
-    expected: HashMap<u64, f64>,
+    /// Independent-molecule count per distinct *observed tile count*, cached.
+    ///
+    /// The key is the tile count alone, not the group size: the inverse of
+    /// `E[n_tiles | m]` depends only on how many tiles were seen and on the
+    /// shares. Nearly every group occupies one or two tiles, so this collapses to
+    /// a handful of solves per run.
+    implied: HashMap<u64, f64>,
 }
 
 impl ChanceModel {
     /// Build the model from `library`'s tile shares.
-    fn new(dictionary: &TileDictionary, library: u32) -> Self {
-        let total = dictionary.template_count(library);
-        let shares = if total == 0 {
-            Vec::new()
-        } else {
-            dictionary
-                .entries()
-                .iter()
-                .filter(|entry| entry.library == library)
-                .map(|entry| entry.templates as f64 / total as f64)
-                .collect()
-        };
-        Self { shares, expected: HashMap::new() }
+    fn new(shares: Vec<f64>) -> Self {
+        Self { shares, implied: HashMap::new() }
     }
 
-    /// Distinct tiles expected of `k` templates drawn independently in
-    /// proportion to the tile shares: `Σ_t (1 − (1 − w_t)^k)`.
+    /// The number of independent molecules that `observed` distinct tiles implies.
     ///
-    /// This is the baseline the observed tile count is measured against. A group
-    /// of `k` *independent* library molecules does not occupy `k` tiles — some
-    /// collide by chance — so crediting `k − n_tiles` to sequencing duplication
-    /// over-counts. The over-count is negligible for small groups and reaches
-    /// 21% for groups above 100 members, the regime RNA-seq lives in.
-    fn expected_tiles(&mut self, k: u64) -> f64 {
-        if let Some(&expected) = self.expected.get(&k) {
-            return expected;
+    /// Some of a group's molecules land on the same tile by chance, so `observed`
+    /// under-states the molecule count and the difference has to be credited to the
+    /// library rather than to the flowcell. This inverts
+    /// `E[n_tiles | m] = Σ_t (1 − (1 − w_t)^m)` at `observed`, which is what
+    /// "how many independent molecules would look like this?" means.
+    ///
+    /// Inverting is not the same as subtracting `E[n_tiles | k] − observed`, the
+    /// obvious-looking form: only the *independent* molecules can collide, and
+    /// there are fewer of them than `k`, so subtracting the collisions expected of
+    /// all `k` members over-corrects. On real tile shares that costs 0.2% of the
+    /// count at `k = 20`, 3.8% at `k = 500` and 21% at `k = 3102` — precisely the
+    /// large-group regime the correction exists for.
+    ///
+    /// `E` is strictly increasing in `m`, so bisection is enough; the caller bounds
+    /// the result by the group size, since a group cannot hold more molecules than
+    /// members.
+    fn independent_molecules(&mut self, observed: u64) -> f64 {
+        // Fewer than two tiles carries no information: `E[n_tiles | m]` is then
+        // constant, so the inverse is not unique and bisection would return 1,
+        // claiming every duplicate was made on the flowcell. Every template had to
+        // land on the one tile whether it was clustered or not. Reporting an
+        // unbounded molecule count lets the caller's `min(k)` resolve it to "as
+        // many molecules as members", i.e. no sequencing duplicates at all.
+        if self.shares.len() < 2 {
+            return f64::INFINITY;
         }
-        let expected: f64 =
-            self.shares.iter().map(|share| 1.0 - (1.0 - share).powf(k as f64)).sum();
-        self.expected.insert(k, expected);
-        expected
+        let target = observed as f64;
+        if let Some(&implied) = self.implied.get(&observed) {
+            return implied;
+        }
+        // `E[n | 1] = Σ w_t = 1`, and `E[n | m] < m` for more than one tile, so
+        // the answer is at least `observed`. Grow the upper bound until it brackets.
+        let mut low = target;
+        let mut high = (target * 2.0).max(2.0);
+        while self.expected_tiles(high) < target && high < INVERSE_SEARCH_CEILING {
+            high *= 2.0;
+        }
+        for _ in 0..BISECTION_STEPS {
+            let mid = 0.5 * (low + high);
+            if self.expected_tiles(mid) < target {
+                low = mid;
+            } else {
+                high = mid;
+            }
+            if high - low <= 1e-9 * high {
+                break;
+            }
+        }
+        let implied = 0.5 * (low + high);
+        self.implied.insert(observed, implied);
+        implied
+    }
+
+    /// `E[n_tiles | m] = Σ_t (1 − (1 − w_t)^m)`, for real-valued `m`.
+    fn expected_tiles(&self, molecules: f64) -> f64 {
+        self.shares.iter().map(|share| 1.0 - (1.0 - share).powf(molecules)).sum()
     }
 }
 
 /// The previous template's triple, cached to skip the hash probe.
+///
+/// Buffers are reused rather than reallocated: a miss used to box the unit and
+/// tile afresh, putting two allocations and two frees on the per-template path —
+/// so the memo did not "degrade to nothing" on input whose tiles are not
+/// clustered, it degraded to allocator traffic.
+#[derive(Default)]
 struct Memo {
     library: u32,
-    unit: Box<[u8]>,
-    tile: Box<[u8]>,
+    unit: Vec<u8>,
+    tile: Vec<u8>,
     id: u32,
+    /// False until the first template has been interned, so an all-zero memo
+    /// cannot match a real triple.
+    occupied: bool,
 }
 
 impl Memo {
-    fn new(library: u32, location: ImagingLocation<'_>, id: u32) -> Self {
-        Self { library, unit: location.unit.into(), tile: location.tile.into(), id }
-    }
-
-    /// Whether this memo is for exactly `library` and `location`.
+    /// Whether this memo holds exactly `library` and `location`.
     #[inline]
     fn matches(&self, library: u32, location: ImagingLocation<'_>) -> bool {
-        self.library == library && &*self.unit == location.unit && &*self.tile == location.tile
+        self.occupied
+            && self.library == library
+            && self.unit.as_slice() == location.unit
+            && self.tile.as_slice() == location.tile
+    }
+
+    /// Overwrite the memo in place, keeping the buffers' capacity.
+    #[inline]
+    fn store(&mut self, library: u32, location: ImagingLocation<'_>, id: u32) {
+        self.library = library;
+        self.unit.clear();
+        self.unit.extend_from_slice(location.unit);
+        self.tile.clear();
+        self.tile.extend_from_slice(location.tile);
+        self.id = id;
+        self.occupied = true;
     }
 }
 
@@ -886,58 +908,6 @@ fn clamp_buckets(requested: u32) -> u32 {
         );
     }
     clamped
-}
-
-/// Warn before the main pass if `dir` looks too small to hold the spill.
-///
-/// Deliberately a warning, not an error. The estimate is only as good as the
-/// input's bytes-per-template, which swings by around 4x between an uncompressed
-/// BAM and a well-compressed one — so sizing a *hard* failure from it would abort
-/// runs that had ample room, which is far worse than not checking. The precise
-/// protection is the hard error on a failed spill write; this only buys an early
-/// heads-up in the case that error comes too late to be cheap, namely temp and
-/// output on different volumes.
-///
-/// Silent when the input size is unknown (a stream) or the volume cannot be
-/// interrogated.
-fn warn_if_space_looks_short(dir: &Path, input_bytes: Option<u64>) {
-    let (Some(input_bytes), Some(available)) = (input_bytes, available_bytes(dir)) else {
-        return;
-    };
-    let needed = (input_bytes as f64 * SPILL_SIZE_FRACTION_OF_INPUT) as u64;
-    if available < needed {
-        log::warn!(
-            "{} has {:.1} GiB free, which may be too little for the duplicate-decomposition \
-             spill of a {:.1} GiB input (a rough upper bound is {:.1} GiB, less for \
-             uncompressed input). If it runs out, point --tmp-dir at a larger volume or drop \
-             --read-name-format.",
-            dir.display(),
-            gibibytes(available),
-            gibibytes(input_bytes),
-            gibibytes(needed),
-        );
-    }
-}
-
-/// Bytes available to this user on the volume holding `dir`.
-fn available_bytes(dir: &Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = CString::new(dir.as_os_str().as_bytes()).ok()?;
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `path` is a valid NUL-terminated C string that outlives the call,
-    // and `statvfs` only writes into `stat`, reporting failure via its return
-    // value rather than leaving `stat` partly written.
-    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
-        return None;
-    }
-    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
-}
-
-/// Render a byte count in GiB, for messages about disk space.
-fn gibibytes(bytes: u64) -> f64 {
-    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
 /// The process's soft limit on open file descriptors.
@@ -1033,7 +1003,7 @@ mod tests {
         dict.observe(0, &name("FC", 1, 1102)).expect("parses");
         assert_eq!(dict.entries()[0].templates, 3);
         assert_eq!(dict.entries()[1].templates, 1);
-        assert_eq!(dict.template_count(0), 4);
+        assert_eq!(dict.library_tiles(1)[0].templates, 4);
     }
 
     #[test]
@@ -1053,8 +1023,11 @@ mod tests {
             }
         }
         assert_eq!(alternating.entries().len(), runs.entries().len());
-        assert_eq!(alternating.template_count(0), runs.template_count(0));
-        assert_eq!(alternating.collision_rate(0), runs.collision_rate(0));
+        assert_eq!(alternating.library_tiles(1)[0].templates, runs.library_tiles(1)[0].templates);
+        assert_eq!(
+            alternating.library_tiles(1)[0].collision_rate,
+            runs.library_tiles(1)[0].collision_rate
+        );
     }
 
     #[test]
@@ -1063,7 +1036,7 @@ mod tests {
         for _ in 0..10 {
             dict.observe(0, &name("FC", 1, 1101)).expect("parses");
         }
-        assert_eq!(dict.collision_rate(0), Some(1.0), "one tile carries no information");
+        assert_eq!(dict.library_tiles(1)[0].collision_rate, 1.0, "one tile carries no information");
     }
 
     #[test]
@@ -1072,7 +1045,7 @@ mod tests {
         for tile in 0..4 {
             dict.observe(0, &name("FC", 1, tile)).expect("parses");
         }
-        let q = dict.collision_rate(0).expect("has templates");
+        let q = dict.library_tiles(1)[0].collision_rate;
         assert!((q - 0.25).abs() < 1e-12, "q = {q}");
     }
 
@@ -1092,10 +1065,10 @@ mod tests {
             skewed.observe(0, &name("FC", 1, tile)).expect("parses");
         }
         assert!(
-            skewed.collision_rate(0) > even.collision_rate(0),
+            skewed.library_tiles(1)[0].collision_rate > even.library_tiles(1)[0].collision_rate,
             "{:?} should exceed {:?}",
-            skewed.collision_rate(0),
-            even.collision_rate(0)
+            skewed.library_tiles(1)[0].collision_rate,
+            even.library_tiles(1)[0].collision_rate
         );
     }
 
@@ -1106,13 +1079,16 @@ mod tests {
         let mut dict = dictionary();
         dict.observe(0, &name("FC", 1, 1101)).expect("parses");
         dict.observe(1, &name("FC", 1, 1102)).expect("parses");
-        assert_eq!(dict.collision_rate(0), Some(1.0));
-        assert_eq!(dict.collision_rate(1), Some(1.0));
+        assert_eq!(dict.library_tiles(1)[0].collision_rate, 1.0);
+        assert_eq!(dict.library_tiles(2)[1].collision_rate, 1.0);
     }
 
     #[test]
-    fn collision_rate_of_an_unseen_library_is_undefined() {
-        assert_eq!(dictionary().collision_rate(0), None);
+    fn a_library_with_no_templates_has_no_tiles_and_no_shares() {
+        let stats = &dictionary().library_tiles(1)[0];
+        assert_eq!(stats.templates, 0);
+        assert_eq!(stats.tiles, 0);
+        assert!(stats.shares.is_empty());
     }
 
     #[test]
@@ -1121,8 +1097,8 @@ mod tests {
         dict.observe(0, &name("FC", 1, 1101)).expect("parses");
         dict.observe(0, &name("FC", 1, 1102)).expect("parses");
         dict.observe(1, &name("FC", 1, 1103)).expect("parses");
-        assert_eq!(dict.tile_count(0), 2);
-        assert_eq!(dict.tile_count(1), 1);
+        assert_eq!(dict.library_tiles(2)[0].tiles, 2);
+        assert_eq!(dict.library_tiles(2)[1].tiles, 1);
     }
 
     #[test]
@@ -1138,10 +1114,8 @@ mod tests {
     fn spiller() -> TileSpiller {
         TileSpiller::new(
             "illumina".parse().expect("illumina is a valid format"),
-            OnUnparseable::Fail,
             TEST_BIN_COUNT,
             DEFAULT_SPILL_BUCKETS,
-            None,
             None,
         )
         .expect("spiller opens")
@@ -1199,8 +1173,8 @@ mod tests {
         }
         let result = decompose(spiller);
         assert_eq!(result.duplicate_pairs, 3);
-        assert_eq!(result.naive_sequencing_duplicates, 3);
-        assert_eq!(result.sequencing_duplicates, 3);
+        assert_eq!(result.raw_sequencing_duplicates, 3);
+        assert_eq!(result.corrected_sequencing_duplicates, 3);
         assert_eq!(result.library_duplicates, 0);
     }
 
@@ -1216,8 +1190,8 @@ mod tests {
         }
         let result = decompose(spiller);
         assert_eq!(result.tile_collision_rate, 1.0);
-        assert_eq!(result.naive_sequencing_duplicates, 3);
-        assert_eq!(result.sequencing_duplicates, 0);
+        assert_eq!(result.raw_sequencing_duplicates, 3);
+        assert_eq!(result.corrected_sequencing_duplicates, 0);
     }
 
     #[test]
@@ -1228,8 +1202,8 @@ mod tests {
         }
         let result = decompose(spiller);
         assert_eq!(result.duplicate_pairs, 3);
-        assert_eq!(result.naive_sequencing_duplicates, 0);
-        assert_eq!(result.sequencing_duplicates, 0);
+        assert_eq!(result.raw_sequencing_duplicates, 0);
+        assert_eq!(result.corrected_sequencing_duplicates, 0);
         assert_eq!(result.library_duplicates, 3);
     }
 
@@ -1247,8 +1221,8 @@ mod tests {
         }
         let result = decompose(spiller);
         assert_eq!(result.duplicate_pairs, 3);
-        assert_eq!(result.naive_sequencing_duplicates, 2);
-        assert_eq!(result.sequencing_duplicates, 2);
+        assert_eq!(result.raw_sequencing_duplicates, 2);
+        assert_eq!(result.corrected_sequencing_duplicates, 2);
         assert_eq!(result.library_duplicates, 1);
     }
 
@@ -1268,7 +1242,7 @@ mod tests {
         }
         let result = decompose(spiller);
         assert_eq!(
-            result.sequencing_duplicates + result.library_duplicates,
+            result.corrected_sequencing_duplicates + result.library_duplicates,
             result.duplicate_pairs
         );
     }
@@ -1281,7 +1255,7 @@ mod tests {
         }
         let result = decompose(spiller);
         assert_eq!(result.duplicate_pairs, 0);
-        assert_eq!(result.sequencing_duplicates, 0);
+        assert_eq!(result.corrected_sequencing_duplicates, 0);
         assert_eq!(result.library_duplicates, 0);
     }
 
@@ -1313,28 +1287,40 @@ mod tests {
     }
 
     #[test]
-    fn the_chance_correction_reduces_sequencing_duplicates_when_tiles_are_few() {
-        // Four evenly-loaded tiles, and one eight-member group all on tile 0.
-        // Eight independent molecules would already be expected to cover only
-        // ~3.6 of the four tiles, so crediting all seven duplicates to
-        // sequencing over-counts badly.
+    fn the_chance_correction_removes_a_split_that_chance_alone_explains() {
+        // Four evenly-loaded tiles and an eight-member group spread two-per-tile.
+        // The raw rule scores 4 sequencing duplicates (each tile's members beyond
+        // the first), but eight independent molecules would be expected to cover
+        // all four tiles anyway — so occupying four tiles is no evidence of
+        // clustering, and the corrected count should collapse to nothing.
+        let mut spiller = spiller();
+        spread_over_tiles(&mut spiller, 4);
+        for tile in 0..4 {
+            for _ in 0..2 {
+                observe(&mut spiller, 1, 99, tile);
+            }
+        }
+        let result = decompose(spiller);
+        assert_eq!(result.duplicate_pairs, 7);
+        assert_eq!(result.raw_sequencing_duplicates, 4, "two per tile over four tiles");
+        assert_eq!(result.corrected_sequencing_duplicates, 0, "chance explains all of it");
+        assert_eq!(result.library_duplicates, 7);
+    }
+
+    #[test]
+    fn a_group_on_one_of_many_tiles_keeps_its_full_raw_count() {
+        // The inverse must not shave the count when the evidence is unambiguous:
+        // with plenty of tiles available, all eight members on one tile implies
+        // one molecule and seven copies, exactly as the raw rule says. The older
+        // subtract-E[n|k] form under-counted here, by 21% at k=3102.
         let mut spiller = spiller();
         spread_over_tiles(&mut spiller, 4);
         for _ in 0..8 {
             observe(&mut spiller, 1, 99, 0);
         }
         let result = decompose(spiller);
-        assert_eq!(result.duplicate_pairs, 7);
-        assert_eq!(result.naive_sequencing_duplicates, 7);
-        assert!(
-            result.sequencing_duplicates < result.naive_sequencing_duplicates,
-            "correction should fire: got {}",
-            result.sequencing_duplicates
-        );
-        assert_eq!(
-            result.sequencing_duplicates + result.library_duplicates,
-            result.duplicate_pairs
-        );
+        assert_eq!(result.raw_sequencing_duplicates, 7);
+        assert_eq!(result.corrected_sequencing_duplicates, 7);
     }
 
     #[test]
@@ -1348,8 +1334,8 @@ mod tests {
             observe(&mut spiller, 1, 99, 0);
         }
         let result = decompose(spiller);
-        assert_eq!(result.naive_sequencing_duplicates, 7);
-        assert_eq!(result.sequencing_duplicates, 7);
+        assert_eq!(result.raw_sequencing_duplicates, 7);
+        assert_eq!(result.corrected_sequencing_duplicates, 7);
     }
 
     #[test]
@@ -1392,7 +1378,11 @@ mod tests {
         let err = spiller
             .observe_pair(0, b"SRR1234567.1", PairSlot { off: 1, sig: 1 })
             .expect_err("must not be silently skipped");
-        assert!(err.to_string().contains("SRR1234567.1"), "{err}");
+        // `{:#}` walks the context chain; the offending name is on the inner error
+        // and the guidance about how to proceed on the outer one.
+        let message = format!("{err:#}");
+        assert!(message.contains("SRR1234567.1"), "{message}");
+        assert!(message.contains("--no-sequencing-dups"), "{message}");
     }
 
     #[test]
@@ -1410,34 +1400,6 @@ mod tests {
     }
 
     #[test]
-    fn a_temp_volume_that_looks_too_small_warns_rather_than_aborting() {
-        // The estimate is only as good as the input's bytes-per-template, which
-        // swings ~4x with compression, so an over-eager hard failure would abort
-        // runs that had ample room. The authoritative check is the write itself.
-        let dir = TempDir::new().expect("temp dir");
-        warn_if_space_looks_short(dir.path(), Some(u64::MAX));
-        warn_if_space_looks_short(dir.path(), Some(1024));
-        warn_if_space_looks_short(dir.path(), None);
-    }
-
-    #[test]
-    fn a_spiller_opens_even_for_an_input_larger_than_the_volume() {
-        // Same point at the level that matters: an implausible input size must not
-        // stop the spiller from being created.
-        assert!(
-            TileSpiller::new(
-                "illumina".parse().expect("valid format"),
-                OnUnparseable::Fail,
-                TEST_BIN_COUNT,
-                DEFAULT_SPILL_BUCKETS,
-                None,
-                Some(u64::MAX),
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
     fn every_bucket_count_reaches_the_same_answer() {
         // Bucketing is only a way to keep descriptors bounded; it must not
         // change which records meet each other.
@@ -1447,10 +1409,8 @@ mod tests {
         for buckets in [1, 2, 16, 64] {
             let mut spiller = TileSpiller::new(
                 "illumina".parse().expect("valid format"),
-                OnUnparseable::Fail,
                 TEST_BIN_COUNT,
                 buckets,
-                None,
                 None,
             )
             .expect("spiller opens");

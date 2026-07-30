@@ -5,7 +5,6 @@
 //! valid BAM that a standard reader (noodles) can decode.
 
 mod helpers;
-use std::process::Command;
 
 use helpers::*;
 
@@ -34,13 +33,7 @@ fn default_output_is_uncompressed_bgzf() {
     let env = TestEnv::new();
     build_input(&env);
     let out = env._tmp.path().join("out.bam");
-    let r = Command::new(rust_binary())
-        .args(["-i"])
-        .arg(&env.input)
-        .args(["-o"])
-        .arg(&out)
-        .output()
-        .unwrap();
+    let r = dupblaster().args(["-i"]).arg(&env.input).args(["-o"]).arg(&out).output().unwrap();
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
 
     let bytes = std::fs::read(&out).unwrap();
@@ -55,18 +48,12 @@ fn level_6_produces_smaller_output_than_default() {
     build_input(&env);
 
     let out0 = env._tmp.path().join("out0.bam");
-    let r = Command::new(rust_binary())
-        .args(["-i"])
-        .arg(&env.input)
-        .args(["-o"])
-        .arg(&out0)
-        .output()
-        .unwrap();
+    let r = dupblaster().args(["-i"]).arg(&env.input).args(["-o"]).arg(&out0).output().unwrap();
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
     let size_0 = std::fs::metadata(&out0).unwrap().len();
 
     let out6 = env._tmp.path().join("out6.bam");
-    let r = Command::new(rust_binary())
+    let r = dupblaster()
         .args(["-i"])
         .arg(&env.input)
         .args(["-o"])
@@ -89,7 +76,7 @@ fn compressed_output_round_trips() {
     let env = TestEnv::new();
     build_input(&env);
     let out = env._tmp.path().join("out.bam");
-    let r = Command::new(rust_binary())
+    let r = dupblaster()
         .args(["-i"])
         .arg(&env.input)
         .args(["-o"])
@@ -108,7 +95,7 @@ fn rejects_out_of_range_compression_level() {
     let env = TestEnv::new();
     build_input(&env);
     let out = env._tmp.path().join("out.bam");
-    let r = Command::new(rust_binary())
+    let r = dupblaster()
         .args(["-i"])
         .arg(&env.input)
         .args(["-o"])

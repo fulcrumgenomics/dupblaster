@@ -138,7 +138,7 @@ fn duplicates_on_one_tile_are_reported_as_sequencing_duplicates() {
 
     let row = parse_row(&stats);
     assert_eq!(row["duplicate_pairs"], "3");
-    assert_eq!(row["sequencing_duplicates"], "3");
+    assert_eq!(row["corrected_sequencing_duplicates"], "3");
     assert_eq!(row["library_duplicates"], "0");
 }
 
@@ -157,7 +157,7 @@ fn duplicates_on_distinct_tiles_are_reported_as_library_duplicates() {
 
     let row = parse_row(&stats);
     assert_eq!(row["duplicate_pairs"], "3");
-    assert_eq!(row["sequencing_duplicates"], "0");
+    assert_eq!(row["corrected_sequencing_duplicates"], "0");
     assert_eq!(row["library_duplicates"], "3");
 }
 
@@ -181,7 +181,7 @@ fn two_copies_on_each_of_two_tiles_yields_two_sequencing_and_one_library() {
 
     let row = parse_row(&stats);
     assert_eq!(row["duplicate_pairs"], "3");
-    assert_eq!(row["sequencing_duplicates"], "2");
+    assert_eq!(row["corrected_sequencing_duplicates"], "2");
     assert_eq!(row["library_duplicates"], "1");
 }
 
@@ -202,7 +202,7 @@ fn the_same_tile_number_on_two_flowcells_is_not_a_sequencing_duplicate() {
 
     let row = parse_row(&stats);
     assert_eq!(row["duplicate_pairs"], "1");
-    assert_eq!(row["sequencing_duplicates"], "0");
+    assert_eq!(row["corrected_sequencing_duplicates"], "0");
     assert_eq!(row["library_duplicates"], "1");
 }
 
@@ -246,7 +246,7 @@ fn sequencing_and_library_duplicates_sum_to_the_duplicate_pair_total() {
 
     let row = parse_row(&stats);
     let total: u64 = row["duplicate_pairs"].parse().unwrap();
-    let sequencing: u64 = row["sequencing_duplicates"].parse().unwrap();
+    let sequencing: u64 = row["corrected_sequencing_duplicates"].parse().unwrap();
     let library: u64 = row["library_duplicates"].parse().unwrap();
     assert_eq!(total, 6, "3 + 1 + 2 duplicates across the three groups");
     assert_eq!(sequencing + library, total);
@@ -271,7 +271,7 @@ fn a_single_tile_library_blanks_the_split_but_still_reports_the_collision_rate()
     let row = parse_row(&stats);
     assert_eq!(row["tile_count"], "1");
     assert_eq!(row["tile_collision_rate"], "1.000000");
-    assert_eq!(row["sequencing_duplicates"], "");
+    assert_eq!(row["corrected_sequencing_duplicates"], "");
     assert_eq!(row["library_duplicates"], "");
 }
 
@@ -293,8 +293,48 @@ fn the_tile_collision_rate_is_reported_for_an_ordinary_library() {
 #[test]
 fn removing_sequencing_duplicates_raises_the_library_size_estimate() {
     // Flowcell duplicates say nothing about how many distinct molecules the
-    // library held, so counting them as evidence of saturation makes the library
-    // look smaller than it is. The corrected column sits beside the plain one.
+    // library held, so counting them as saturation makes it look smaller. With the
+    // split off the estimate falls back to the uncorrected form, so these two runs
+    // isolate exactly that effect.
+    //
+    // The data mixes same-tile and cross-tile groups on purpose: a library whose
+    // duplicates are *entirely* sequencing duplicates has shown no evidence of
+    // resampling at all, so its corrected size is legitimately not estimable.
+    let env = TestEnv::new();
+    let out = env._tmp.path().join("out.bam");
+    let mut run = Run::new();
+    run.spread_over_tiles(200);
+    for group in 0..20 {
+        for _ in 0..3 {
+            run.pair("FC", 1, 1101, 500_000 + 1_000 * group);
+        }
+    }
+    for group in 0..20 {
+        for tile in [2101, 2102] {
+            run.pair("FC", 1, tile, 700_000 + 1_000 * group);
+        }
+    }
+    run.write_to(&env.input);
+
+    let corrected_stats = env._tmp.path().join("on.tsv");
+    run_ok(&env.input, &corrected_stats, &out, &[]);
+    let plain_stats = env._tmp.path().join("off.tsv");
+    run_ok(&env.input, &plain_stats, &out, &["--no-sequencing-dups"]);
+
+    let corrected: u64 = parse_row(&corrected_stats)["estimated_library_size"].parse().unwrap();
+    let plain: u64 = parse_row(&plain_stats)["estimated_library_size"].parse().unwrap();
+    assert!(
+        corrected > plain,
+        "corrected {corrected} should exceed uncorrected {plain} once flowcell duplicates \
+         stop counting as saturation"
+    );
+}
+
+#[test]
+fn the_library_size_estimate_is_blank_when_every_duplicate_is_a_sequencing_duplicate() {
+    // The degenerate case of the correction: removing the sequencing duplicates
+    // leaves the observed total equal to the unique count, so there is no
+    // resampling for Lander-Waterman to work from and no size to report.
     let env = TestEnv::new();
     let stats = env._tmp.path().join("stats.tsv");
     let out = env._tmp.path().join("out.bam");
@@ -309,17 +349,18 @@ fn removing_sequencing_duplicates_raises_the_library_size_estimate() {
     run_ok(&env.input, &stats, &out, &[]);
 
     let row = parse_row(&stats);
-    let plain: u64 = row["estimated_library_size"].parse().unwrap();
-    let corrected: u64 = row["estimated_library_size_corrected"].parse().unwrap();
-    assert!(
-        corrected > plain,
-        "corrected {corrected} should exceed uncorrected {plain} once flowcell \
-         duplicates stop counting as saturation"
+    assert_eq!(
+        row["corrected_sequencing_duplicates"], row["duplicate_pairs"],
+        "every duplicate here is a flowcell duplicate"
     );
+    assert_eq!(row["estimated_library_size"], "", "nothing left to estimate from");
 }
 
 #[test]
-fn the_corrected_library_size_is_blank_when_the_split_is_not_estimable() {
+fn the_library_size_estimate_falls_back_when_the_split_is_not_estimable() {
+    // One tile means the split cannot be computed, but the library-size estimate
+    // still has everything it needs — it just cannot subtract a correction. It must
+    // fall back to the uncorrected value rather than going blank.
     let env = TestEnv::new();
     let stats = env._tmp.path().join("stats.tsv");
     let out = env._tmp.path().join("out.bam");
@@ -332,8 +373,8 @@ fn the_corrected_library_size_is_blank_when_the_split_is_not_estimable() {
 
     let row = parse_row(&stats);
     assert_eq!(row["tile_count"], "1");
-    assert_eq!(row["estimated_library_size_corrected"], "");
-    assert!(!row["estimated_library_size"].is_empty(), "the plain estimate still stands");
+    assert_eq!(row["corrected_sequencing_duplicates"], "", "split not estimable");
+    assert!(!row["estimated_library_size"].is_empty(), "but the estimate still stands");
 }
 
 #[test]
@@ -497,11 +538,9 @@ fn the_per_sequencing_unit_table_attributes_sequencing_duplicates_to_its_flowcel
 }
 
 #[test]
-fn the_per_unit_sequencing_duplicates_sum_to_the_per_library_figure() {
-    // Two numbers in the same output that a user would naturally add up. They
-    // reconcile only because both accumulate the unrounded per-group value and
-    // round once; rounding per group inflates the per-unit column instead.
-    // Few tiles here on purpose, so the correction leaves fractional values.
+fn the_per_unit_column_sums_exactly_to_the_raw_per_library_figure() {
+    // Each tile contributes `members - 1`, so both figures are one integer sum
+    // viewed two ways: no rounding, no attribution heuristic, no tolerance.
     let env = TestEnv::new();
     let stats = env._tmp.path().join("stats.tsv");
     let out = env._tmp.path().join("out.bam");
@@ -523,16 +562,48 @@ fn the_per_unit_sequencing_duplicates_sum_to_the_per_library_figure() {
     run.write_to(&env.input);
     run_ok(&env.input, &stats, &out, &[]);
 
-    let library: u64 = parse_row(&stats)["sequencing_duplicates"].parse().unwrap();
+    let raw: u64 = parse_row(&stats)["raw_sequencing_duplicates"].parse().unwrap();
     let per_unit: u64 = parse_rows(&env._tmp.path().join("stats.sequencing-units.tsv"))
         .iter()
         .map(|r| r["sequencing_duplicates"].parse::<u64>().unwrap())
         .sum();
-    assert!(library > 0, "the test data should produce some sequencing duplicates");
-    assert!(
-        library.abs_diff(per_unit) <= 1,
-        "per-unit total {per_unit} should reconcile with per-library {library}"
-    );
+    assert!(raw > 0, "the test data should produce some sequencing duplicates");
+    assert_eq!(per_unit, raw, "per-unit must sum exactly, not approximately");
+}
+
+#[test]
+fn the_per_unit_column_reconciles_across_many_heterogeneous_units() {
+    // Twenty units with differing tile spreads and group shapes, so per-unit
+    // residues cannot cancel by symmetry. Exactness must not depend on scale.
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut run = Run::new();
+    let mut pos = 10_000;
+    let flowcells: Vec<String> = (0..20).map(|i| format!("FC{i}")).collect();
+    for (index, flowcell) in flowcells.iter().enumerate() {
+        for tile in 0..(4 + index as u32 % 9) {
+            run.pair(flowcell, 1, tile, pos);
+            pos += 1_000;
+        }
+    }
+    for (index, flowcell) in flowcells.iter().enumerate() {
+        for group in 0..(1 + index as u32 % 5) {
+            for _ in 0..(2 + index as u32 % 5) {
+                run.pair(flowcell, 1, 0, 5_000_000 + 1_000 * group);
+            }
+        }
+    }
+    run.write_to(&env.input);
+    run_ok(&env.input, &stats, &out, &[]);
+
+    let raw: u64 = parse_row(&stats)["raw_sequencing_duplicates"].parse().unwrap();
+    let per_unit: u64 = parse_rows(&env._tmp.path().join("stats.sequencing-units.tsv"))
+        .iter()
+        .map(|r| r["sequencing_duplicates"].parse::<u64>().unwrap())
+        .sum();
+    assert!(raw > 0);
+    assert_eq!(per_unit, raw, "20 units must still reconcile exactly");
 }
 
 /// Run without `--read-name-format`, so the layout defaults to Illumina.
@@ -564,7 +635,7 @@ fn the_split_runs_by_default_with_no_flags_at_all() {
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
 
     let row = parse_row(&stats);
-    assert_eq!(row["sequencing_duplicates"], "3", "the split should be on by default");
+    assert_eq!(row["corrected_sequencing_duplicates"], "3", "the split should be on by default");
     assert_eq!(row["library_duplicates"], "0");
     assert!(env._tmp.path().join("stats.sequencing-units.tsv").exists());
 }
@@ -585,18 +656,17 @@ fn no_sequencing_dups_turns_the_split_off() {
 
     let row = parse_row(&stats);
     assert_eq!(row["duplicate_pairs"], "3", "duplicates are still marked and counted");
-    assert_eq!(row["sequencing_duplicates"], "", "but not classified");
+    assert_eq!(row["corrected_sequencing_duplicates"], "", "but not classified");
     assert_eq!(row["library_duplicates"], "");
     assert_eq!(row["tile_count"], "");
     assert!(!env._tmp.path().join("stats.sequencing-units.tsv").exists());
 }
 
 #[test]
-fn unparseable_read_names_skip_the_split_instead_of_failing_the_run() {
-    // The consequence of defaulting the layout to Illumina: a platform without a
-    // preset — MGI, Ultima, or anything whose names were rewritten — must still
-    // get its duplicates marked. The metric is dropped, loudly, and the run
-    // succeeds.
+fn unparseable_read_names_fail_the_run_even_with_no_flags() {
+    // The split is on by default, so this is what a user of a platform without a
+    // preset meets first. It must fail rather than quietly drop the metric, and the
+    // message has to name both ways forward.
     let env = TestEnv::new();
     let stats = env._tmp.path().join("stats.tsv");
     let out = env._tmp.path().join("out.bam");
@@ -604,21 +674,30 @@ fn unparseable_read_names_skip_the_split_instead_of_failing_the_run() {
         .sq("chr1", 1_000_000)
         .rec_simple("SRR1234567.1", 99, "chr1", 100, "50M", "=", 200, 150)
         .rec_simple("SRR1234567.1", 147, "chr1", 200, "50M", "=", 100, -150)
-        .rec_simple("SRR1234567.2", 99, "chr1", 100, "50M", "=", 200, 150)
-        .rec_simple("SRR1234567.2", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
     let result = run_default(&env.input, &stats, &out, &[]);
-    assert!(result.status.success(), "must not fail: {}", String::from_utf8_lossy(&result.stderr));
 
-    let row = parse_row(&stats);
-    assert_eq!(row["duplicate_pairs"], "1", "duplicate marking is unaffected");
-    assert_eq!(row["sequencing_duplicates"], "", "the split is skipped");
-    assert!(!env._tmp.path().join("stats.sequencing-units.tsv").exists());
-
+    assert!(!result.status.success(), "must not silently skip the metric");
     let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(stderr.contains("SRR1234567"), "should quote the name: {stderr}");
-    assert!(stderr.contains("--read-name-format"), "should say how to fix it: {stderr}");
-    assert!(stderr.contains("--no-sequencing-dups"), "should say how to silence it: {stderr}");
+    assert!(stderr.contains("SRR1234567.1"), "should quote the name: {stderr}");
+    assert!(stderr.contains("--read-name-format"), "should offer the layout flag: {stderr}");
+    assert!(stderr.contains("--no-sequencing-dups"), "should offer the opt-out: {stderr}");
+}
+
+#[test]
+fn the_split_can_be_skipped_on_a_platform_without_a_preset() {
+    // The escape hatch the failure above points at.
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    SamBuilder::new()
+        .sq("chr1", 1_000_000)
+        .rec_simple("F350009384L1C001R0010000000", 99, "chr1", 100, "50M", "=", 200, 150)
+        .rec_simple("F350009384L1C001R0010000000", 147, "chr1", 200, "50M", "=", 100, -150)
+        .write_to(&env.input);
+    let result = run_default(&env.input, &stats, &out, &["--no-sequencing-dups"]);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(parse_row(&stats)["duplicate_pairs"], "0");
 }
 
 #[test]
@@ -678,7 +757,7 @@ fn the_split_is_identical_under_every_spill_bucket_count() {
         run_ok(&env.input, &stats, &out, &["--spill-buckets", buckets]);
         let row = parse_row(&stats);
         let total: u64 = row["duplicate_pairs"].parse().unwrap();
-        let sequencing: u64 = row["sequencing_duplicates"].parse().unwrap();
+        let sequencing: u64 = row["corrected_sequencing_duplicates"].parse().unwrap();
         let library: u64 = row["library_duplicates"].parse().unwrap();
         assert_eq!(total, 20, "ten groups of three contribute two duplicates each");
         assert_eq!(sequencing + library, total);
@@ -719,7 +798,7 @@ fn the_split_is_unchanged_under_every_single_end_strategy() {
         run_ok(&env.input, &stats, &out, &["--single-end-strategy", strategy, "--ignore-unmated"]);
         let row = parse_row(&stats);
         let total: u64 = row["duplicate_pairs"].parse().unwrap();
-        let sequencing: u64 = row["sequencing_duplicates"].parse().unwrap();
+        let sequencing: u64 = row["corrected_sequencing_duplicates"].parse().unwrap();
         let library: u64 = row["library_duplicates"].parse().unwrap();
         assert_eq!(sequencing + library, total, "identity broken under {strategy}");
         seen.push(format!("{sequencing}/{library}/{total}"));
@@ -776,8 +855,8 @@ fn the_decomposition_is_reported_per_library() {
     let rows = parse_rows(&stats);
     let by_library: HashMap<&str, &HashMap<String, String>> =
         rows.iter().map(|r| (r["library"].as_str(), r)).collect();
-    assert_eq!(by_library["lib1"]["sequencing_duplicates"], "2");
+    assert_eq!(by_library["lib1"]["corrected_sequencing_duplicates"], "2");
     assert_eq!(by_library["lib1"]["library_duplicates"], "0");
-    assert_eq!(by_library["lib2"]["sequencing_duplicates"], "0");
+    assert_eq!(by_library["lib2"]["corrected_sequencing_duplicates"], "0");
     assert_eq!(by_library["lib2"]["library_duplicates"], "2");
 }

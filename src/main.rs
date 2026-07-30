@@ -54,7 +54,7 @@ use crate::raw_writer::RawBamWriter;
 use crate::readname::ReadNameFormat;
 use crate::sam_reader::SamReader;
 use crate::sig::{MethylationMode, SingleEndStrategy};
-use crate::tiles::{DEFAULT_SPILL_BUCKETS, OnUnparseable, TileSpiller};
+use crate::tiles::{DEFAULT_SPILL_BUCKETS, TileSpiller};
 
 /// Crate-level build identifier shown in `--version` and the `@PG VN:` tag.
 const DUPBLASTER_BUILD: &str = env!("CARGO_PKG_VERSION");
@@ -250,6 +250,8 @@ pub struct Args {
     /// subdirectory and read back once the output BAM is closed. That is roughly
     /// 5 GB for a 30x human genome and 50 GB at 300x, so point this at a volume
     /// with room — or pass `--no-sequencing-dups` if you don't want the metric.
+    /// dupblaster does not try to predict how much it will need, since with a
+    /// streamed input it cannot know; a spill write that fails is a hard error.
     ///
     /// `--single-end-strategy picard-exact` also buffers orphan / single-end reads
     /// to an uncompressed BAM here between its two passes, which is much smaller —
@@ -316,12 +318,10 @@ pub struct Args {
     /// layout; or `regex:PATTERN`, a pattern with `(?<su>...)` and `(?<tile>...)`
     /// capture groups, for platforms without a preset. [default: illumina]
     ///
-    /// The layout is never guessed, because mis-parsing one would silently produce
-    /// a confident wrong number. What happens to a read name it cannot parse
-    /// depends on whether you named the layout: passing this flag makes a
-    /// mismatch a hard error, while leaving it at the default makes dupblaster
-    /// skip the split with a warning — so data from platforms without a preset
-    /// still processes.
+    /// The layout is never guessed beyond that default, because mis-parsing one
+    /// would silently produce a confident wrong number. A read name the layout
+    /// cannot parse is a hard error: on a platform without a preset, either name
+    /// the layout with `regex:PATTERN` or pass `--no-sequencing-dups`.
     #[arg(long = "read-name-format", value_name = "FORMAT")]
     pub read_name_format: Option<ReadNameFormat>,
 
@@ -582,27 +582,11 @@ fn run(args: Args) -> Result<ExitCode> {
     // Attached after construction because the spiller is sized against
     // `bin_count`, which only exists once the bins are built.
     if !args.no_sequencing_dups {
-        // Naming the layout makes a mismatch fatal; leaving it defaulted makes it
-        // merely skip the split, so a platform without a preset still processes.
-        let (format, on_unparseable) = match args.read_name_format.clone() {
-            Some(format) => (format, OnUnparseable::Fail),
-            None => (ReadNameFormat::default(), OnUnparseable::Disable),
-        };
-        // The input's size sizes the pre-flight free-space check; a stream has
-        // none, in which case the check is skipped.
-        let input_bytes = args
-            .input
-            .as_deref()
-            .filter(|path| *path != Path::new("-"))
-            .and_then(|path| std::fs::metadata(path).ok())
-            .map(|meta| meta.len());
         let spiller = TileSpiller::new(
-            format,
-            on_unparseable,
+            args.read_name_format.clone().unwrap_or_default(),
             processor.bin_count(),
             args.spill_buckets,
             args.tmp_dir.as_deref(),
-            input_bytes,
         )
         .context("preparing the sequencing-vs-library duplicate spill")?;
         processor.attach_tile_spiller(spiller);
@@ -649,7 +633,7 @@ fn run(args: Args) -> Result<ExitCode> {
     // `for_each_block` owns that grouping loop. picard-exact takes a separate
     // two-pass driver (pairs stream out, fragments are buffered then
     // re-processed); every other strategy is a single streaming pass.
-    if args.single_end_strategy.to_strategy() == SingleEndStrategy::PicardExact {
+    let processed = if args.single_end_strategy.to_strategy() == SingleEndStrategy::PicardExact {
         run_picard_exact(
             &mut reader,
             &mut processor,
@@ -658,7 +642,7 @@ fn run(args: Args) -> Result<ExitCode> {
             &header,
             &args,
             &mut ladder,
-        )?;
+        )
     } else {
         let mut pool: Vec<RawRecord> = Vec::with_capacity(8);
         for_each_block(&mut reader, &mut pool, |block| {
@@ -670,7 +654,17 @@ fn run(args: Args) -> Result<ExitCode> {
             }
             Ok(())
         })
-        .context("processing record block")?;
+        .context("processing record block")
+    };
+    // A run that died part-way has written a prefix of its output. Leave that
+    // prefix on disk — silently discarding a user's partial output would be its
+    // own surprise — but abandon the writer rather than finishing it, so the file
+    // lacks the BGZF EOF marker and every reader can see it is incomplete.
+    // Dropping the writer instead would emit that marker and make the truncated
+    // file pass `samtools quickcheck`.
+    if let Err(error) = processed {
+        out.abandon();
+        return Err(error);
     }
 
     print_run_stats(&stats, &args);
@@ -687,10 +681,8 @@ fn run(args: Args) -> Result<ExitCode> {
     // spill back: it touches gigabytes and can take tens of seconds, and
     // dupblaster sits in pipelines where a downstream sort or caller is blocked
     // on our stdout. This ordering is a hard requirement, not a preference.
-    // `is_active` is false when an unparseable read name retired the split, in
-    // which case there is nothing spilled to read back.
     let decomposition = match processor.take_tile_spiller() {
-        Some(spiller) if spiller.is_active() => {
+        Some(spiller) => {
             if !args.quiet {
                 eprintln!(
                     "dupblaster: decomposing duplicates from {:.1} MiB of spilled tile records",
@@ -703,7 +695,7 @@ fn run(args: Args) -> Result<ExitCode> {
                     .context("decomposing sequencing vs library duplicates")?,
             )
         }
-        _ => None,
+        None => None,
     };
 
     if let Some(stats_path) = args.stats.as_deref() {

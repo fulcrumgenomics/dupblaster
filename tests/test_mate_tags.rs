@@ -1,7 +1,6 @@
 //! --add-mate-tags behavioral tests.
 
 mod helpers;
-use std::process::Command;
 
 use helpers::*;
 
@@ -22,7 +21,7 @@ fn add_mate_tags_is_idempotent_across_two_runs() {
         .write_to(&env.input);
     // First pass: add tags.
     let pass1 = env._tmp.path().join("pass1.bam");
-    let r = Command::new(rust_binary())
+    let r = dupblaster()
         .args(["-i"])
         .arg(&env.input)
         .args(["-o"])
@@ -33,7 +32,7 @@ fn add_mate_tags_is_idempotent_across_two_runs() {
     assert!(r.status.success(), "pass1: {}", String::from_utf8_lossy(&r.stderr));
     // Second pass: feed pass1 back in with --add-mate-tags.
     let pass2 = env._tmp.path().join("pass2.bam");
-    let r = Command::new(rust_binary())
+    let r = dupblaster()
         .args(["-i"])
         .arg(&pass1)
         .args(["-o"])
@@ -91,7 +90,7 @@ fn add_mate_tags_writes_mate_cigar_and_mate_mapq() {
     sb.write_to(&env.input);
 
     let out_bam = env._tmp.path().join("out.bam");
-    let r = Command::new(rust_binary())
+    let r = dupblaster()
         .args(["-i"])
         .arg(&env.input)
         .args(["-o"])
