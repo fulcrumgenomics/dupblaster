@@ -25,7 +25,6 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
@@ -102,39 +101,6 @@ pub(crate) struct TileEntry {
     pub templates: u64,
 }
 
-/// FNV-1a over a dictionary key.
-///
-/// std's SipHash buys DoS resistance that is wasted here — the keys are read-name
-/// tokens, not attacker-controlled — while costing several times more per probe on
-/// a path walked once per template. This matches the codebase's existing
-/// preference for fast non-cryptographic hashing on per-record paths (see
-/// [`crate::sig::U64Hasher`]). Not benchmarked in isolation: the one-entry memo
-/// already absorbs most probes on name-sorted input.
-struct FnvHasher(u64);
-
-impl Default for FnvHasher {
-    fn default() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
-    }
-}
-
-impl Hasher for FnvHasher {
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        let mut hash = self.0;
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100_0000_01b3);
-        }
-        self.0 = hash;
-    }
-
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
 /// Tile aggregates for one library, all derived from the same single pass.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LibraryTiles {
@@ -156,7 +122,16 @@ pub(crate) struct TileDictionary {
     /// How to pull the unit and tile out of a read name; chosen by the user.
     format: ReadNameFormat,
     /// Packed triple key → serial ID. See [`Self::pack_key`] for the encoding.
-    ids: HashMap<Box<[u8]>, u32, BuildHasherDefault<FnvHasher>>,
+    ///
+    /// Deliberately std's default hasher, despite this being a per-template path.
+    /// A hand-rolled FNV-1a was measured against it and came out ~2% *slower*
+    /// end-to-end (5.13 s against 5.03 s over 8.4M templates, three runs each):
+    /// the keys are only ~20 bytes, so SipHash's word-at-a-time processing beats a
+    /// byte-at-a-time multiply loop, and FNV's weak low bits cost extra probes.
+    /// A word-at-a-time hasher might win, but it would need a new dependency and a
+    /// measurement to justify it — not the reflex that a fast hasher is always
+    /// faster.
+    ids: HashMap<Box<[u8]>, u32>,
     /// Interned triples, indexed by ID.
     entries: Vec<TileEntry>,
     /// Reused buffer for the lookup key, so probing allocates nothing.
