@@ -253,13 +253,11 @@ DuckDB. Give `--stats` a `.gz` (or `.bgz`) suffix to gzip-compress the file.
 | `unmapped_pairs` | Templates with both reads unmapped. |
 | `unmated_templates` | Templates with a stray half (skipped unless `--ignore-unmated`). |
 | `estimated_library_size` | Lander-Waterman estimate of the library's distinct molecules, with sequencing duplicates removed from the observed total (Picard's `ESTIMATED_LIBRARY_SIZE` convention). Empty when not estimable — including the degenerate case where *every* duplicate is a sequencing duplicate, which leaves no resampling to infer from. |
-| `raw_sequencing_duplicates` | Duplicate pairs made on the flowcell, uncorrected: `Σ (tile members − 1)` over duplicate groups. The per-sequencing-unit table sums to exactly this. Empty under `--no-sequencing-dups`, or when a library has no pairs or sits on one tile. |
-| `corrected_sequencing_duplicates` | The same count corrected for tiles that collide by chance. **This is the figure to use.** |
-| `library_duplicates` | The residual `duplicate_pairs − corrected_sequencing_duplicates`; the two sum exactly. |
-| `frac_pair_duplicates` | `duplicate_pairs / mapped_pairs` — the pair-level rate, as distinct from the read-level `frac_duplicates`. |
-| `frac_sequencing_duplicates` | `corrected_sequencing_duplicates / duplicate_pairs`. |
-| `tile_count` | Distinct imaging tiles seen for this library. An implausible value means `--read-name-format` is pointed at the wrong field. |
-| `tile_collision_rate` | `q = Σ w_t²`, the chance two unrelated templates share a tile. |
+| `raw_sequencing_duplicate_pairs` | Duplicate pairs made on the flowcell, uncorrected: `Σ (tile members − 1)` over duplicate groups. The per-sequencing-unit table sums to exactly this. Empty under `--no-sequencing-dups`, or when a library has no pairs or sits on a single tile. |
+| `corrected_sequencing_duplicate_pairs` | The same count corrected for tiles that collide by chance. **This is the figure to use.** |
+| `library_duplicate_pairs` | The residual `duplicate_pairs − corrected_sequencing_duplicates`; the two sum exactly. |
+| `frac_duplicate_pairs` | `duplicate_pairs / mapped_pairs` — the pair-level rate, as distinct from the read-level `frac_duplicates`. |
+| `frac_sequencing_duplicate_pairs` | `corrected_sequencing_duplicates / duplicate_pairs`. |
 
 ## Sequencing vs. library duplicates (`--no-sequencing-dups`)
 
@@ -305,11 +303,11 @@ library_duplicates    = n - 1      each extra tile is an independent molecule
 total                 = k - 1      the duplicates dupblaster already reports
 ```
 
-The two always sum to `duplicate_pairs` exactly. That is the **raw** rule, reported as `raw_sequencing_duplicates`.
+The two always sum to `duplicate_pairs` exactly. That is the **raw** rule, reported as `raw_sequencing_duplicate_pairs`.
 
 #### Correcting for chance
 
-Independent molecules sometimes land on the same tile by accident, so the tile count `n` under-states how many molecules a group really held, and the raw rule credits the difference to the flowcell. The reported `corrected_sequencing_duplicates` therefore does not use `k - n`. It asks instead **how many independent molecules would produce the `n` tiles we saw**, by inverting
+Independent molecules sometimes land on the same tile by accident, so the tile count `n` under-states how many molecules a group really held, and the raw rule credits the difference to the flowcell. The reported `corrected_sequencing_duplicate_pairs` therefore does not use `k - n`. It asks instead **how many independent molecules would produce the `n` tiles we saw**, by inverting
 
 ```
 E[n | m] = Σ_t (1 - (1 - w_t)^m)
@@ -319,7 +317,7 @@ for `m` (where `w_t` is tile `t`'s share of the library's templates), and report
 
 Inverting is not the same as subtracting `E[n | k] - n`, which is the form that first suggests itself. Only the *independent* molecules can collide, and there are fewer of them than `k`, so subtracting the collisions expected of all `k` members over-corrects — by 0.2% of the count at `k = 20`, 3.8% at `k = 500` and **21% at `k = 3102`** on real tile shares. The gap between the raw and corrected columns is a useful diagnostic in its own right: it is 0.05 pp on our WGS sample and grows with group size, so it is where RNA-seq and amplicon data will differ most from WGS.
 
-A library on fewer than two tiles is a special case: `E[n | m]` is then constant, every duplicate is on "the" tile whether it was clustered or not, and no attribution is possible. Both counts are left blank, with `tile_count` and `tile_collision_rate` showing why.
+A library on fewer than two tiles is a special case: `E[n | m]` is then constant, every duplicate is on "the" tile whether it was clustered or not, and no attribution is possible. Both counts are left blank rather than reported as zero.
 
 ### No pixel radius
 
@@ -331,7 +329,7 @@ Picard and `samtools markdup` call a duplicate optical when two reads fall withi
 | `markdup -d 2500` | 59.4% | 65.0% |
 | `markdup -d 100` | 33.2% | 10.3% |
 
-Working from identity also handles coincidental duplicates with no special case, which is what makes the metric meaningful for RNA-seq and amplicon data where such duplicates are the norm. Two distinct molecules at one locus are imaged independently, so they usually occupy two tiles and read as one library duplicate and zero sequencing. They *can* collide on one tile — with probability `tile_collision_rate` — which is exactly what the correction above exists to account for, rather than something the raw rule gets right on its own.
+Working from identity also handles coincidental duplicates with no special case, which is what makes the metric meaningful for RNA-seq and amplicon data where such duplicates are the norm. Two distinct molecules at one locus are imaged independently, so they usually occupy two tiles and read as one library duplicate and zero sequencing. They *can* collide on one tile, with probability `q = Σ w_t²`, which is exactly what the correction above exists to account for rather than something the raw rule gets right on its own.
 
 ### Choosing the format
 
@@ -353,7 +351,7 @@ The sequencing unit and tile are treated as **opaque tokens** and never parsed a
 
 The split is left **blank** rather than zero whenever it cannot mean anything, so a missing number is visibly a missing number rather than a measurement. That happens when `--no-sequencing-dups` was passed, when a library has no both-ends-mapped pairs, or when a library sits on a single tile.
 
-That last case is worth understanding: with one tile, every duplicate is on "the" tile whether it was clustered or not, so `q = 1` and no duplicate can be attributed. dupblaster reports `tile_collision_rate` (`q`) and `tile_count` whenever it looked at all, precisely so you can see *why* a blank is blank. An implausibly large `tile_count` is the signal that `--read-name-format` is pointed at the wrong field — past a million distinct tiles dupblaster warns, and past 16,777,216 it fails.
+That last case is worth understanding: with one tile, every duplicate is on "the" tile whether it was clustered or not, so nothing can be attributed. The per-sequencing-unit file's `tiles` column is what distinguishes it from the other reasons a cell is blank. A misconfigured `--read-name-format` shows up there too, as an implausible tile count — past a million distinct tiles dupblaster warns, and past 16,777,216 it fails.
 
 ### Per-sequencing-unit table
 
@@ -365,8 +363,8 @@ With `--stats <PATH>`, a companion `<PATH>.sequencing-units.tsv` breaks the same
 | `sequencing_unit` | Flowcell and lane, verbatim from the read names, e.g. `H72CFDSXF:2`. |
 | `templates` | Templates observed on this unit. |
 | `tiles` | Distinct tiles seen on this unit. |
-| `sequencing_duplicates` | Sequencing duplicates on this unit's own tiles — each tile contributes `members - 1` of any group it holds part of, so a group straddling two units splits across them exactly. Summed over all units this equals `raw_sequencing_duplicates`. |
-| `frac_sequencing_duplicates` | `sequencing_duplicates / templates` — the loading-density signal, comparable across units. |
+| `sequencing_duplicate_pairs` | Sequencing duplicates on this unit's own tiles — each tile contributes `members - 1` of any group it holds part of, so a group straddling two units splits across them exactly. Summed over all units this equals `raw_sequencing_duplicate_pairs`. |
+| `frac_sequencing_duplicate_pairs` | `sequencing_duplicates / templates` — the loading-density signal, comparable across units. |
 
 ### Corrected library size
 

@@ -156,22 +156,20 @@ fn stats_tsv_has_all_expected_columns() {
         "duplicate_templates",
         "frac_duplicates",
         "mapped_pairs",
+        "unmapped_pairs",
         "duplicate_pairs",
         // The split's own block, present whether or not it ran so the schema does
         // not change shape with the options used; blank when it did not.
-        "raw_sequencing_duplicates",
-        "corrected_sequencing_duplicates",
-        "library_duplicates",
-        "frac_pair_duplicates",
-        "frac_sequencing_duplicates",
+        "raw_sequencing_duplicate_pairs",
+        "corrected_sequencing_duplicate_pairs",
+        "library_duplicate_pairs",
+        "frac_duplicate_pairs",
+        "frac_sequencing_duplicate_pairs",
         "estimated_library_size",
         "mapped_orphans",
         "duplicate_orphans",
         "unmapped_orphans",
-        "unmapped_pairs",
         "unmated_templates",
-        "tile_count",
-        "tile_collision_rate",
     ];
     assert_eq!(cols, expected);
 }
@@ -195,12 +193,10 @@ fn decomposition_columns_are_blank_when_the_split_is_disabled() {
     let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
     let values: Vec<&str> = lines.next().unwrap().split('\t').collect();
     for column in [
-        "raw_sequencing_duplicates",
-        "corrected_sequencing_duplicates",
-        "library_duplicates",
-        "frac_sequencing_duplicates",
-        "tile_count",
-        "tile_collision_rate",
+        "raw_sequencing_duplicate_pairs",
+        "corrected_sequencing_duplicate_pairs",
+        "library_duplicate_pairs",
+        "frac_sequencing_duplicate_pairs",
     ] {
         let index = header.iter().position(|c| *c == column).expect("column present");
         assert_eq!(values[index], "", "{column} should be blank");
