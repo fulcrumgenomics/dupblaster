@@ -41,7 +41,7 @@ fn cross_library_pairs_at_same_locus_are_not_duplicates() {
         .rec_simple_rg("p2", 147, "chr1", 200, "50M", "=", 100, -150, "B")
         .write_to(&env.input);
 
-    let flags = run_and_extract_flags(&env.input, &out, &[]);
+    let flags = run_and_capture(&env.input, &out, &[]).flags;
     let dup = dup_by_qname(&flags);
     assert!(!dup["p1"], "p1 should not be a duplicate");
     assert!(!dup["p2"], "p2 is a different library — not a duplicate of p1");
@@ -64,7 +64,7 @@ fn same_library_pairs_across_read_groups_are_duplicates() {
         .rec_simple_rg("p2", 147, "chr1", 200, "50M", "=", 100, -150, "B")
         .write_to(&env.input);
 
-    let flags = run_and_extract_flags(&env.input, &out, &[]);
+    let flags = run_and_capture(&env.input, &out, &[]).flags;
     let dup = dup_by_qname(&flags);
     assert!(!dup["p1"], "first pair seen is the original");
     assert!(dup["p2"], "same library, same coords → duplicate");
@@ -86,7 +86,7 @@ fn library_unaware_flag_marks_cross_library_dups() {
         .rec_simple_rg("p2", 147, "chr1", 200, "50M", "=", 100, -150, "B")
         .write_to(&env.input);
 
-    let flags = run_and_extract_flags(&env.input, &out, &["--library-unaware"]);
+    let flags = run_and_capture(&env.input, &out, &["--library-unaware"]).flags;
     let dup = dup_by_qname(&flags);
     assert!(dup["p2"], "with --library-unaware, different libraries collapse");
 }
@@ -111,7 +111,7 @@ fn reads_without_read_group_share_unknown_library() {
         .rec_simple("u2", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
 
-    let flags = run_and_extract_flags(&env.input, &out, &[]);
+    let flags = run_and_capture(&env.input, &out, &[]).flags;
     let dup = dup_by_qname(&flags);
     assert!(!dup["u1"], "first RG-less pair is the original");
     assert!(dup["u2"], "second RG-less pair dedups within Unknown Library");
@@ -139,7 +139,7 @@ fn unknown_library_is_distinct_from_named_libraries() {
         .rec_simple_rg("p2", 147, "chr1", 200, "50M", "=", 100, -150, "A")
         .write_to(&env.input);
 
-    let flags = run_and_extract_flags(&env.input, &out, &[]);
+    let flags = run_and_capture(&env.input, &out, &[]).flags;
     let dup = dup_by_qname(&flags);
     assert!(!dup["p1"], "first lib1 pair is the original");
     assert!(!dup["pN"], "RG-less pair is the Unknown Library — not a dup of lib1");
@@ -175,7 +175,7 @@ fn picard_exact_orphans_dedup_within_library_only() {
     b = unmapped_mate(b, "orphanB");
     b.write_to(&env.input);
 
-    let flags = run_and_extract_flags(&env.input, &out, &["--single-end-strategy", "picard-exact"]);
+    let flags = run_and_capture(&env.input, &out, &["--single-end-strategy", "picard-exact"]).flags;
     let dup = dup_by_qname(&flags);
     assert!(!dup["pairA"], "the pair is the original");
     assert!(dup["orphanA"], "lib1 orphan at the pair's 5' end is a duplicate of the pair");

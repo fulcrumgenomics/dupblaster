@@ -49,7 +49,7 @@ fn picard_exact_orphan_before_pair_marks_orphan_dup() {
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
     let recs =
-        run_and_extract_flags(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]);
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]).flags;
 
     // Output reordering: the pair flushes in pass 1, the orphan in pass 2.
     assert_eq!(recs[0], ("rA".into(), 99));
@@ -75,7 +75,7 @@ fn picard_exact_pair_before_orphan_marks_orphan_dup() {
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
     let recs =
-        run_and_extract_flags(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]);
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]).flags;
     assert_eq!(nth_flag(&recs, "rA", 0), 99);
     assert_eq!(nth_flag(&recs, "rB", 0), 73 | FLAG_DUPLICATE);
     assert_eq!(nth_flag(&recs, "rB", 1), 133 | FLAG_DUPLICATE);
@@ -96,7 +96,7 @@ fn picard_exact_still_marks_pair_pair_duplicates() {
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
     let recs =
-        run_and_extract_flags(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]);
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]).flags;
     // No fragments → no reordering; pairs stream in input order.
     assert_eq!(recs[0], ("rA".into(), 99));
     assert_eq!(recs[1], ("rA".into(), 147));
@@ -118,7 +118,7 @@ fn picard_exact_two_orphans_no_pair_one_marked_dup() {
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
     let recs =
-        run_and_extract_flags(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]);
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]).flags;
     let dup_count = recs.iter().filter(|(_, f)| f & FLAG_DUPLICATE != 0).count();
     assert_eq!(dup_count, 1, "exactly one of two identical orphans should be dup: {recs:?}");
 }
@@ -134,7 +134,7 @@ fn picard_exact_lone_orphan_not_dup() {
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
     let recs =
-        run_and_extract_flags(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]);
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]).flags;
     assert_eq!(recs[0], ("rSolo".into(), 0));
 }
 
@@ -157,7 +157,7 @@ fn picard_exact_fragment_keying_is_strand_aware() {
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
     let recs =
-        run_and_extract_flags(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]);
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]).flags;
     assert_eq!(
         nth_flag(&recs, "rB", 0) & FLAG_DUPLICATE,
         0,
@@ -178,11 +178,12 @@ fn picard_exact_respects_tmp_dir_flag() {
         .rec_simple("rB", 0, "chr1", 100, "50M", "*", 0, 0)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(
+    let recs = run_and_capture(
         &env.input,
         &bam_out,
         &["--single-end-strategy", "picard-exact", "--tmp-dir", tmp_dir.to_str().unwrap()],
-    );
+    )
+    .flags;
     let dup_count = recs.iter().filter(|(_, f)| f & FLAG_DUPLICATE != 0).count();
     assert_eq!(dup_count, 1, "result must be unchanged when using a custom --tmp-dir");
 }

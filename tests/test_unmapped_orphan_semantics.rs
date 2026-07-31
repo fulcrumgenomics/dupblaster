@@ -19,7 +19,7 @@ fn both_unmapped_pairs_are_never_marked_duplicate() {
         .record("r2", 141, "*", 0, 0, "*", "*", 0, 0, &"A".repeat(50), &"I".repeat(50))
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     assert_eq!(recs.len(), 4);
     for (qname, flag) in &recs {
@@ -47,7 +47,7 @@ fn two_orphan_pairs_with_same_mapped_position_are_dups() {
         .record("rB", 133, "chr1", 100, 0, "*", "=", 100, 0, &"A".repeat(50), &"I".repeat(50))
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     // rA is the kept representative; rB is the duplicate. The dup flag
     // propagates to every record in rB's block (including the unmapped
@@ -70,7 +70,7 @@ fn orphan_pairs_with_different_mapped_positions_are_not_dups() {
         .record("rB", 133, "chr1", 500, 0, "*", "=", 500, 0, &"A".repeat(50), &"I".repeat(50))
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     for (qname, flag) in &recs {
         assert_eq!(
@@ -96,7 +96,7 @@ fn two_reverse_strand_single_end_orphans_at_same_position_are_dups() {
         .rec_simple("rB", FLAG_REVERSE, "chr1", 100, "50M", "*", 0, 0)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     assert_eq!(recs[0], ("rA".into(), FLAG_REVERSE));
     assert_eq!(recs[1], ("rB".into(), FLAG_REVERSE | FLAG_DUPLICATE));
@@ -121,7 +121,7 @@ fn unmapped_single_end_read_passes_through_without_ignore_unmated() {
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
     // No --ignore-unmated: this must succeed on the defaults.
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     // Every input record is emitted, none marked duplicate (the unmapped read
     // is never dup-checked; the lone mapped read has no other fragment).
@@ -153,7 +153,7 @@ fn unmapped_single_end_read_passes_through_in_picard_exact_mode() {
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
     let recs =
-        run_and_extract_flags(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]);
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]).flags;
 
     assert_eq!(recs.len(), 3, "all records must pass through");
     // The unmapped SE read is emitted, never marked duplicate, still unmapped.
@@ -174,7 +174,7 @@ fn two_reverse_strand_single_end_orphans_at_different_positions_are_not_dups() {
         .rec_simple("rB", FLAG_REVERSE, "chr1", 500, "50M", "*", 0, 0)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     for (qname, flag) in &recs {
         assert_eq!(

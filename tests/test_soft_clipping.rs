@@ -25,7 +25,7 @@ fn forward_leading_softclip_is_compensated_in_signature() {
         .rec_simple("rB", 147, "chr1", 151, "50M", "=", 105, -95)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     assert_eq!(recs[0], ("rA".into(), 99));
     assert_eq!(recs[1], ("rA".into(), 147));
@@ -48,7 +48,7 @@ fn reverse_trailing_softclip_is_compensated_in_signature() {
         .rec_simple("rB", 147, "chr1", 151, "45M5S", "=", 100, -95)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     assert_eq!(recs[0], ("rA".into(), 99));
     assert_eq!(recs[1], ("rA".into(), 147));
@@ -69,7 +69,7 @@ fn different_softclip_lengths_yielding_different_five_prime_are_not_dups() {
         .rec_simple("rB", 147, "chr1", 151, "50M", "=", 100, -90)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     for (qname, flag) in &recs {
         assert_eq!(
@@ -93,7 +93,7 @@ fn softclip_pushing_five_prime_before_contig_start_does_not_panic() {
         .rec_simple("rA", 147, "chr1", 55, "50M", "=", 5, -90)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     // Single pair, no duplicates expected — just verifying the run
     // completes and produces output.
@@ -121,7 +121,7 @@ fn leading_hard_clip_counts_toward_five_prime_clip_like_soft_clip() {
         .rec_simple("rB", 147, "chr1", 151, "50M", "=", 100, -85)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     assert_eq!(recs[0], ("rA".into(), 99));
     assert_eq!(recs[1], ("rA".into(), 147));
@@ -145,7 +145,7 @@ fn leading_hard_clip_changes_signature_relative_to_soft_clip_only() {
         .rec_simple("rB", 147, "chr1", 151, "50M", "=", 100, -90)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     for (qname, flag) in &recs {
         assert_eq!(

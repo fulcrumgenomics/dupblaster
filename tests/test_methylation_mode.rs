@@ -40,7 +40,7 @@ fn wgs_mode_collapses_opposite_strand_pairs_at_same_locus() {
         .rec_simple("ob", 163, "chr1", 100, "50M", "=", 200, 150)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     assert_eq!(recs[0], ("ot".into(), 99));
     assert_eq!(recs[1], ("ot".into(), 147));
@@ -62,7 +62,7 @@ fn directional_mode_keeps_opposite_strand_pairs_distinct() {
         .rec_simple("ob", 163, "chr1", 100, "50M", "=", 200, 150)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &["--methylation-mode", "directional"]);
+    let recs = run_and_capture(&env.input, &bam_out, &["--methylation-mode", "directional"]).flags;
 
     for (qname, flag) in &recs {
         assert_eq!(
@@ -86,7 +86,7 @@ fn directional_mode_collapses_same_strand_pcr_duplicates() {
         .rec_simple("ot2", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &["--methylation-mode", "directional"]);
+    let recs = run_and_capture(&env.input, &bam_out, &["--methylation-mode", "directional"]).flags;
 
     assert_eq!(recs[0], ("ot1".into(), 99));
     assert_eq!(recs[1], ("ot1".into(), 147));
@@ -109,7 +109,7 @@ fn directional_mode_three_deep_keeps_other_strand() {
         .rec_simple("ob", 163, "chr1", 100, "50M", "=", 200, 150)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &["--methylation-mode", "directional"]);
+    let recs = run_and_capture(&env.input, &bam_out, &["--methylation-mode", "directional"]).flags;
 
     assert_eq!(recs[0].1 & FLAG_DUPLICATE, 0, "first OT is the representative");
     assert_eq!(recs[2], ("ot2".into(), 99 | FLAG_DUPLICATE), "second OT is a duplicate");
@@ -133,7 +133,7 @@ fn directional_mode_collapses_identical_ff_pairs() {
         .rec_simple("ff2", 131, "chr1", 200, "50M", "=", 100, 0)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &["--methylation-mode", "directional"]);
+    let recs = run_and_capture(&env.input, &bam_out, &["--methylation-mode", "directional"]).flags;
 
     assert_eq!(recs[0].1 & FLAG_DUPLICATE, 0);
     assert_eq!(recs[2], ("ff2".into(), 67 | FLAG_DUPLICATE));
@@ -154,7 +154,7 @@ fn directional_mode_collapses_identical_rr_pairs() {
         .rec_simple("rr2", 179, "chr1", 200, "50M", "=", 100, 0)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &["--methylation-mode", "directional"]);
+    let recs = run_and_capture(&env.input, &bam_out, &["--methylation-mode", "directional"]).flags;
 
     assert_eq!(recs[0].1 & FLAG_DUPLICATE, 0);
     assert_eq!(recs[2], ("rr2".into(), 115 | FLAG_DUPLICATE));
@@ -175,7 +175,7 @@ fn directional_mode_collapses_identical_rf_outie_pairs() {
         .rec_simple("rf2", 161, "chr1", 200, "50M", "=", 100, 0)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &["--methylation-mode", "directional"]);
+    let recs = run_and_capture(&env.input, &bam_out, &["--methylation-mode", "directional"]).flags;
 
     assert_eq!(recs[0].1 & FLAG_DUPLICATE, 0);
     assert_eq!(recs[2], ("rf2".into(), 81 | FLAG_DUPLICATE));
@@ -203,7 +203,7 @@ fn directional_mode_keeps_strand_swapped_cross_contig_pairs_distinct() {
         .rec_simple("b", 161, "chr1", 100, "50M", "chr2", 200, 0)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &["--methylation-mode", "directional"]);
+    let recs = run_and_capture(&env.input, &bam_out, &["--methylation-mode", "directional"]).flags;
 
     assert_eq!(recs[0].1 & FLAG_DUPLICATE, 0, "chimera A is the representative");
     assert_eq!(recs[2], ("a2".into(), 97 | FLAG_DUPLICATE), "exact copy of A is a duplicate");
@@ -230,7 +230,7 @@ fn directional_mode_propagates_dup_flag_to_supplementary() {
         .rec_simple("ot2", 99 | FLAG_SUPPLEMENTARY, "chr1", 500, "50M", "=", 200, 150)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &["--methylation-mode", "directional"]);
+    let recs = run_and_capture(&env.input, &bam_out, &["--methylation-mode", "directional"]).flags;
 
     assert_eq!(recs[0].1 & FLAG_DUPLICATE, 0, "first OT is the representative");
     // Every record of the duplicate block — including the supplementary.
@@ -255,7 +255,7 @@ fn directional_mode_remove_dups_keeps_both_strands() {
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
     let recs =
-        run_and_extract_flags(&env.input, &bam_out, &["-r", "--methylation-mode", "directional"]);
+        run_and_capture(&env.input, &bam_out, &["-r", "--methylation-mode", "directional"]).flags;
 
     // ot2 (the same-strand copy) is removed; ot1 and the OB pair remain.
     let names: Vec<&str> = recs.iter().map(|(q, _)| q.as_str()).collect();
@@ -278,7 +278,7 @@ fn directional_mode_still_marks_single_end_duplicates() {
         .rec_simple("se2", 0, "chr1", 100, "50M", "*", 0, 0)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &["--methylation-mode", "directional"]);
+    let recs = run_and_capture(&env.input, &bam_out, &["--methylation-mode", "directional"]).flags;
 
     assert_eq!(recs[0], ("se1".into(), 0));
     assert_eq!(recs[1], ("se2".into(), FLAG_DUPLICATE));
