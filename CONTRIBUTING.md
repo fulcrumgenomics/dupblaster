@@ -39,12 +39,13 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 ## Verification Checklist
 
-Run all four before sending a PR. CI runs the same gates.
+Run all five before sending a PR. CI runs the same gates.
 
 ```sh
 cargo ci-fmt    # rustfmt --check
 cargo ci-lint   # clippy --all-targets -D warnings
 cargo ci-test   # nextest, --locked
+cargo ci-doc    # rustdoc, -D warnings (catches broken intra-doc links)
 cargo deny check  # licenses, advisories, bans, sources
 ```
 
@@ -171,7 +172,7 @@ Open a GitHub issue with:
 - Each PR should include tests for the behavior it adds or changes.
 - Update CHANGELOG.md's `[Unreleased]` section with a one-line entry
   in the appropriate subsection (Added / Changed / Fixed / Removed).
-- All four CI gates must be green before merge.
+- All five CI gates must be green before merge.
 
 ## Releasing
 

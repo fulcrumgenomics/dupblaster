@@ -396,9 +396,10 @@ where
     S: Copy + Eq + Hash,
     H: Hasher + Default,
 {
-    /// Cell-row width = `(bin_count + 1) * 2`. Used by [`Self::check_dm`]
-    /// to compute the 2D offset `s1 * stride + s2`; not consulted by
-    /// fragment-table operations (which only use the `s1 = 0` row).
+    /// Cell-row width = `(bin_count + 1) * 2`. Used by
+    /// [`PairDupTable::pair_slot`] to compute the 2D offset `s1 * stride + s2`
+    /// and by [`PairDupTable::drain_into_fragment_table`] to invert it; not
+    /// consulted by fragment-table operations (which only use the `s1 = 0` row).
     stride: u32,
     /// The flat array of partition cells, each a `HashSet` of signature values.
     /// Indexed by a 1D offset derived from `(s1 * stride + s2)` for pair tables

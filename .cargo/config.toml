@@ -2,3 +2,7 @@
 ci-test = "nextest run --workspace --locked --no-tests=pass"
 ci-fmt = "fmt --all -- --check"
 ci-lint = "clippy --workspace --all-targets -- -D warnings"
+# `cargo doc` accepts no trailing rustdoc args, hence `--config` rather than the
+# `-- -D warnings` form ci-lint uses. Scoping it to the alias instead of
+# `[build] rustdocflags` keeps a plain local `cargo doc` warn-only.
+ci-doc = ["doc", "--workspace", "--no-deps", "--locked", "--config", "build.rustdocflags=[\"-D\",\"warnings\"]"]
