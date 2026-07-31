@@ -214,6 +214,7 @@ fn an_uncompressed_run_reports_no_on_disk_size() {
 
     let result = run(&env.input, &stats, &out, &[]);
     let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "dupblaster failed: {stderr}");
     assert!(stderr.contains("spilled tile records"), "expected the spill line: {stderr}");
     assert!(
         !stderr.contains("on disk"),
@@ -235,6 +236,7 @@ fn a_compressed_run_reports_the_on_disk_size_and_a_ratio() {
 
     let result = run(&env.input, &stats, &out, &["--tmp-compression-level", "1"]);
     let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "dupblaster failed: {stderr}");
     assert!(stderr.contains("on disk"), "expected an on-disk size: {stderr}");
     assert!(stderr.contains("x)"), "expected a ratio: {stderr}");
 }

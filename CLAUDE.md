@@ -68,7 +68,7 @@ job, always:
   suite reads/writes SAM/BAM in-process via `noodles` — no `samtools` shell-out.
 - Name tests after the behavior asserted; prefer many small tests over
   table-driven ones.
-- See `tests/helpers/mod.rs` (`SamBuilder`, `run_and_extract_flags`) for the
+- See `tests/helpers/mod.rs` (`SamBuilder`, `run_and_capture`) for the
   integration-test pattern, and the in-module `#[cfg(test)]` blocks for unit
   tests of pure functions.
 
