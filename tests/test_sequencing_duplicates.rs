@@ -142,6 +142,126 @@ fn duplicates_on_one_tile_are_reported_as_sequencing_duplicates() {
     assert_eq!(row["library_duplicate_pairs"], "0");
 }
 
+/// Build an input mixing a same-tile group with a distinct-tile group, run it with
+/// `extra`, and return the metrics row. The mix means a level that corrupted the
+/// spill would have to corrupt it consistently to still produce these numbers.
+fn split_with_flags(extra: &[&str]) -> HashMap<String, String> {
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut input = Run::new();
+    input.spread_over_tiles(200);
+    for _ in 0..4 {
+        input.pair("FC", 1, 1101, 500_000);
+    }
+    for tile in [2101, 2102, 2103] {
+        input.pair("FC", 1, tile, 900_000);
+    }
+    input.write_to(&env.input);
+    run_ok(&env.input, &stats, &out, extra);
+    parse_row(&stats)
+}
+
+/// The metrics the mixed input must report at any compression level.
+fn assert_expected_split(row: &HashMap<String, String>) {
+    assert_eq!(row["corrected_sequencing_duplicate_pairs"], "3");
+    assert_eq!(row["library_duplicate_pairs"], "2");
+}
+
+// The unit tests cover the round trip inside TileSpiller; these cover the wiring,
+// so a level that never reaches the spiller cannot pass unnoticed.
+
+#[test]
+fn an_uncompressed_spill_reports_the_expected_split() {
+    assert_expected_split(&split_with_flags(&[]));
+}
+
+#[test]
+fn a_fast_tier_spill_reports_the_expected_split() {
+    assert_expected_split(&split_with_flags(&["--spill-compression-level", "-5"]));
+}
+
+#[test]
+fn a_compressed_spill_reports_the_expected_split() {
+    assert_expected_split(&split_with_flags(&["--spill-compression-level", "1"]));
+}
+
+#[test]
+fn the_highest_accepted_level_reports_the_expected_split() {
+    assert_expected_split(&split_with_flags(&["--spill-compression-level", "9"]));
+}
+
+#[test]
+fn an_uncompressed_run_reports_no_on_disk_size() {
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut input = Run::new();
+    input.spread_over_tiles(200);
+    for _ in 0..4 {
+        input.pair("FC", 1, 1101, 500_000);
+    }
+    input.write_to(&env.input);
+
+    let result = run(&env.input, &stats, &out, &[]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("spilled tile records"), "expected the spill line: {stderr}");
+    assert!(
+        !stderr.contains("on disk"),
+        "an uncompressed run should not report an on-disk size: {stderr}"
+    );
+}
+
+#[test]
+fn a_compressed_run_reports_the_on_disk_size_and_a_ratio() {
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut input = Run::new();
+    input.spread_over_tiles(200);
+    for _ in 0..4 {
+        input.pair("FC", 1, 1101, 500_000);
+    }
+    input.write_to(&env.input);
+
+    let result = run(&env.input, &stats, &out, &["--spill-compression-level", "1"]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("on disk"), "expected an on-disk size: {stderr}");
+    assert!(stderr.contains("x)"), "expected a ratio: {stderr}");
+}
+
+#[test]
+fn a_compression_level_above_the_accepted_range_is_rejected() {
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut input = Run::new();
+    input.pair("FC", 1, 1101, 500_000);
+    input.write_to(&env.input);
+
+    let result = run(&env.input, &stats, &out, &["--spill-compression-level", "22"]);
+    assert!(!result.status.success(), "level 22 should be rejected");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("must be between"), "expected a range error, got: {stderr}");
+}
+
+#[test]
+fn a_compression_level_of_zero_is_rejected_as_ambiguous() {
+    // zstd reads 0 as "the default level" while `--compression-level 0` in the same
+    // CLI means "stored", so 0 here would silently turn compression on.
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut input = Run::new();
+    input.pair("FC", 1, 1101, 500_000);
+    input.write_to(&env.input);
+
+    let result = run(&env.input, &stats, &out, &["--spill-compression-level", "0"]);
+    assert!(!result.status.success(), "level 0 should be rejected");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("ambiguous"), "expected the ambiguity error, got: {stderr}");
+}
+
 #[test]
 fn duplicates_on_distinct_tiles_are_reported_as_library_duplicates() {
     let env = TestEnv::new();

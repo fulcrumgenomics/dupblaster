@@ -216,6 +216,7 @@ The most common flags:
 | `--single-end-strategy <NAME>` | How to key single-end / orphan reads. `strand-aware` (default), `picard-exact`, `picard-approx`, or `samblaster-legacy`. See [§ Single-end / orphan handling](#single-end--orphan-handling). |
 | `--methylation-mode <MODE>` | Methylation-aware keying for bisulfite / enzymatic-conversion data. Off by default. `directional` keeps the two original strands (OT/OB) of a fragment distinct. See [§ Methylation mode](#methylation-mode). |
 | `--tmp-dir <DIR>` | Directory for dupblaster's temporary files, deleted on exit (default: `$TMPDIR`). **The sequencing-vs-library duplicate split writes here on every run** — 16 bytes per pair, so ~5 GB for a 30x human genome and ~50 GB at 300x. Point this at a volume with room, or pass `--no-sequencing-dups`. Also used by `--single-end-strategy picard-exact` for its orphan buffer. |
+| `--spill-compression-level <LEVEL>` | Compress the duplicate-split spill with zstd, `-7` to `9` (default: uncompressed). On a whole-genome run, levels `-5` to `1` cut the spill by roughly a third to a half for a few percent more runtime; the saving is smaller on smaller inputs, and memory grows with the level (see below). Negative levels are zstd's fast tiers. Storage only — duplicate flags and metrics are identical either way. |
 | `--library-unaware` | Disable library-aware marking; use one dedup table across all reads (samblaster behavior). No effect when the header has ≤1 library. See [§ Library awareness](#library-awareness). |
 | `--stats <PATH>` | Write a per-library TSV of run-summary metrics (one row per library). |
 | `--sample <NAME>` | Override the `sample` column in `--stats` (and `--complexity-metrics`) output. |
@@ -281,6 +282,19 @@ The split is **on by default**, assumes the Illumina read-name layout (see [§ C
 | temp disk | — | 4.95 GiB | 16 B per pair |
 
 So the cost is a few percent of runtime and no extra memory, against 16 bytes of temp disk per pair (about 5 GB for a 30x human genome — see `--tmp-dir`).
+
+If that temp space is the binding constraint rather than CPU, **`--spill-compression-level`** compresses the spill with zstd, without changing a single reported number. On the same 333M-template sample, against an uncompressed control:
+
+| level | spill | ratio | wall | Δ wall |
+|---|---|---|---|---|
+| *(omitted)* | 4.95 GiB | 1.00x | 391.2 s | — |
+| `-5` | 2.95 GiB | 1.68x | 391.2 s | +1.4%¹ |
+| `-1` | 2.56 GiB | 1.94x | 407.0 s | +4.0% |
+| `1` | 2.44 GiB | 2.03x | 405.9 s | +3.7% |
+
+¹ Measured in a separate sweep against its own control. Repeated uncompressed runs varied by 1.7% (384.7 / 386.0 / 391.2 s), so treat differences of a few seconds between levels as noise — the ratios reproduce exactly, the timings do not separate the levels.
+
+Two things to know before reaching for a high level. The spill is split across 64 bucket files that compress independently, so **smaller inputs compress less** — a whole-genome run gets the ratios above, a small panel may get nothing. And **memory grows with the level**, because every bucket holds its own compression context: negligible at level 1, but hundreds of megabytes by level 9. Levels above 9 are rejected for that reason. If a run is memory-constrained as well as disk-constrained, stay at or below 1.
 
 **In a pipeline, most of that cost is invisible.** The work splits into a per-pair part during the main pass and a post-pass that reassembles the groups, and the post-pass runs only *after* the output stream is closed:
 
@@ -375,7 +389,7 @@ Flowcell duplicates are not evidence that a library is exhausted, so counting th
 
 Two things changed for existing pipelines, both because the split is now on by default:
 
-1. **dupblaster reads temporary disk on every run** — 16 bytes per both-ends-mapped pair under `--tmp-dir` (`$TMPDIR` by default), so ~5 GB for a 30x human genome and ~50 GB at 300x. It does not try to predict the requirement, because with a streamed input it cannot know the shape of what is coming; a spill write that fails is a hard error rather than a silently dropped metric.
+1. **dupblaster reads temporary disk on every run** — 16 bytes per both-ends-mapped pair under `--tmp-dir` (`$TMPDIR` by default), so ~5 GB for a 30x human genome and ~50 GB at 300x. It does not try to predict the requirement, because with a streamed input it cannot know the shape of what is coming; a spill write that fails is a hard error rather than a silently dropped metric. Where that space is tight, `--spill-compression-level` trades a little CPU for a substantially smaller spill.
 2. **Read names that are not Illumina/Element-shaped now fail the run.** If your BAMs come from MGI or Ultima, predate CASAVA 1.8, or had their names rewritten (SRA accessions, simulated data), add `--no-sequencing-dups` — or describe the layout with `--read-name-format regex:PATTERN` to get the metric.
 
 Both are single-flag fixes; `--no-sequencing-dups` restores 0.2.0 behaviour for everything the split touches.

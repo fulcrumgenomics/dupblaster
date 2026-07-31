@@ -159,6 +159,43 @@ fn parse_compression_level(s: &str) -> Result<CompressionLevel, String> {
     CompressionLevel::new(n).map_err(|e| format!("{e}"))
 }
 
+/// Bounds on `--spill-compression-level`, deliberately far narrower than the
+/// range libzstd advertises.
+///
+/// The ceiling is a memory limit, not a taste judgement. Every spill bucket holds
+/// its own compression context for the whole main pass, so the cost is
+/// `DEFAULT_SPILL_BUCKETS ×` one context — under 100 MB at level 1, but tens of
+/// gigabytes at zstd's maximum, which would OOM exactly the constrained runs this
+/// flag exists to rescue. Levels past 9 also barely shrink this data.
+///
+/// The floor is where the fast tiers stop giving anything back: below roughly -7
+/// the spill simply stops getting smaller while still costing CPU.
+const MIN_SPILL_LEVEL: i32 = -7;
+const MAX_SPILL_LEVEL: i32 = 9;
+
+/// Parse and validate a `--spill-compression-level` value.
+///
+/// Rejects 0 rather than forwarding it: zstd reads level 0 as "use the default"
+/// (3), while `--compression-level` in this same CLI reads 0 as "stored". One tool
+/// cannot have 0 mean both things, so here it means neither and the error says so.
+fn parse_spill_compression_level(s: &str) -> Result<i32, String> {
+    let level: i32 = s.parse().map_err(|_| format!("not an integer: {s}"))?;
+    // libzstd stays the outer authority, in case a future release narrows below
+    // the band above.
+    let supported = zstd::compression_level_range();
+    let (min, max) =
+        (MIN_SPILL_LEVEL.max(*supported.start()), MAX_SPILL_LEVEL.min(*supported.end()));
+    if level == 0 {
+        return Err("0 is ambiguous here: omit --spill-compression-level entirely to write the \
+                    spill uncompressed, or pass 3 for zstd's default level"
+            .to_string());
+    }
+    if !(min..=max).contains(&level) {
+        return Err(format!("must be between {min} and {max}"));
+    }
+    Ok(level)
+}
+
 /// `--help` heading for the IO and indexing knobs whose defaults suit
 /// essentially every run — grouped away from the options a caller chooses
 /// between.
@@ -349,6 +386,31 @@ pub struct Args {
     #[arg(long = "max-read-length", default_value_t = 1000, help_heading = TUNING_HEADING,
           value_parser = clap::value_parser!(i32).range(1..=10_000_000))]
     pub max_read_length: i32,
+
+    /// Compress the duplicate-decomposition spill with zstd at this level (-7 to
+    /// 9; negative levels are zstd's fast tiers).
+    ///
+    /// Omitted, the spill is written uncompressed — fastest, and about 16 bytes of
+    /// temporary disk per mapped pair (on the order of 5 GB for a 30x human
+    /// genome). Pass a level where that temporary space is worth more than a
+    /// little CPU: on a whole-genome run, levels from -5 to 1 cut the spill by
+    /// roughly a third to a half for a few percent more runtime.
+    ///
+    /// Two caveats. The saving shrinks on smaller inputs, because the spill is
+    /// split across many bucket files and each compresses on its own — on a small
+    /// panel it may not shrink at all. And memory grows with the level, steeply
+    /// past 3, because every bucket holds its own compression context; if the run
+    /// is memory-constrained as well as disk-constrained, stay at or below 1.
+    ///
+    /// This only changes how the spill is stored: the duplicate flags and every
+    /// reported metric are identical either way.
+    // `allow_negative_numbers` is scoped to this argument rather than set on the
+    // command: without it clap reads the `-5` of a fast tier as a short flag, and
+    // widening the rule globally would loosen parsing for every other argument.
+    #[arg(long = "spill-compression-level", value_name = "LEVEL",
+          help_heading = TUNING_HEADING, allow_negative_numbers = true,
+          value_parser = parse_spill_compression_level)]
+    pub spill_compression_level: Option<i32>,
 }
 
 impl Args {
@@ -548,6 +610,7 @@ fn run(args: Args) -> Result<ExitCode> {
             processor.bin_count(),
             DEFAULT_SPILL_BUCKETS,
             args.tmp_dir.as_deref(),
+            args.spill_compression_level,
         )
         .context("preparing the sequencing-vs-library duplicate spill")?;
         processor.attach_tile_spiller(spiller);
@@ -643,11 +706,33 @@ fn run(args: Args) -> Result<ExitCode> {
     // dupblaster sits in pipelines where a downstream sort or caller is blocked
     // on our stdout. This ordering is a hard requirement, not a preference.
     let decomposition = match processor.take_tile_spiller() {
-        Some(spiller) => {
+        Some(mut spiller) => {
+            // Closes the bucket streams, which the post-pass requires before it can
+            // decode them, and yields the on-disk total while the files are still
+            // there. Only measured when compression is on: statting every bucket is
+            // pointless work on the default path, where the answer is the logical
+            // size by construction.
+            let measure = !args.quiet && args.spill_compression_level.is_some();
+            let on_disk =
+                spiller.finish_spill(measure).context("closing the duplicate-split spill")?;
             if !args.quiet {
+                let logical = spiller.spilled_bytes();
+                let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+                // A ratio needs something to divide; an empty spill has none. Note
+                // the figure can legitimately come out below 1.0 on a tiny input,
+                // where per-bucket framing outweighs what there was to compress.
+                let compressed = match (on_disk, logical) {
+                    (Some(on_disk), logical) if logical > 0 => format!(
+                        " ({:.1} MiB on disk, {:.2}x)",
+                        mib(on_disk),
+                        logical as f64 / on_disk.max(1) as f64
+                    ),
+                    _ => String::new(),
+                };
                 eprintln!(
-                    "dupblaster: decomposing duplicates from {:.1} MiB of spilled tile records",
-                    spiller.spilled_bytes() as f64 / (1024.0 * 1024.0),
+                    "dupblaster: decomposing duplicates from {:.1} MiB of spilled tile \
+                     records{compressed}",
+                    mib(logical),
                 );
             }
             Some(
@@ -1132,6 +1217,7 @@ mod tests {
             complexity_interval: 1_000_000,
             no_sequencing_dups: true,
             read_name_format: None,
+            spill_compression_level: None,
             quiet: true,
             min_bins: 32,
             check_crc: false,
