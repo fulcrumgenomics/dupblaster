@@ -168,6 +168,9 @@ fn parse_compression_level(s: &str) -> Result<CompressionLevel, String> {
 /// tens of gigabytes at zstd's maximum, which would OOM exactly the constrained
 /// runs this flag exists to rescue. Levels past 9 also barely shrink this data.
 ///
+/// The picard-exact orphan buffer holds a single context, so the spill is what
+/// binds; both share this range rather than tracking their own.
+///
 /// The floor is where the fast tiers stop giving anything back: below roughly -7
 /// the temporary files stop getting smaller while still costing CPU.
 const MIN_TMP_COMPRESSION_LEVEL: i32 = -7;
@@ -389,7 +392,7 @@ pub struct Args {
           value_parser = clap::value_parser!(i32).range(1..=10_000_000))]
     pub max_read_length: i32,
 
-    /// Ztsd compression level used to compress temporary files (-7 to 9).
+    /// Zstd compression level used to compress temporary files (-7 to 9).
     ///
     /// Unspecified uses no compression.  Levels -5 to 1 tend to offer
     /// meaningful (1.5-2x) reduction in temp usage, for marginal (2-7%)
@@ -943,14 +946,11 @@ fn run_picard_exact(
     }
 
     // Pass 1: pairs out, fragments deferred to the temp BAM.
+    let deferred;
     {
-        let mut temp_writer = RawBamWriter::open_temp(
-            &temp_path,
-            header,
-            TEMP_RING_BYTES,
-            args.tmp_compression_level,
-        )
-        .context("opening temp orphan BAM")?;
+        let mut temp_writer =
+            RawBamWriter::open_temp(&temp, header, TEMP_RING_BYTES, args.tmp_compression_level)
+                .context("opening temp orphan BAM")?;
         let mut pool: Vec<RawRecord> = Vec::with_capacity(8);
         for_each_block(reader, &mut pool, |block| {
             let lib = processor.process_block_phase1(block, stats, out, &mut temp_writer)?;
@@ -960,6 +960,7 @@ fn run_picard_exact(
             Ok(())
         })
         .context("processing record block (picard-exact pass 1)")?;
+        deferred = temp_writer.records_written();
         temp_writer.finish().context("finishing temp orphan BAM")?;
     }
 
@@ -981,7 +982,9 @@ fn run_picard_exact(
     let mut temp_reader = Reader::Bam(RawBamReader::new(buffered, false));
     temp_reader.read_header().context("reading temp orphan BAM header")?;
     let mut pool: Vec<RawRecord> = Vec::with_capacity(8);
+    let mut recovered: u64 = 0;
     for_each_block(&mut temp_reader, &mut pool, |block| {
+        recovered += block.len() as u64;
         let lib = processor.process_fragment_block(block, stats, out)?;
         if let Some(rec) = ladder.as_mut() {
             rec.observe(lib, &stats.libraries[lib as usize]);
@@ -989,6 +992,17 @@ fn run_picard_exact(
         Ok(())
     })
     .context("processing fragment block (picard-exact pass 2)")?;
+
+    // A short read is not distinguishable from a clean end of stream: a truncated
+    // BGZF stream and a truncated zstd frame both surface as `UnexpectedEof`,
+    // which the BAM reader treats as the end. Without this check a damaged temp
+    // file would silently drop orphans from the output and still exit zero.
+    if recovered != deferred {
+        bail!(
+            "temp orphan BAM held {deferred} records but only {recovered} could be read back; \
+             the temporary file under --tmp-dir was truncated or corrupted"
+        );
+    }
 
     Ok(())
 }

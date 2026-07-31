@@ -49,7 +49,8 @@ regex = { version = "1", default-features = false, features = ["std", "perf", "u
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 wide = "1.4"
-# Compresses the duplicate-split spill files under --spill-compression-level.
+# Compresses dupblaster's temporary files under --tmp-compression-level: the
+# duplicate-split spill and the picard-exact orphan buffer.
 # Chosen over the deflate implementations already in the tree (libdeflater via
 # bgzf, and flate2) after measuring all three on a 333M-template spill: zstd
 # compressed more for roughly half bgzf's CPU and a quarter of flate2's.

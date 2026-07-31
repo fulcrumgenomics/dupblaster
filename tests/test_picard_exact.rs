@@ -220,6 +220,11 @@ fn compressing_the_temp_bam_at_a_fast_tier_does_not_change_the_output() {
 }
 
 #[test]
+fn compressing_the_temp_bam_at_the_highest_level_does_not_change_the_output() {
+    assert_eq!(orphan_run(&["--tmp-compression-level", "9"]), orphan_run(&[]));
+}
+
+#[test]
 fn the_compressed_temp_bam_marks_the_same_duplicates() {
     // Guards against the round-trip tests agreeing on an empty answer.
     let recs = orphan_run(&["--tmp-compression-level", "1"]);
