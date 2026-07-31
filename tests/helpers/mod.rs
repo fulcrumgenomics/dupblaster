@@ -27,6 +27,19 @@ pub fn rust_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_dupblaster"))
 }
 
+/// A `dupblaster` command with the sequencing-vs-library split switched off.
+///
+/// That split is on by default and treats a read name it cannot parse as a fatal
+/// error, while these tests use short synthetic names like `r1` that carry no
+/// flowcell or tile. Switching it off keeps each test on the behaviour it actually
+/// asserts. Tests *of* the split build their own command so they exercise the
+/// default.
+pub fn dupblaster() -> Command {
+    let mut command = Command::new(rust_binary());
+    command.arg("--no-sequencing-dups");
+    command
+}
+
 /// Builder for a SAM file in memory; writes to a temp file on demand.
 pub struct SamBuilder {
     pub header: String,
@@ -283,7 +296,7 @@ pub fn run_and_extract_flags(
     bam_out: &Path,
     extra: &[&str],
 ) -> Vec<(String, u16)> {
-    let out = Command::new(rust_binary())
+    let out = dupblaster()
         .args(["-i"])
         .arg(sam_input)
         .args(["-o"])

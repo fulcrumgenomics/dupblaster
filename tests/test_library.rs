@@ -10,7 +10,6 @@ mod helpers;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
 
 use helpers::*;
 
@@ -220,7 +219,7 @@ fn stats_reports_one_row_per_library() {
         .rec_simple_rg("p4", 147, "chr1", 200, "50M", "=", 100, -150, "B")
         .write_to(&env.input);
 
-    let run = Command::new(rust_binary())
+    let run = dupblaster()
         .args(["-i"])
         .arg(&env.input)
         .args(["-o"])

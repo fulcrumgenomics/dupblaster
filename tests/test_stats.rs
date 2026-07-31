@@ -4,12 +4,11 @@ mod helpers;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
 
 use helpers::*;
 
 fn run_with_stats(input: &Path, stats: &Path, output: &Path, extra: &[&str]) {
-    let mut cmd = Command::new(rust_binary());
+    let mut cmd = dupblaster();
     cmd.args(["-i"]).arg(input).args(["-o"]).arg(output).args(["--stats"]).arg(stats).args(extra);
     let out = cmd.output().expect("rust dupblaster ran");
     assert!(
@@ -157,15 +156,51 @@ fn stats_tsv_has_all_expected_columns() {
         "duplicate_templates",
         "frac_duplicates",
         "mapped_pairs",
+        "unmapped_pairs",
         "duplicate_pairs",
+        // The split's own block, present whether or not it ran so the schema does
+        // not change shape with the options used; blank when it did not.
+        "raw_sequencing_duplicate_pairs",
+        "corrected_sequencing_duplicate_pairs",
+        "library_duplicate_pairs",
+        "frac_duplicate_pairs",
+        "frac_sequencing_duplicate_pairs",
+        "estimated_library_size",
         "mapped_orphans",
         "duplicate_orphans",
         "unmapped_orphans",
-        "unmapped_pairs",
         "unmated_templates",
-        "estimated_library_size",
     ];
     assert_eq!(cols, expected);
+}
+
+/// Under `--no-sequencing-dups` the decomposition columns are present but empty,
+/// so a consumer sees a stable schema and can tell "not measured" from "zero".
+#[test]
+fn decomposition_columns_are_blank_when_the_split_is_disabled() {
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    SamBuilder::new()
+        .sq("chr1", 1_000_000)
+        .rec_simple("r1", 99, "chr1", 100, "50M", "=", 200, 150)
+        .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150)
+        .write_to(&env.input);
+    // The shared helper already passes --no-sequencing-dups.
+    run_with_stats(&env.input, &stats, &out, &[]);
+    let text = std::fs::read_to_string(&stats).unwrap();
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
+    let values: Vec<&str> = lines.next().unwrap().split('\t').collect();
+    for column in [
+        "raw_sequencing_duplicate_pairs",
+        "corrected_sequencing_duplicate_pairs",
+        "library_duplicate_pairs",
+        "frac_sequencing_duplicate_pairs",
+    ] {
+        let index = header.iter().position(|c| *c == column).expect("column present");
+        assert_eq!(values[index], "", "{column} should be blank");
+    }
 }
 
 /// `--remove-dups` drops duplicate records from the output but the `--stats`

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Duplicates are now split into a sequencing and a library component, on by default.** A **sequencing** duplicate is a copy made on the flowcell (cluster/ExAmp); a **library** duplicate is an independent molecule — a PCR copy, or one that happens to share a locus. They call for opposite responses (loading density versus library complexity) and a single duplicate rate cannot tell them apart. Two duplicates imaged on the same tile are copies of one molecule; on different tiles they are independent.
+  - Adds `raw_sequencing_duplicate_pairs`, `corrected_sequencing_duplicate_pairs`, `library_duplicate_pairs`, `frac_duplicate_pairs`, and `frac_sequencing_duplicate_pairs` to `--stats`, and writes a per-sequencing-unit table beside it (`<STATS>.sequencing-units.tsv`) with per-flowcell/lane template counts, tile counts and sequencing-duplicate rates. That table's counts sum *exactly* to `raw_sequencing_duplicate_pairs`.
+  - Both-ends-mapped pairs only. **`--no-sequencing-dups`** turns it off; it only ever *classifies* duplicates, so disabling it never changes which reads are marked.
+  - **Threshold-free**: tile *identity* only, never a pixel radius. Same-tile displacement distributions differ radically between runs (40.7% of same-tile pairs within 20 px on one sample against 2.8% on another), so no fixed radius generalizes — `samtools markdup -d 2500` over-called one of our two labelled samples and under-called the other. It also handles coincidental duplicates with no special case, which is what makes the metric meaningful on RNA-seq and amplicon data.
+  - Corrected for tiles that collide **by chance**, by inferring how many independent molecules a group's observed tile count implies, rather than by subtracting the collisions expected of all its members, which over-corrects. A library on a single tile carries no information at all — every duplicate is on "the" tile whether it was clustered or not — so its counts are left blank rather than reported as zero.
+  - Validated against read-name ground truth on a 333M-template EM-seq sample: 62.8% of chr20 duplicate pairs sequencing, 64.9% genome-wide, with a tile count exact to the tile (6,334). The per-sequencing-unit column sums to `raw_sequencing_duplicate_pairs` exactly (53,070,208) rather than approximately.
+  - Costs **+7.2% wall time** (359.7 s → 385.6 s on 333M templates), no change in peak memory, and 16 bytes of temporary disk per pair. Only about a third of that (27 ns per pair) falls in the main pass; the rest is a post-pass that runs after the output stream is closed, so it does not hold up a downstream process — the overhead a pipeline feels is roughly **+2.5%**.
+- `--read-name-format <FORMAT>`: the read-name layout the split reads. `illumina` (the default — `instrument:run:flowcell:lane:tile:x:y`, CASAVA 1.8+, bcl2fastq, BCL Convert), `element` (Element AVITI, the same layout), or `regex:<PATTERN>` with `(?<su>…)` and `(?<tile>…)` capture groups for platforms without a preset. The layout is never guessed beyond that default, because mis-parsing one would silently produce a confident wrong number.
+
+### Changed
+
+- **`estimated_library_size` now has sequencing duplicates removed from the observed total**, following Picard's `ESTIMATED_LIBRARY_SIZE` convention (subtracted from `n`, not from the unique count). Flowcell duplicates are not evidence a library is exhausted, so counting them as saturation understates it — worth 2.3x on one 30x WGS sample. Under `--no-sequencing-dups` the column falls back to the previous uncorrected value.
+
+### Fixed
+
+- A run that aborts part-way now leaves its partial BAM **without** the BGZF EOF marker, so `samtools quickcheck` and other readers correctly report it as truncated. Previously the writer's `Drop` emitted that marker on the way out, so a file missing records passed every integrity check it had. The partial output is still left on disk — discarding it would be its own surprise — it just no longer claims to be complete. Applies to every aborting run, independently of `--no-sequencing-dups`.
+
+### Upgrading from 0.2.0
+
+Two consequences of the split being on by default. Both are one flag to resolve, and `--no-sequencing-dups` restores 0.2.0 behaviour for everything the split touches. (The partial-BAM change under **Fixed** applies regardless of that flag.)
+
+- **Temporary disk is now used on every run** — 16 bytes per both-ends-mapped pair under `--tmp-dir` (`$TMPDIR` by default): ~5 GB for a 30x human genome, ~50 GB at 300x. dupblaster deliberately does not try to predict the requirement, since with a streamed input it cannot know the shape of what is coming; a spill write that fails is a hard error rather than a silently dropped metric. Point `--tmp-dir` at a volume with room, or pass `--no-sequencing-dups`.
+- **Read names that are not Illumina/Element-shaped now fail the run.** MGI, Ultima, pre-CASAVA-1.8 Illumina, and anything whose names were rewritten (SRA accessions, simulated data) need either `--no-sequencing-dups` or `--read-name-format regex:PATTERN`. The error message names both.
 ## [0.2.0] - 2026-07-28
 
 ### Added

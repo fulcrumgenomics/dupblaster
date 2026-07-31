@@ -120,6 +120,29 @@ impl RawBamWriter {
         }
         Ok(())
     }
+
+    /// Give up on the output *without* marking it complete, for an aborting run.
+    ///
+    /// The partial file is deliberately left on disk — a failed run that also
+    /// vanished its output would be worse — but it must not look finished. The
+    /// BGZF EOF marker is what `samtools quickcheck` and every other reader use
+    /// to tell a complete file from a truncated one, so emitting it here would
+    /// make a short file pass every integrity check it has.
+    ///
+    /// `bgzf::Writer`'s `Drop` writes that marker unconditionally, so simply
+    /// dropping is not an option: this flushes what is already buffered (keeping
+    /// as much of the partial output as possible) and then **leaks** the writer
+    /// to suppress `Drop`. Leaking is sound precisely here — the process is
+    /// exiting non-zero, so the OS closes the file and reaps the write-behind
+    /// thread, and nothing observes the leaked buffer.
+    pub fn abandon(mut self) {
+        if let Some(mut w) = self.bgzf.take() {
+            // Best-effort: the run is already failing, so a flush error changes
+            // nothing about the outcome.
+            let _ = w.flush();
+            std::mem::forget(w);
+        }
+    }
 }
 
 /// Serialize the BAM-on-disk header into `writer`:

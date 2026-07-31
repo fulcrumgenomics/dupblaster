@@ -9,7 +9,6 @@
 //! `helpers::read_recs_and_header`); no external `samtools` is required.
 
 mod helpers;
-use std::process::Command;
 
 use helpers::*;
 
@@ -28,13 +27,7 @@ fn bam_input_produces_bam_output_with_matching_dups() {
     let bam_out = env._tmp.path().join("rust.out.bam");
     sam_to_bam(&env.input, &bam_in);
 
-    let out = Command::new(rust_binary())
-        .args(["-i"])
-        .arg(&bam_in)
-        .args(["-o"])
-        .arg(&bam_out)
-        .output()
-        .unwrap();
+    let out = dupblaster().args(["-i"]).arg(&bam_in).args(["-o"]).arg(&bam_out).output().unwrap();
     assert!(out.status.success(), "rust failed: {}", String::from_utf8_lossy(&out.stderr));
 
     // Decode the BAM output back to records for inspection.
@@ -56,13 +49,7 @@ fn bam_output_uses_bgzf_framing() {
     let bam_in = env._tmp.path().join("in.bam");
     let bam_out = env._tmp.path().join("rust.out.bam");
     sam_to_bam(&env.input, &bam_in);
-    Command::new(rust_binary())
-        .args(["-i"])
-        .arg(&bam_in)
-        .args(["-o"])
-        .arg(&bam_out)
-        .output()
-        .unwrap();
+    dupblaster().args(["-i"]).arg(&bam_in).args(["-o"]).arg(&bam_out).output().unwrap();
     let bytes = std::fs::read(&bam_out).unwrap();
     // BGZF magic.
     assert_eq!(&bytes[..4], &[0x1f, 0x8b, 0x08, 0x04], "output is not BGZF-framed BAM");
@@ -84,7 +71,7 @@ fn bam_input_routes_through_pipeline_via_stdin() {
     // Pipe the BAM into the rust binary on stdin; output to a file.
     let bam_bytes = std::fs::read(&bam_in).unwrap();
     let bam_out = env._tmp.path().join("rust.stdin.bam");
-    let mut child = Command::new(rust_binary())
+    let mut child = dupblaster()
         .args(["-o"])
         .arg(&bam_out)
         .stdin(std::process::Stdio::piped())

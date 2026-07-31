@@ -3,8 +3,6 @@
 
 mod helpers;
 
-use std::process::Command;
-
 use helpers::*;
 
 /// Build a tiny one-pair input and run dupblaster with `extra` flags,
@@ -17,7 +15,7 @@ fn run(extra: &[&str]) -> std::process::Output {
         .rec_simple("r1", 99, "chr1", 100, "50M", "=", 200, 150)
         .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
-    Command::new(rust_binary())
+    dupblaster()
         .args(["-i"])
         .arg(&env.input)
         .args(["-o"])
