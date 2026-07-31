@@ -46,8 +46,8 @@ use crate::complexity::{LadderRecorder, ladder_path, write_ladder_rows};
 use crate::counts::{histogram_path, histogram_rows, write_histogram_rows};
 use crate::dedup::{LibraryIndex, ProcessorOptions, RecordProcessor, Stats};
 use crate::metrics::{
-    Metrics, SequencingUnitMetrics, resolve_sample, sequencing_units_path, write_rows_to_path,
-    write_unit_rows_to_path,
+    Metrics, SequencingUnitMetrics, duplicate_metrics_path, resolve_sample, sequencing_units_path,
+    write_rows_to_path, write_unit_rows_to_path,
 };
 use crate::raw_reader::RawBamReader;
 use crate::raw_writer::RawBamWriter;
@@ -219,7 +219,8 @@ const LONG_ABOUT: &str = concat!(
 
 /// Parsed command-line arguments — see `--help` for per-flag descriptions.
 #[derive(Parser, Debug, Clone)]
-#[command(name = "dupblaster", disable_version_flag = true, about = SHORT_ABOUT, long_about = LONG_ABOUT)]
+#[command(name = "dupblaster", version = DUPBLASTER_BUILD, disable_version_flag = true,
+          about = SHORT_ABOUT, long_about = LONG_ABOUT)]
 pub struct Args {
     /// Input SAM/BAM file [default: stdin].
     #[arg(short = 'i', long = "input")]
@@ -229,6 +230,21 @@ pub struct Args {
     /// stdout.
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
+
+    /// Prefix for the metrics files. Required — every run reports its duplicates.
+    ///
+    /// Each file appends a suffix to PREFIX, so `--metrics-prefix out/sampleA`
+    /// writes `out/sampleA.duplicate-metrics.tsv` and its siblings:
+    ///
+    /// `.duplicate-metrics.tsv` — one row per library, the run summary.
+    ///
+    /// `.sequencing-units.tsv` — one row per flowcell-and-lane, unless
+    /// `--sequencing-dups off`.
+    ///
+    /// `.duplication-sampled.{tsv,pdf}` and `.duplication-spectrum.{tsv,pdf}` —
+    /// unless `--complexity-metrics off`.
+    #[arg(long = "metrics-prefix", value_name = "PREFIX")]
+    pub metrics_prefix: PathBuf,
 
     /// BGZF compression level for the output BAM, 0-12.
     #[arg(short = 'l',
@@ -255,13 +271,17 @@ pub struct Args {
           default_value_t = SingleEndStrategyCli::StrandAware)]
     pub single_end_strategy: SingleEndStrategyCli,
 
-    /// Identify duplicates across libraries instead of within libraries.
+    /// Identify duplicates within each library rather than across all reads.
     ///
-    /// Libraries are identified from `@RG LB:` entries, and by default
-    /// de-duplication is restricted to within a library, with statistics reported
-    /// per-library. Has no effect when the header declares ≤1 library.
-    #[arg(long = "library-unaware")]
-    pub library_unaware: bool,
+    /// Libraries are identified from `@RG LB:` entries, and statistics are
+    /// reported per-library. Turning this off pools every read into one dedup
+    /// table, which is samblaster's behaviour. Has no effect when the header
+    /// declares ≤1 library.
+    #[arg(long = "library-aware", value_name = "on|off",
+          num_args = 0..=1, default_value = "on", default_missing_value = "on",
+          hide_possible_values = true,
+          value_parser = clap::builder::BoolishValueParser::new())]
+    pub library_aware: bool,
 
     /// Methylation-aware pair keying for strand-aware libraries; off by default.
     #[arg(long = "methylation-mode", value_enum)]
@@ -271,37 +291,42 @@ pub struct Args {
     #[arg(long = "tmp-dir")]
     pub tmp_dir: Option<PathBuf>,
 
-    /// Write a TSV of per-library metrics to PATH.
-    #[arg(long = "stats")]
-    pub stats: Option<PathBuf>,
-
-    /// Sample name for the `sample` column of the TSV outputs. Defaults to the
+    /// Sample name for the `sample` column of the metrics files. Defaults to the
     /// unique `@RG SM:` values, comma-joined.
     #[arg(long = "sample")]
     pub sample: Option<String>,
 
-    /// Write per-library duplication-complexity QC with this path prefix. Off by
-    /// default, and costs nothing when unset.
+    /// Write duplication-complexity QC alongside the run summary.
     ///
-    /// Writes `<PREFIX>.duplication-{sampled,spectrum}.{tsv,pdf}` containing
-    /// i) duplication stats sampled every `--complexity-interval`, and ii)
-    /// a family size histogram of how many molecules were seen how many times.
-    #[arg(long = "complexity-metrics")]
-    pub complexity_metrics: Option<PathBuf>,
+    /// Adds `.duplication-sampled.{tsv,pdf}` — duplication sampled every
+    /// `--complexity-interval` templates — and `.duplication-spectrum.{tsv,pdf}`,
+    /// a family-size histogram of how many molecules were seen how many times.
+    /// Turning this off costs no output BAM change and reclaims the per-signature
+    /// count table, which holds only signatures seen 2+ times.
+    #[arg(long = "complexity-metrics", value_name = "on|off",
+          num_args = 0..=1, default_value = "on", default_missing_value = "on",
+          hide_possible_values = true,
+          value_parser = clap::builder::BoolishValueParser::new())]
+    pub complexity_metrics: bool,
 
     /// Snapshot cadence for the `--complexity-metrics` sampling, in templates.
+    /// Ignored when `--complexity-metrics off`.
     #[arg(long = "complexity-interval",
           default_value_t = 1_000_000,
           value_parser = clap::value_parser!(u64).range(1..))]
     pub complexity_interval: u64,
 
-    /// Don't split duplicates into sequencing ("optical") and library components.
+    /// Split duplicates into sequencing ("optical") and library components.
     ///
-    /// Sequencing vs. library duplicate classification is on by default. Disabling
-    /// i) does not affect the output BAM, ii) reduces tmp file usage by
-    /// approximately 10-20MiB per 1m read pairs, iii) reduces CPU usage by 5-10%.
-    #[arg(long = "no-sequencing-dups")]
-    pub no_sequencing_dups: bool,
+    /// Adds the `.sequencing-units.tsv` file and the sequencing/library columns of
+    /// the run summary. Turning it off i) does not affect the output BAM, ii)
+    /// reduces tmp file usage by approximately 10-20MiB per 1m read pairs, iii)
+    /// reduces CPU usage by 5-10%.
+    #[arg(long = "sequencing-dups", value_name = "on|off",
+          num_args = 0..=1, default_value = "on", default_missing_value = "on",
+          hide_possible_values = true,
+          value_parser = clap::builder::BoolishValueParser::new())]
+    pub sequencing_dups: bool,
 
     /// Read/query name format in the BAM file - used to extract flowcell/lane/tile
     /// or equivalent for sequencing duplicate classification [default: illumina].
@@ -332,8 +357,11 @@ pub struct Args {
     pub quiet: bool,
 
     /// Print the dupblaster version to stdout and exit.
-    #[arg(short = 'V', long = "version")]
-    pub show_version: bool,
+    // `ArgAction::Version` rather than a `bool` we inspect in `run`: parsing must
+    // short-circuit here, or the required `--metrics-prefix` would be enforced
+    // first and `--version` could never run on its own.
+    #[arg(short = 'V', long = "version", action = clap::ArgAction::Version)]
+    pub show_version: Option<bool>,
 
     /// Minimum bins per side for the partitioned dedup hash table.
     /// Controls cell count via `cells ≈ (bins+1)² × 4`. Lower values
@@ -485,23 +513,12 @@ fn ensure_dir_writable(path: &Path, flag: &str) -> Result<()> {
 }
 
 fn run(args: Args) -> Result<ExitCode> {
-    if args.show_version {
-        // Version goes to stdout (not stderr) so `dupblaster --version | head`
-        // and tooling that captures it work as expected.
-        println!("dupblaster {DUPBLASTER_BUILD}");
-        return Ok(ExitCode::SUCCESS);
-    }
     args.validate()?;
-    // Fail fast if the optional QC outputs (written only at the very end) can't
-    // be created, rather than after a full processing pass. The main `-o` output
-    // is validated separately when its writer is opened, below.
-    if let Some(stats) = args.stats.as_deref() {
-        ensure_dir_writable(stats, "--stats")?;
-    }
-    if let Some(prefix) = args.complexity_metrics.as_deref() {
-        // All four complexity files share the prefix's directory.
-        ensure_dir_writable(prefix, "--complexity-metrics")?;
-    }
+    // Fail fast if the metrics files (written only at the very end) can't be
+    // created, rather than after a full processing pass. Every one of them shares
+    // the prefix's directory, so one probe covers the lot. The main `-o` output is
+    // validated separately when its writer is opened, below.
+    ensure_dir_writable(&args.metrics_prefix, "--metrics-prefix")?;
     let started = StartedRun::now();
     if !args.quiet {
         eprintln!("dupblaster: Version {DUPBLASTER_BUILD} by Fulcrum Genomics");
@@ -585,16 +602,16 @@ fn run(args: Args) -> Result<ExitCode> {
 
     let opts = processor_options(&args);
     // Library-aware duplicate marking: when the header declares >1 distinct
-    // `@RG LB:` value (and `--library-unaware` wasn't passed), dedup state is
-    // partitioned per library so duplicates are only called within a library.
-    let library_index = LibraryIndex::from_header(&header, args.library_unaware);
+    // `@RG LB:` value (and `--library-aware` is on), dedup state is partitioned
+    // per library so duplicates are only called within a library.
+    let library_index = LibraryIndex::from_header(&header, !args.library_aware);
     let num_libs = library_index.num_libs();
     let mut stats = Stats::new(&library_index);
     let mut processor =
         RecordProcessor::from_ref_lengths(&ref_lengths, opts, args.min_bins, library_index);
     // Attached after construction because the spiller is sized against
     // `bin_count`, which only exists once the bins are built.
-    if !args.no_sequencing_dups {
+    if args.sequencing_dups {
         let spiller = TileSpiller::new(
             args.read_name_format.clone().unwrap_or_default(),
             processor.bin_count(),
@@ -634,7 +651,7 @@ fn run(args: Args) -> Result<ExitCode> {
     // paired subset when it has any pairs (a strategy-independent key), and on
     // single-end signatures only when it has none — the case where the fragment
     // keyspace is guaranteed free of pair-ends and so is clean under Picard too.
-    let mut ladder = args.complexity_metrics.as_ref().map(|_| {
+    let mut ladder = args.complexity_metrics.then(|| {
         LadderRecorder::new(
             num_libs as usize,
             args.complexity_interval,
@@ -734,32 +751,32 @@ fn run(args: Args) -> Result<ExitCode> {
         None => None,
     };
 
-    if let Some(stats_path) = args.stats.as_deref() {
-        let rows = Metrics::rows_from_stats(
-            &stats,
-            &header,
-            args.sample.as_deref(),
-            decomposition.as_ref().map(|result| result.libraries.as_slice()),
-        );
-        write_rows_to_path(&rows, stats_path).context("writing --stats TSV")?;
+    // Every file below hangs off `--metrics-prefix`, which is required, so the
+    // run summary is always written.
+    let prefix = args.metrics_prefix.as_path();
+    let rows = Metrics::rows_from_stats(
+        &stats,
+        &header,
+        args.sample.as_deref(),
+        decomposition.as_ref().map(|result| result.libraries.as_slice()),
+    );
+    write_rows_to_path(&rows, &duplicate_metrics_path(prefix))
+        .context("writing duplicate-metrics TSV")?;
 
-        // The per-unit table is a different granularity (one flowcell-and-lane
-        // per row), so it gets its own file beside the per-library one.
-        if let Some(result) = decomposition.as_ref() {
-            let sample = resolve_sample(&header, args.sample.as_deref());
-            let rows = SequencingUnitMetrics::rows(&result.units, &stats, &sample);
-            write_unit_rows_to_path(&rows, &sequencing_units_path(stats_path))
-                .context("writing sequencing-unit TSV")?;
-        }
+    // The per-unit table is a different granularity (one flowcell-and-lane per
+    // row), so it gets its own file beside the per-library one. `decomposition` is
+    // `Some` exactly when `--sequencing-dups` is on.
+    if let Some(result) = decomposition.as_ref() {
+        let sample = resolve_sample(&header, args.sample.as_deref());
+        let rows = SequencingUnitMetrics::rows(&result.units, &stats, &sample);
+        write_unit_rows_to_path(&rows, &sequencing_units_path(prefix))
+            .context("writing sequencing-unit TSV")?;
     }
 
-    // `--complexity-metrics <PREFIX>`, shared by the two QC blocks below.
-    let prefix = args.complexity_metrics.as_deref();
-
-    // Emit the duplicate-rate ladder (only when `--complexity-metrics` was set,
-    // which is the only case `ladder` is `Some`). `finalize` appends the final
-    // per-library snapshot and sorts rows for a stable file order.
-    if let (Some(mut rec), Some(prefix)) = (ladder, prefix) {
+    // Emit the duplicate-rate ladder (`ladder` is `Some` exactly when
+    // `--complexity-metrics` is on). `finalize` appends the final per-library
+    // snapshot and sorts rows for a stable file order.
+    if let Some(mut rec) = ladder {
         rec.finalize(&stats);
         let path = ladder_path(prefix);
         write_ladder_rows(rec.rows(), &path).context("writing duplication-sampled TSV")?;
@@ -767,9 +784,9 @@ fn run(args: Args) -> Result<ExitCode> {
             .context("writing duplication-sampled plot")?;
     }
 
-    // Group-size histogram (η_k), from the per-library occurrence counts. Only
-    // populated when `--complexity-metrics` was set (so `counts()` is `Some`).
-    if let (Some(prefix), Some(counts)) = (prefix, processor.counts()) {
+    // Group-size histogram (η_k), from the per-library occurrence counts, which
+    // are only collected when `--complexity-metrics` is on.
+    if let Some(counts) = processor.counts() {
         let sample = resolve_sample(&header, args.sample.as_deref());
         let rows = histogram_rows(counts, &stats, &sample);
         write_histogram_rows(&rows, &histogram_path(prefix))
@@ -803,7 +820,7 @@ fn processor_options(args: &Args) -> ProcessorOptions {
         max_read_length: args.max_read_length,
         single_end_strategy: args.single_end_strategy.to_strategy(),
         methylation_mode: args.methylation_mode.map(MethylationModeCli::to_mode),
-        collect_counts: args.complexity_metrics.is_some(),
+        collect_counts: args.complexity_metrics,
     }
 }
 
@@ -1214,23 +1231,31 @@ fn read_rusage() -> Option<Rusage> {
 mod tests {
     use super::*;
 
+    /// Parse `extra` with the required `--metrics-prefix` supplied, so each test
+    /// spells out only the flag it exercises.
+    fn parse(extra: &[&str]) -> Result<Args, clap::Error> {
+        let mut argv = vec!["dupblaster", "--metrics-prefix", "metrics"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv)
+    }
+
     fn args_with_output(out: Option<&str>) -> Args {
         Args {
             input: None,
             output: out.map(PathBuf::from),
+            metrics_prefix: PathBuf::from("metrics"),
             remove_dups: false,
             add_mate_tags: false,
             ignore_unmated: false,
             max_read_length: 1000,
-            library_unaware: false,
+            library_aware: true,
             single_end_strategy: SingleEndStrategyCli::StrandAware,
             methylation_mode: None,
             tmp_dir: None,
-            stats: None,
             sample: None,
-            complexity_metrics: None,
+            complexity_metrics: false,
             complexity_interval: 1_000_000,
-            no_sequencing_dups: true,
+            sequencing_dups: false,
             read_name_format: None,
             tmp_compression_level: None,
             quiet: true,
@@ -1240,7 +1265,7 @@ mod tests {
             read_buffer_mb: 16,
             write_buffer_mb: 64,
             compression_level: CompressionLevel::new(0).expect("level 0 is valid"),
-            show_version: false,
+            show_version: None,
         }
     }
 
@@ -1274,31 +1299,31 @@ mod tests {
 
     #[test]
     fn max_read_length_rejects_non_positive() {
-        assert!(Args::try_parse_from(["dupblaster", "--max-read-length", "0"]).is_err());
-        assert!(Args::try_parse_from(["dupblaster", "--max-read-length", "-5"]).is_err());
+        assert!(parse(&["--max-read-length", "0"]).is_err());
+        assert!(parse(&["--max-read-length", "-5"]).is_err());
     }
 
     #[test]
     fn max_read_length_rejects_overflowing_value() {
         // Above the 10M cap that keeps 2*max_read_length within i32.
-        assert!(Args::try_parse_from(["dupblaster", "--max-read-length", "20000000"]).is_err());
+        assert!(parse(&["--max-read-length", "20000000"]).is_err());
     }
 
     #[test]
     fn max_read_length_accepts_in_range() {
-        let args = Args::try_parse_from(["dupblaster", "--max-read-length", "150000"]).unwrap();
+        let args = parse(&["--max-read-length", "150000"]).unwrap();
         assert_eq!(args.max_read_length, 150_000);
     }
 
     #[test]
     fn min_bins_rejects_zero_and_oversized() {
-        assert!(Args::try_parse_from(["dupblaster", "--min-bins", "0"]).is_err());
-        assert!(Args::try_parse_from(["dupblaster", "--min-bins", "100000"]).is_err());
+        assert!(parse(&["--min-bins", "0"]).is_err());
+        assert!(parse(&["--min-bins", "100000"]).is_err());
     }
 
     #[test]
     fn min_bins_accepts_in_range() {
-        let args = Args::try_parse_from(["dupblaster", "--min-bins", "8192"]).unwrap();
+        let args = parse(&["--min-bins", "8192"]).unwrap();
         assert_eq!(args.min_bins, 8192);
     }
 
@@ -1338,19 +1363,18 @@ mod tests {
 
     #[test]
     fn check_crc_and_no_check_crc_are_mutually_exclusive() {
-        assert!(Args::try_parse_from(["dupblaster", "--check-crc", "--no-check-crc"]).is_err());
+        assert!(parse(&["--check-crc", "--no-check-crc"]).is_err());
     }
 
     #[test]
     fn methylation_mode_defaults_to_none() {
-        let args = Args::try_parse_from(["dupblaster"]).unwrap();
+        let args = parse(&[]).unwrap();
         assert_eq!(args.methylation_mode, None);
     }
 
     #[test]
     fn methylation_mode_parses_directional() {
-        let args =
-            Args::try_parse_from(["dupblaster", "--methylation-mode", "directional"]).unwrap();
+        let args = parse(&["--methylation-mode", "directional"]).unwrap();
         assert_eq!(args.methylation_mode, Some(MethylationModeCli::Directional));
     }
 
@@ -1358,18 +1382,78 @@ mod tests {
     fn methylation_mode_rejects_unknown_value() {
         // `pbat` is intentionally not implemented yet — it must be rejected at
         // parse time rather than silently treated as directional.
-        assert!(Args::try_parse_from(["dupblaster", "--methylation-mode", "pbat"]).is_err());
+        assert!(parse(&["--methylation-mode", "pbat"]).is_err());
     }
 
     #[test]
     fn short_l_sets_compression_level() {
-        let args = Args::try_parse_from(["dupblaster", "-l", "6"]).unwrap();
+        let args = parse(&["-l", "6"]).unwrap();
         assert_eq!(u8::from(args.compression_level), 6);
     }
 
     #[test]
     fn short_m_sets_add_mate_tags() {
-        let args = Args::try_parse_from(["dupblaster", "-m"]).unwrap();
+        let args = parse(&["-m"]).unwrap();
         assert!(args.add_mate_tags);
+    }
+
+    #[test]
+    fn metrics_prefix_is_required() {
+        // Every run reports its duplicates, as Picard MarkDuplicates requires of
+        // METRICS_FILE. `--help`/`--version` still work: clap short-circuits them
+        // before required-argument validation.
+        assert!(Args::try_parse_from(["dupblaster"]).is_err());
+    }
+
+    #[test]
+    fn toggles_default_to_on() {
+        let args = parse(&[]).unwrap();
+        assert!(args.complexity_metrics);
+        assert!(args.sequencing_dups);
+        assert!(args.library_aware);
+    }
+
+    #[test]
+    fn a_bare_toggle_means_on() {
+        // Habitual `--flag` usage must not error just because the flag takes an
+        // optional value.
+        assert!(parse(&["--complexity-metrics"]).unwrap().complexity_metrics);
+        assert!(parse(&["--sequencing-dups"]).unwrap().sequencing_dups);
+        assert!(parse(&["--library-aware"]).unwrap().library_aware);
+    }
+
+    #[test]
+    fn off_turns_a_toggle_off() {
+        assert!(!parse(&["--complexity-metrics", "off"]).unwrap().complexity_metrics);
+        assert!(!parse(&["--sequencing-dups", "off"]).unwrap().sequencing_dups);
+        assert!(!parse(&["--library-aware", "off"]).unwrap().library_aware);
+    }
+
+    #[test]
+    fn toggles_accept_the_usual_boolean_spellings() {
+        for off in ["off", "false", "no", "0", "OFF", "False"] {
+            assert!(
+                !parse(&["--complexity-metrics", off]).unwrap().complexity_metrics,
+                "{off} should read as off"
+            );
+        }
+        for on in ["on", "true", "yes", "1", "ON"] {
+            assert!(
+                parse(&["--complexity-metrics", on]).unwrap().complexity_metrics,
+                "{on} should read as on"
+            );
+        }
+    }
+
+    #[test]
+    fn a_toggle_rejects_a_non_boolean_value() {
+        assert!(parse(&["--complexity-metrics", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn a_toggle_cannot_be_given_twice() {
+        // Contradicting yourself is a mistake worth reporting, not something to
+        // resolve silently by taking the last value.
+        assert!(parse(&["--sequencing-dups", "on", "--sequencing-dups", "off"]).is_err());
     }
 }

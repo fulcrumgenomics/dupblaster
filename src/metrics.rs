@@ -1,5 +1,5 @@
 //! Run-summary metrics emitted as a per-library TSV (one row per library) when
-//! `--stats PATH` is set on the command line.
+//! `--metrics-prefix PREFIX` is set on the command line.
 //!
 //! Rows are plain `#[derive(Serialize)]` structs written through
 //! [`fgoxide::io::DelimFile`] (the same serde-driven path riker uses), so the
@@ -66,11 +66,11 @@ pub struct Metrics {
     ///
     /// Uncorrected, so it slightly over-states the count wherever a group's
     /// molecules collide on a tile by chance — negligible on WGS, material for
-    /// groups of hundreds. The companion `<STATS>.sequencing-units.tsv` sums to
+    /// groups of hundreds. The companion `<PREFIX>.sequencing-units.tsv` sums to
     /// exactly this figure.
     ///
     /// `None` — an empty cell — whenever the split was not computed:
-    /// `--no-sequencing-dups` was passed, the library has no both-ends-mapped
+    /// `--sequencing-dups off` was passed, the library has no both-ends-mapped
     /// pairs, or it sits on a single tile and so carries no information at all.
     /// The per-sequencing-unit file's `tiles` column distinguishes the last case.
     pub raw_sequencing_duplicate_pairs: Option<u64>,
@@ -223,7 +223,7 @@ impl Metrics {
         }
     }
 
-    /// Build the `--stats` rows from end-of-run [`Stats`]: one row per library
+    /// Build the run-summary rows from end-of-run [`Stats`]: one row per library
     /// that processed at least one template (skipping an empty "Unknown
     /// Library" catch-all). Falls back to a single run-wide "All Reads" row
     /// when no library saw any data. `header` and `sample_override` resolve the
@@ -255,7 +255,7 @@ impl Metrics {
     }
 }
 
-/// One row of the per-sequencing-unit QC table written alongside `--stats` when
+/// One row of the per-sequencing-unit QC table written alongside the run summary when
 /// `--read-name-format` is on.
 ///
 /// Its own file because the granularity is different: a sequencing unit is a
@@ -265,7 +265,7 @@ impl Metrics {
 /// templates, a 9× spread invisible in the per-library row.
 #[derive(Debug, Clone, Serialize)]
 pub struct SequencingUnitMetrics {
-    /// Sample name, matching the `--stats` rows.
+    /// Sample name, matching the run-summary rows.
     pub sample: String,
     /// Library this unit's reads belong to.
     pub library: String,
@@ -333,21 +333,25 @@ impl SequencingUnitMetrics {
     }
 }
 
-/// Path of the per-sequencing-unit table, derived from the `--stats` path by
-/// inserting `.sequencing-units` before the extension. Derived rather than given
-/// its own flag so enabling the split needs no second option.
-///
-/// A compression suffix is kept last, so `out.tsv.gz` yields
-/// `out.sequencing-units.tsv.gz` rather than burying `.gz` mid-name.
-pub fn sequencing_units_path(stats_path: &Path) -> PathBuf {
-    const COMPRESSED: [&str; 2] = ["gz", "bgz"];
-    let extension = stats_path.extension().and_then(|ext| ext.to_str()).unwrap_or("tsv");
-    if COMPRESSED.contains(&extension) {
-        let stem = stats_path.with_extension("");
-        let inner = stem.extension().and_then(|ext| ext.to_str()).unwrap_or("tsv").to_string();
-        return stem.with_extension(format!("sequencing-units.{inner}.{extension}"));
-    }
-    stats_path.with_extension(format!("sequencing-units.{extension}"))
+/// Path of the run-summary table: `<PREFIX>.duplicate-metrics.tsv`.
+pub fn duplicate_metrics_path(prefix: &Path) -> PathBuf {
+    suffixed(prefix, ".duplicate-metrics.tsv")
+}
+
+/// Path of the per-sequencing-unit table: `<PREFIX>.sequencing-units.tsv`. A
+/// different granularity from [`duplicate_metrics_path`] — one flowcell-and-lane
+/// per row rather than one library — so it gets its own file.
+pub fn sequencing_units_path(prefix: &Path) -> PathBuf {
+    suffixed(prefix, ".sequencing-units.tsv")
+}
+
+/// Append `suffix` to `prefix` as raw bytes rather than via `with_extension`, so
+/// a prefix that already contains dots keeps them: `sampleA.hg38` yields
+/// `sampleA.hg38.duplicate-metrics.tsv`, not `sampleA.duplicate-metrics.tsv`.
+fn suffixed(prefix: &Path, suffix: &str) -> PathBuf {
+    let mut name = prefix.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 /// Write the per-sequencing-unit rows to `path` as a tab-separated file.
@@ -360,12 +364,11 @@ pub fn write_unit_rows_to_path(rows: &[SequencingUnitMetrics], path: &Path) -> R
 /// Write the metrics rows to `path` as a tab-separated file: a header row of
 /// serde field names followed by one row per [`Metrics`]. Serialization is
 /// handled by [`fgoxide::io::DelimFile`], so the [`Metrics`] field set is the
-/// single source of truth for the columns. A `.gz`/`.bgz` suffix on `path`
-/// transparently gzip-compresses the output.
+/// single source of truth for the columns.
 pub fn write_rows_to_path(rows: &[Metrics], path: &Path) -> Result<()> {
     DelimFile::default()
         .write_tsv(path, rows.iter())
-        .with_context(|| format!("writing stats TSV to {}", path.display()))
+        .with_context(|| format!("writing duplicate-metrics TSV to {}", path.display()))
 }
 
 /// Resolve the `sample` value: explicit override wins, else comma-join the

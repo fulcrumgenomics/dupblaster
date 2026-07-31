@@ -16,6 +16,8 @@ fn run_and_get_pg_lines(sam_in: &Path, bam_out: &Path) -> Vec<String> {
         .arg(sam_in)
         .args(["-o"])
         .arg(bam_out)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(bam_out))
         .args(["--quiet"])
         .output()
         .expect("rust dupblaster ran");
@@ -98,6 +100,8 @@ fn rerunning_dupblaster_disambiguates_pg_id() {
         .arg(&pass1)
         .args(["-o"])
         .arg(&pass2)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&pass2))
         .args(["--quiet"])
         .output()
         .unwrap();
@@ -129,7 +133,15 @@ fn input_with_broken_pp_pointer_fails_with_clear_error() {
         .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150);
     sb.write_to(&env.input);
 
-    let r = dupblaster().args(["-i"]).arg(&env.input).args(["-o"]).arg(&out_bam).output().unwrap();
+    let r = dupblaster()
+        .args(["-i"])
+        .arg(&env.input)
+        .args(["-o"])
+        .arg(&out_bam)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&out_bam))
+        .output()
+        .unwrap();
     assert!(!r.status.success(), "expected non-zero exit on broken PP chain");
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(

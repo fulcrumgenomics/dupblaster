@@ -26,6 +26,8 @@ fn add_mate_tags_is_idempotent_across_two_runs() {
         .arg(&env.input)
         .args(["-o"])
         .arg(&pass1)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&pass1))
         .args(["--add-mate-tags"])
         .output()
         .unwrap();
@@ -37,6 +39,8 @@ fn add_mate_tags_is_idempotent_across_two_runs() {
         .arg(&pass1)
         .args(["-o"])
         .arg(&pass2)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&pass2))
         .args(["--add-mate-tags"])
         .output()
         .unwrap();
@@ -95,6 +99,8 @@ fn add_mate_tags_writes_mate_cigar_and_mate_mapq() {
         .arg(&env.input)
         .args(["-o"])
         .arg(&out_bam)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&out_bam))
         .args(["--add-mate-tags"])
         .output()
         .unwrap();

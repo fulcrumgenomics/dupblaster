@@ -1,15 +1,21 @@
-//! Integration tests for `--complexity-metrics` (duplicate-rate ladder +
+//! Integration tests for the complexity metrics (duplicate-rate ladder +
 //! group-size histogram), including coverage across all single-end strategies.
 
 mod helpers;
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::Command;
 
 use helpers::*;
 
-/// Run dupblaster with `--complexity-metrics <prefix>` (plus `extra` args) and
-/// return the parsed rows of the file with the given suffix.
+/// Run dupblaster with complexity metrics left at their default (on) and return
+/// the parsed rows of the file with the given suffix.
+///
+/// Builds its own command rather than using [`dupblaster`], which switches
+/// complexity metrics off — this file is the one that must exercise the default.
+/// The sequencing split is off because these inputs use short synthetic read names
+/// carrying no flowcell or tile.
 fn run_and_read(
     input: &Path,
     prefix: &Path,
@@ -17,13 +23,14 @@ fn run_and_read(
     extra: &[&str],
 ) -> Vec<HashMap<String, String>> {
     let out = prefix.with_extension("out.bam");
-    let status = dupblaster()
+    let status = Command::new(rust_binary())
         .args(["-i"])
         .arg(input)
         .args(["-o"])
         .arg(&out)
-        .args(["--complexity-metrics"])
+        .args(["--metrics-prefix"])
         .arg(prefix)
+        .args(["--sequencing-dups", "off"])
         .args(extra)
         .output()
         .expect("dupblaster ran");
@@ -306,7 +313,9 @@ fn count_histogram_multi_library_writes_one_faceted_pdf() {
 }
 
 #[test]
-fn complexity_metrics_unwritable_dir_fails_early_with_clear_error() {
+fn unwritable_metrics_dir_fails_early_with_clear_error() {
+    // The metrics files are written only at the very end, so a bad prefix must be
+    // caught up front rather than after a full processing pass.
     let env = TestEnv::new();
     write_pe_triple_plus_two_singletons(&env.input);
     let out = env._tmp.path().join("out.bam");
@@ -316,14 +325,14 @@ fn complexity_metrics_unwritable_dir_fails_early_with_clear_error() {
         .arg(&env.input)
         .args(["-o"])
         .arg(&out)
-        .args(["--complexity-metrics"])
+        .args(["--metrics-prefix"])
         .arg(&bad_prefix)
         .output()
         .expect("dupblaster ran");
-    assert!(!res.status.success(), "must fail on an unwritable --complexity-metrics directory");
+    assert!(!res.status.success(), "must fail on an unwritable --metrics-prefix directory");
     let err = String::from_utf8_lossy(&res.stderr);
     assert!(
-        err.contains("--complexity-metrics") && err.contains("does not exist"),
+        err.contains("--metrics-prefix") && err.contains("does not exist"),
         "error should name the flag and the missing directory: {err}"
     );
 }

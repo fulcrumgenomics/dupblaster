@@ -89,7 +89,7 @@ pub struct ProcessorOptions {
 const UNKNOWN_LIBRARY: &str = "Unknown Library";
 
 /// Display name for the single combined bucket when library splitting is
-/// turned off (`--library-unaware`) over a header that *does* declare
+/// turned off (`--library-aware off`) over a header that *does* declare
 /// multiple libraries — signalling the merge to anyone reading `--stats`.
 const ALL_READS: &str = "All Reads";
 
@@ -103,7 +103,7 @@ const ALL_READS: &str = "All Reads";
 ///
 /// Libraries are deduplicated by their `LB` value, **not** by `RG:ID` — two
 /// read groups sharing one `LB` are one library. Bucket 0 is the catch-all
-/// "unknown library". In single-library mode (`--library-unaware`, or a header
+/// "unknown library". In single-library mode (`--library-aware off`, or a header
 /// with ≤1 distinct `LB`) there is exactly one bucket and `lookup` is
 /// never consulted — the whole mechanism is a no-op with no per-read RG scan.
 pub struct LibraryIndex {
@@ -115,7 +115,7 @@ pub struct LibraryIndex {
 
 impl LibraryIndex {
     /// Build the index from the SAM header. `disabled` forces single-library
-    /// mode regardless of the header (the `--library-unaware` escape hatch).
+    /// mode regardless of the header (the `--library-aware off` escape hatch).
     pub fn from_header(header: &Header, disabled: bool) -> Self {
         // Collect (RG:ID, LB) pairs and the distinct LB set. BTreeSet keeps the
         // library order deterministic across runs (sorted by LB), so bucket
@@ -342,7 +342,7 @@ pub struct RecordProcessor {
     counts: Option<Vec<CountsMap>>,
     /// Spills every pair's `(signature, tile)` so duplicates can be split into
     /// sequencing and library components after the output is closed. `Some` only
-    /// unless `--no-sequencing-dups` was given; attached by
+    /// unless `--sequencing-dups off` was given; attached by
     /// [`Self::attach_tile_spiller`] because it needs `bin_count`, which is not
     /// known until the bins are built.
     tiles: Option<TileSpiller>,

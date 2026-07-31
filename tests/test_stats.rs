@@ -1,15 +1,21 @@
-//! Integration tests for the `--stats` TSV output.
+//! Integration tests for the `<PREFIX>.duplicate-metrics.tsv` output.
 
 mod helpers;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use helpers::*;
 
-fn run_with_stats(input: &Path, stats: &Path, output: &Path, extra: &[&str]) {
+fn run_with_stats(input: &Path, prefix: &Path, output: &Path, extra: &[&str]) {
     let mut cmd = dupblaster();
-    cmd.args(["-i"]).arg(input).args(["-o"]).arg(output).args(["--stats"]).arg(stats).args(extra);
+    cmd.args(["-i"])
+        .arg(input)
+        .args(["-o"])
+        .arg(output)
+        .args(["--metrics-prefix"])
+        .arg(prefix)
+        .args(extra);
     let out = cmd.output().expect("rust dupblaster ran");
     assert!(
         out.status.success(),
@@ -19,6 +25,13 @@ fn run_with_stats(input: &Path, stats: &Path, output: &Path, extra: &[&str]) {
 }
 
 /// Parse the two-line TSV into a column → value map.
+/// The run-summary file dupblaster derives from a `--metrics-prefix`.
+fn summary(prefix: &Path) -> PathBuf {
+    let mut name = prefix.as_os_str().to_owned();
+    name.push(".duplicate-metrics.tsv");
+    PathBuf::from(name)
+}
+
 fn parse_stats_tsv(path: &Path) -> HashMap<String, String> {
     let text = std::fs::read_to_string(path).expect("read stats");
     let mut lines = text.lines();
@@ -33,7 +46,7 @@ fn parse_stats_tsv(path: &Path) -> HashMap<String, String> {
 #[test]
 fn stats_tsv_reports_correct_counts_for_simple_dup_input() {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     // 3 mapped pairs, one of which is a duplicate of another. Expected:
     //   total_templates = 3, mapped_pairs = 3, duplicate_pairs = 1.
@@ -47,7 +60,7 @@ fn stats_tsv_reports_correct_counts_for_simple_dup_input() {
         .rec_simple("r3", 147, "chr1", 600, "50M", "=", 500, -150)
         .write_to(&env.input);
     run_with_stats(&env.input, &stats, &out, &[]);
-    let m = parse_stats_tsv(&stats);
+    let m = parse_stats_tsv(&summary(&stats));
     assert_eq!(m["total_templates"], "3");
     assert_eq!(m["mapped_pairs"], "3");
     assert_eq!(m["duplicate_pairs"], "1");
@@ -64,7 +77,7 @@ fn stats_tsv_reports_correct_counts_for_simple_dup_input() {
 #[test]
 fn stats_tsv_uses_sample_override() {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     SamBuilder::new()
         .sq("chr1", 1_000_000)
@@ -72,14 +85,14 @@ fn stats_tsv_uses_sample_override() {
         .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
     run_with_stats(&env.input, &stats, &out, &["--sample", "NA12878"]);
-    let m = parse_stats_tsv(&stats);
+    let m = parse_stats_tsv(&summary(&stats));
     assert_eq!(m["sample"], "NA12878");
 }
 
 #[test]
 fn stats_tsv_pulls_sample_from_read_group_sm() {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     SamBuilder::new()
         .sq("chr1", 1_000_000)
@@ -88,14 +101,14 @@ fn stats_tsv_pulls_sample_from_read_group_sm() {
         .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
     run_with_stats(&env.input, &stats, &out, &[]);
-    let m = parse_stats_tsv(&stats);
+    let m = parse_stats_tsv(&summary(&stats));
     assert_eq!(m["sample"], "SAMPLE_A");
 }
 
 #[test]
 fn stats_tsv_comma_joins_multiple_sm_values() {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     SamBuilder::new()
         .sq("chr1", 1_000_000)
@@ -105,7 +118,7 @@ fn stats_tsv_comma_joins_multiple_sm_values() {
         .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
     run_with_stats(&env.input, &stats, &out, &[]);
-    let m = parse_stats_tsv(&stats);
+    let m = parse_stats_tsv(&summary(&stats));
     // BTreeSet sort order: alphabetical.
     assert_eq!(m["sample"], "SAMPLE_A,SAMPLE_B");
 }
@@ -116,7 +129,7 @@ fn stats_tsv_comma_joins_multiple_sm_values() {
 #[test]
 fn paired_unmapped_singleton_counts_as_unmapped_orphan_not_unmated() {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     // FLAG 5 = paired (1) + unmapped (4). Single primary in its qname block.
     SamBuilder::new()
@@ -129,7 +142,7 @@ fn paired_unmapped_singleton_counts_as_unmapped_orphan_not_unmated() {
         .rec_simple("r2", 69, "*", 0, "*", "*", 0, 0)
         .write_to(&env.input);
     run_with_stats(&env.input, &stats, &out, &["--ignore-unmated"]);
-    let m = parse_stats_tsv(&stats);
+    let m = parse_stats_tsv(&summary(&stats));
     assert_eq!(m["unmapped_orphans"], "1", "row: {m:?}");
     assert_eq!(m["unmated_templates"], "0", "row: {m:?}");
 }
@@ -137,7 +150,7 @@ fn paired_unmapped_singleton_counts_as_unmapped_orphan_not_unmated() {
 #[test]
 fn stats_tsv_has_all_expected_columns() {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     SamBuilder::new()
         .sq("chr1", 1_000_000)
@@ -145,7 +158,7 @@ fn stats_tsv_has_all_expected_columns() {
         .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
     run_with_stats(&env.input, &stats, &out, &[]);
-    let text = std::fs::read_to_string(&stats).unwrap();
+    let text = std::fs::read_to_string(summary(&stats)).unwrap();
     let header = text.lines().next().unwrap();
     let cols: Vec<&str> = header.split('\t').collect();
     let expected = [
@@ -174,21 +187,21 @@ fn stats_tsv_has_all_expected_columns() {
     assert_eq!(cols, expected);
 }
 
-/// Under `--no-sequencing-dups` the decomposition columns are present but empty,
+/// Under `--sequencing-dups off` the decomposition columns are present but empty,
 /// so a consumer sees a stable schema and can tell "not measured" from "zero".
 #[test]
 fn decomposition_columns_are_blank_when_the_split_is_disabled() {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     SamBuilder::new()
         .sq("chr1", 1_000_000)
         .rec_simple("r1", 99, "chr1", 100, "50M", "=", 200, 150)
         .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
-    // The shared helper already passes --no-sequencing-dups.
+    // The shared helper already passes --sequencing-dups off.
     run_with_stats(&env.input, &stats, &out, &[]);
-    let text = std::fs::read_to_string(&stats).unwrap();
+    let text = std::fs::read_to_string(summary(&stats)).unwrap();
     let mut lines = text.lines();
     let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
     let values: Vec<&str> = lines.next().unwrap().split('\t').collect();
@@ -203,13 +216,13 @@ fn decomposition_columns_are_blank_when_the_split_is_disabled() {
     }
 }
 
-/// `--remove-dups` drops duplicate records from the output but the `--stats`
+/// `--remove-dups` drops duplicate records from the output but the metrics
 /// counts still reflect every template examined (Picard semantics): the
 /// duplicate is counted, not hidden.
 #[test]
 fn stats_counts_unaffected_by_remove_dups() {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     SamBuilder::new()
         .sq("chr1", 1_000_000)
@@ -219,7 +232,7 @@ fn stats_counts_unaffected_by_remove_dups() {
         .rec_simple("r2", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
     run_with_stats(&env.input, &stats, &out, &["--remove-dups"]);
-    let m = parse_stats_tsv(&stats);
+    let m = parse_stats_tsv(&summary(&stats));
     assert_eq!(m["total_templates"], "2");
     assert_eq!(m["duplicate_pairs"], "1", "the duplicate is still counted");
     assert_eq!(m["duplicate_templates"], "1");
@@ -229,7 +242,7 @@ fn stats_counts_unaffected_by_remove_dups() {
     assert_eq!(records.len(), 2, "duplicate pair should be removed from output");
 }
 
-/// Empty input (header only, zero records) must not crash the `--stats`
+/// Empty input (header only, zero records) must not crash the metrics
 /// writer. Risk: `frac_duplicates`'s read-level fraction has 0 in the
 /// denominator when no reads were observed; that needs to land as `0.0`
 /// (or empty) rather than NaN / panic. `estimated_library_size` should
@@ -237,11 +250,11 @@ fn stats_counts_unaffected_by_remove_dups() {
 #[test]
 fn stats_tsv_handles_empty_input_without_crashing() {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     SamBuilder::new().sq("chr1", 1_000_000).write_to(&env.input); // header, no records
     run_with_stats(&env.input, &stats, &out, &[]);
-    let m = parse_stats_tsv(&stats);
+    let m = parse_stats_tsv(&summary(&stats));
     assert_eq!(m["total_templates"], "0");
     assert_eq!(m["duplicate_templates"], "0");
     assert_eq!(m["mapped_pairs"], "0");

@@ -26,7 +26,15 @@ fn clip_beyond_padding_clamps_warns_and_exits_nonzero() {
         .rec_simple("r1", 147, "chr1", 200, "50M", "=", 1, -249)
         .write_to(&env.input);
 
-    let r = dupblaster().args(["-i"]).arg(&env.input).args(["-o"]).arg(&out_bam).output().unwrap();
+    let r = dupblaster()
+        .args(["-i"])
+        .arg(&env.input)
+        .args(["-o"])
+        .arg(&out_bam)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&out_bam))
+        .output()
+        .unwrap();
     assert!(!r.status.success(), "clamping should make dupblaster exit non-zero");
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(stderr.contains("clamped"), "stderr should mention clamping, got: {stderr}");
@@ -56,6 +64,8 @@ fn bumping_max_read_length_avoids_clamping() {
         .arg(&env.input)
         .args(["-o"])
         .arg(&out_bam)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&out_bam))
         .args(["--max-read-length", "6000"])
         .output()
         .unwrap();
@@ -81,7 +91,15 @@ fn normal_reads_do_not_clamp() {
         .rec_simple("r1", 147, "chr1", 5200, "50M", "=", 5000, -250)
         .write_to(&env.input);
 
-    let r = dupblaster().args(["-i"]).arg(&env.input).args(["-o"]).arg(&out_bam).output().unwrap();
+    let r = dupblaster()
+        .args(["-i"])
+        .arg(&env.input)
+        .args(["-o"])
+        .arg(&out_bam)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&out_bam))
+        .output()
+        .unwrap();
     assert!(r.status.success(), "stderr: {}", String::from_utf8_lossy(&r.stderr));
     assert!(!String::from_utf8_lossy(&r.stderr).contains("clamped"));
 }

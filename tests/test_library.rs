@@ -3,7 +3,7 @@
 //! Duplicates are called only *within* a library (matching Picard
 //! MarkDuplicates). Library membership comes from each read's `RG:Z` tag mapped
 //! through the header's `@RG ... LB:` field. Library awareness is on by default
-//! whenever the header declares more than one distinct `LB`; `--library-unaware`
+//! whenever the header declares more than one distinct `LB`; `--library-aware off`
 //! forces the old single-table (library-agnostic) behavior.
 
 mod helpers;
@@ -70,7 +70,7 @@ fn same_library_pairs_across_read_groups_are_duplicates() {
     assert!(dup["p2"], "same library, same coords → duplicate");
 }
 
-/// `--library-unaware` restores the single-table behavior: cross-library pairs
+/// `--library-aware off` restores the single-table behavior: cross-library pairs
 /// at the same locus collapse to a duplicate again.
 #[test]
 fn library_unaware_flag_marks_cross_library_dups() {
@@ -86,9 +86,9 @@ fn library_unaware_flag_marks_cross_library_dups() {
         .rec_simple_rg("p2", 147, "chr1", 200, "50M", "=", 100, -150, "B")
         .write_to(&env.input);
 
-    let flags = run_and_capture(&env.input, &out, &["--library-unaware"]).flags;
+    let flags = run_and_capture(&env.input, &out, &["--library-aware", "off"]).flags;
     let dup = dup_by_qname(&flags);
-    assert!(dup["p2"], "with --library-unaware, different libraries collapse");
+    assert!(dup["p2"], "with --library-aware off, different libraries collapse");
 }
 
 /// Reads with no `RG` tag share the single "Unknown Library" bucket and so
@@ -201,7 +201,7 @@ fn parse_stats_rows(path: &Path) -> Vec<HashMap<String, String>> {
 #[test]
 fn stats_reports_one_row_per_library() {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let prefix = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     SamBuilder::new()
         .sq("chr1", 1_000_000)
@@ -224,13 +224,13 @@ fn stats_reports_one_row_per_library() {
         .arg(&env.input)
         .args(["-o"])
         .arg(&out)
-        .args(["--stats"])
-        .arg(&stats)
+        .args(["--metrics-prefix"])
+        .arg(&prefix)
         .output()
         .expect("dupblaster ran");
     assert!(run.status.success(), "dupblaster failed: {}", String::from_utf8_lossy(&run.stderr));
 
-    let rows = parse_stats_rows(&stats);
+    let rows = parse_stats_rows(&prefix.with_extension("duplicate-metrics.tsv"));
     let libs: Vec<&str> = rows.iter().map(|r| r["library"].as_str()).collect();
     assert_eq!(libs, ["lib1", "lib2"], "one row per library, sorted by LB");
 
