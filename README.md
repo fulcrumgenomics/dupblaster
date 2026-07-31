@@ -210,10 +210,10 @@ The most common flags:
 | `-i, --input <PATH>` | Input SAM/BAM file (default: stdin). |
 | `-o, --output <PATH>` | Output BAM file or `-` for stdout. Must end in `.bam`. |
 | `-r, --remove-dups` | Drop duplicate reads from output instead of just flagging them. |
-| `--add-mate-tags` | Add MC (mate CIGAR) and MQ (mate MAPQ) tags to all paired records. |
+| `-m, --add-mate-tags` | Add MC (mate CIGAR) and MQ (mate MAPQ) tags to all paired records. |
 | `--ignore-unmated` | Don't abort if a primary record's mate is missing. |
-| `--compression-level <N>` | BGZF compression level for output (0-12). Default 0 = uncompressed. |
-| `--single-end-strategy <NAME>` | How to key single-end / orphan reads. `strand-aware` (default), `picard-approx`, `picard-exact`, or `samblaster-legacy`. See [§ Single-end / orphan handling](#single-end--orphan-handling). |
+| `-l, --compression-level <N>` | BGZF compression level for output (0-12). Default 0 = uncompressed. |
+| `--single-end-strategy <NAME>` | How to key single-end / orphan reads. `strand-aware` (default), `picard-exact`, `picard-approx`, or `samblaster-legacy`. See [§ Single-end / orphan handling](#single-end--orphan-handling). |
 | `--methylation-mode <MODE>` | Methylation-aware keying for bisulfite / enzymatic-conversion data. Off by default. `directional` keeps the two original strands (OT/OB) of a fragment distinct. See [§ Methylation mode](#methylation-mode). |
 | `--tmp-dir <DIR>` | Directory for dupblaster's temporary files, deleted on exit (default: `$TMPDIR`). **The sequencing-vs-library duplicate split writes here on every run** — 16 bytes per pair, so ~5 GB for a 30x human genome and ~50 GB at 300x. Point this at a volume with room, or pass `--no-sequencing-dups`. Also used by `--single-end-strategy picard-exact` for its orphan buffer. |
 | `--library-unaware` | Disable library-aware marking; use one dedup table across all reads (samblaster behavior). No effect when the header has ≤1 library. See [§ Library awareness](#library-awareness). |
@@ -224,9 +224,10 @@ The most common flags:
 | `--no-sequencing-dups` | Don't split duplicates into sequencing (on-flowcell) and library components. The split is on by default; it classifies duplicates rather than changing which reads are marked. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---no-sequencing-dups). |
 | `--read-name-format <FORMAT>` | Read-name layout the split takes the sequencing unit and tile from: `illumina` (default), `element`, or `regex:PATTERN`. A name the layout cannot parse is a hard error. |
 
-Run `dupblaster --help` for the full list, including tuning knobs for
-the IO ring buffers (`--read-buffer-mb`, `--write-buffer-mb`) and
-BGZF CRC verification (`--check-crc` / `--no-check-crc`).
+Run `dupblaster --help` for the full list. The IO ring buffers
+(`--read-buffer-mb`, `--write-buffer-mb`), BGZF CRC verification
+(`--check-crc` / `--no-check-crc`), and `--max-read-length` sit under an
+"Advanced tuning" heading there — their defaults suit essentially every run.
 
 ## Stats output (`--stats`)
 

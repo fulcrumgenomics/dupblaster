@@ -17,9 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Validated against read-name ground truth on a 333M-template EM-seq sample: 62.8% of chr20 duplicate pairs sequencing, 64.9% genome-wide, with a tile count exact to the tile (6,334). The per-sequencing-unit column sums to `raw_sequencing_duplicate_pairs` exactly (53,070,208) rather than approximately.
   - Costs **+7.2% wall time** (359.7 s → 385.6 s on 333M templates), no change in peak memory, and 16 bytes of temporary disk per pair. Only about a third of that (27 ns per pair) falls in the main pass; the rest is a post-pass that runs after the output stream is closed, so it does not hold up a downstream process — the overhead a pipeline feels is roughly **+2.5%**.
 - `--read-name-format <FORMAT>`: the read-name layout the split reads. `illumina` (the default — `instrument:run:flowcell:lane:tile:x:y`, CASAVA 1.8+, bcl2fastq, BCL Convert), `element` (Element AVITI, the same layout), or `regex:<PATTERN>` with `(?<su>…)` and `(?<tile>…)` capture groups for platforms without a preset. The layout is never guessed beyond that default, because mis-parsing one would silently produce a confident wrong number.
+- Short flags `-l` for `--compression-level` and `-m` for `--add-mate-tags`.
+- dupblaster now credits Fulcrum Genomics and links to its repository — two lines on stderr at startup (suppressed by `--quiet`), and a banner at the top of `-h`/`--help`.
 
 ### Changed
 
+- **`--help` is far more compact.** Every option's description was rewritten to say the same thing in less prose, and the detail that earns its keep moved into the long form: `-h` is now a one-to-two-line-per-option summary, with the full text under `--help`. Per-option "see the README" pointers are gone — the repository link in the banner is the single pointer to full documentation.
+- `--check-crc`, `--no-check-crc`, `--read-buffer-mb`, `--write-buffer-mb`, and `--max-read-length` are grouped under an **"Advanced tuning (rarely needed)"** heading in `--help`, separating the knobs whose defaults suit essentially every run from the options a caller actually chooses between. No behavior change.
 - **`estimated_library_size` now has sequencing duplicates removed from the observed total**, following Picard's `ESTIMATED_LIBRARY_SIZE` convention (subtracted from `n`, not from the unique count). Flowcell duplicates are not evidence a library is exhausted, so counting them as saturation understates it — worth 2.3x on one 30x WGS sample. Under `--no-sequencing-dups` the column falls back to the previous uncorrected value.
 
 ### Fixed
