@@ -12,16 +12,18 @@ ONT/PacBio).
 
 ## Before calling any change done
 
-Run all three gates and make them pass — these are exactly what CI runs:
+Run all four gates and make them pass:
 
-```
+```sh
 cargo ci-fmt     # rustfmt --check
 cargo ci-lint    # clippy --all-targets -D warnings
 cargo ci-test    # nextest, --locked
+cargo ci-doc     # rustdoc, -D warnings (catches broken intra-doc links)
 ```
 
 The `ci-*` aliases live in `.cargo/config.toml`. If `ci-fmt` fails, run
-`cargo fmt`. `cargo deny check` runs in CI too.
+`cargo fmt`. CI runs these four plus `cargo deny check`, for five gates in
+total.
 
 ## Workflow — this repo is PUBLIC
 
