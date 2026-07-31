@@ -42,6 +42,32 @@ enum Sink {
     File(std::fs::File),
     /// Standard output (used when `--output` is absent or is `"-"`).
     Stdout(io::Stdout),
+    /// A file behind a zstd stream, for temporary output only.
+    ///
+    /// Nesting the codec inside the sink rather than around the BGZF writer keeps
+    /// the writer's type — and so every signature that carries it — unchanged, and
+    /// puts the compression on the [`WriteBehind`] thread instead of the worker.
+    /// The BGZF layer above still runs at level 0, so this is stored blocks inside
+    /// a zstd frame: the framing costs ~26 bytes per 64 KB and compresses away,
+    /// while teaching the reader to skip BGZF would not.
+    Zstd(Box<zstd::stream::write::Encoder<'static, std::fs::File>>),
+}
+
+impl Sink {
+    /// Close the sink, writing the zstd frame epilogue when there is one.
+    ///
+    /// Without the epilogue a decoder rejects the file as truncated, so this must
+    /// run before anything reads a compressed temp file back.
+    fn finish(self) -> Result<()> {
+        match self {
+            Sink::File(mut f) => f.flush().context("flushing output file")?,
+            Sink::Stdout(mut s) => s.flush().context("flushing stdout")?,
+            Sink::Zstd(encoder) => {
+                encoder.finish().context("finishing zstd temp output")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Write for Sink {
@@ -49,12 +75,14 @@ impl Write for Sink {
         match self {
             Sink::File(f) => f.write(buf),
             Sink::Stdout(s) => s.write(buf),
+            Sink::Zstd(e) => e.write(buf),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Sink::File(f) => f.flush(),
             Sink::Stdout(s) => s.flush(),
+            Sink::Zstd(e) => e.flush(),
         }
     }
 }
@@ -95,6 +123,46 @@ impl RawBamWriter {
             }
             _ => Sink::Stdout(io::stdout()),
         };
+        Self::from_sink(sink, header, ring_bytes, level)
+    }
+
+    /// Open a BAM writer for a temporary file, optionally behind zstd.
+    ///
+    /// Separate from [`Self::open`] because the zstd sink must never reach the
+    /// primary output: [`Self::abandon`] deliberately leaves a truncated file
+    /// there, and that contract is defined in terms of the BGZF EOF marker a
+    /// reader looks for. A half-written zstd frame conveys the same thing only
+    /// because temporary files are deleted rather than inspected.
+    ///
+    /// BGZF stays at level 0 either way; `zstd_level` adds a second layer around
+    /// it rather than replacing it.
+    pub fn open_temp(
+        path: &Path,
+        header: &Header,
+        ring_bytes: usize,
+        zstd_level: Option<i32>,
+    ) -> Result<Self> {
+        let file =
+            std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        let sink = match zstd_level {
+            None => Sink::File(file),
+            Some(level) => {
+                let encoder = zstd::stream::write::Encoder::new(file, level)
+                    .with_context(|| format!("starting zstd for {}", path.display()))?;
+                Sink::Zstd(Box::new(encoder))
+            }
+        };
+        let stored = CompressionLevel::new(0).expect("compression level 0 is valid");
+        Self::from_sink(sink, header, ring_bytes, stored)
+    }
+
+    /// Wrap `sink` in the write-behind and BGZF layers and emit the BAM header.
+    fn from_sink(
+        sink: Sink,
+        header: &Header,
+        ring_bytes: usize,
+        level: CompressionLevel,
+    ) -> Result<Self> {
         let threaded = WriteBehind::with_thread_name(sink, ring_bytes, "dupblaster");
         let mut bgzf = BgzfWriter::new(threaded, level);
         write_bam_header(&mut bgzf, header)?;
@@ -111,12 +179,13 @@ impl RawBamWriter {
         Ok(())
     }
 
-    /// Flush BGZF, emit the EOF marker, drain the IO writer thread, and
-    /// join it. After this the writer is unusable.
+    /// Flush BGZF, emit the EOF marker, drain the IO writer thread, join it, and
+    /// close the sink. After this the writer is unusable.
     pub fn finish(mut self) -> Result<()> {
         if let Some(w) = self.bgzf.take() {
             let threaded = w.finish().context("flushing BGZF writer")?;
-            threaded.finish().context("flushing IO writer thread")?;
+            let sink = threaded.finish().context("flushing IO writer thread")?;
+            sink.finish()?;
         }
         Ok(())
     }

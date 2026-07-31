@@ -178,17 +178,17 @@ fn an_uncompressed_spill_reports_the_expected_split() {
 
 #[test]
 fn a_fast_tier_spill_reports_the_expected_split() {
-    assert_expected_split(&split_with_flags(&["--spill-compression-level", "-5"]));
+    assert_expected_split(&split_with_flags(&["--tmp-compression-level", "-5"]));
 }
 
 #[test]
 fn a_compressed_spill_reports_the_expected_split() {
-    assert_expected_split(&split_with_flags(&["--spill-compression-level", "1"]));
+    assert_expected_split(&split_with_flags(&["--tmp-compression-level", "1"]));
 }
 
 #[test]
 fn the_highest_accepted_level_reports_the_expected_split() {
-    assert_expected_split(&split_with_flags(&["--spill-compression-level", "9"]));
+    assert_expected_split(&split_with_flags(&["--tmp-compression-level", "9"]));
 }
 
 #[test]
@@ -224,7 +224,7 @@ fn a_compressed_run_reports_the_on_disk_size_and_a_ratio() {
     }
     input.write_to(&env.input);
 
-    let result = run(&env.input, &stats, &out, &["--spill-compression-level", "1"]);
+    let result = run(&env.input, &stats, &out, &["--tmp-compression-level", "1"]);
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("on disk"), "expected an on-disk size: {stderr}");
     assert!(stderr.contains("x)"), "expected a ratio: {stderr}");
@@ -239,7 +239,7 @@ fn a_compression_level_above_the_accepted_range_is_rejected() {
     input.pair("FC", 1, 1101, 500_000);
     input.write_to(&env.input);
 
-    let result = run(&env.input, &stats, &out, &["--spill-compression-level", "22"]);
+    let result = run(&env.input, &stats, &out, &["--tmp-compression-level", "22"]);
     assert!(!result.status.success(), "level 22 should be rejected");
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("must be between"), "expected a range error, got: {stderr}");
@@ -256,7 +256,7 @@ fn a_compression_level_of_zero_is_rejected_as_ambiguous() {
     input.pair("FC", 1, 1101, 500_000);
     input.write_to(&env.input);
 
-    let result = run(&env.input, &stats, &out, &["--spill-compression-level", "0"]);
+    let result = run(&env.input, &stats, &out, &["--tmp-compression-level", "0"]);
     assert!(!result.status.success(), "level 0 should be rejected");
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("ambiguous"), "expected the ambiguity error, got: {stderr}");
