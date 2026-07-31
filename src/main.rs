@@ -970,7 +970,7 @@ fn run_picard_exact(
     // Pass 2: re-read the buffered fragments and mark them against the
     // now-complete fragment table. CRC verification is off — we wrote this
     // file ourselves moments ago.
-    let file = File::open(&temp_path).context("reopening temp orphan BAM for pass 2")?;
+    let file = temp.reopen().context("reopening temp orphan BAM for pass 2")?;
     // Unlike the write side, this runs on the worker thread — there is no
     // read-ahead for the temp file — so decompression is not free here.
     let buffered: Box<dyn BufRead> = match args.tmp_compression_level {

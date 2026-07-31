@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--single-end-strategy picard-exact` no longer silently drops orphans if its temporary BAM is truncated.** The BAM reader treats an unexpected end of a block header as a clean end of stream, so a temp file cut short could be read back incomplete and the run would still exit zero, having quietly omitted records from the output and the counts. The two passes now agree on a record count or the run fails. Independent of `--tmp-compression-level`, though compression adds a second way for the file to end early.
 - A run that aborts part-way now leaves its partial BAM **without** the BGZF EOF marker, so `samtools quickcheck` and other readers correctly report it as truncated. Previously the writer's `Drop` emitted that marker on the way out, so a file missing records passed every integrity check it had. The partial output is still left on disk — discarding it would be its own surprise — it just no longer claims to be complete. Applies to every aborting run, independently of `--no-sequencing-dups`.
 
 ### Upgrading from 0.2.0

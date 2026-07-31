@@ -146,14 +146,15 @@ impl RawBamWriter {
         ring_bytes: usize,
         zstd_level: Option<i32>,
     ) -> Result<Self> {
-        let path = temp.path();
-        let file =
-            std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        // `reopen` rather than opening the path: it checks the dev+inode against
+        // the handle already held, so a temp directory another user can write to
+        // cannot substitute a symlink between creation and this open.
+        let file = temp.reopen().with_context(|| format!("reopening {}", temp.path().display()))?;
         let sink = match zstd_level {
             None => Sink::File(file),
             Some(level) => {
                 let encoder = zstd::stream::write::Encoder::new(file, level)
-                    .with_context(|| format!("starting zstd for {}", path.display()))?;
+                    .with_context(|| format!("starting zstd for {}", temp.path().display()))?;
                 Sink::Zstd(Box::new(encoder))
             }
         };
