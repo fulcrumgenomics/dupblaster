@@ -912,7 +912,7 @@ fn for_each_block(
 ///
 /// **Pass 1** streams pairs and unmapped/unmated blocks straight to `out`
 /// while buffering every mapped-orphan / single-end block to a temporary
-/// uncompressed BAM. **Transition** drains the completed pair table into a
+/// BAM. **Transition** drains the completed pair table into a
 /// fragment table holding every paired read end. **Pass 2** re-reads the
 /// buffered blocks and marks each fragment that collides with a pair end (or
 /// an earlier fragment), emitting them after the pairs.
@@ -993,9 +993,12 @@ fn run_picard_exact(
     Ok(())
 }
 
-/// Create the temporary uncompressed BAM used by picard-exact to buffer
-/// fragment blocks. Honors `dir` (`--tmp-dir`) when given, else the system
-/// temp dir (`$TMPDIR`). The returned handle unlinks the file on drop.
+/// Create the temporary BAM used by picard-exact to buffer fragment blocks.
+/// Honors `dir` (`--tmp-dir`) when given, else the system temp dir (`$TMPDIR`).
+/// The returned handle unlinks the file on drop.
+///
+/// Whether its contents are compressed is [`RawBamWriter::open_temp`]'s business,
+/// driven by `--tmp-compression-level`.
 fn create_temp_bam(dir: Option<&std::path::Path>) -> Result<tempfile::NamedTempFile> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("dupblaster-orphans-").suffix(".bam");

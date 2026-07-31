@@ -104,6 +104,15 @@ impl Run {
         self
     }
 
+    /// Add a mapped single-end read, which `picard-exact` defers to its temp BAM.
+    fn single_end(&mut self, flowcell: &str, lane: u32, tile: u32, pos: u32) -> &mut Self {
+        self.cluster += 1;
+        let name = read_name(flowcell, lane, tile, self.cluster);
+        let builder = std::mem::replace(&mut self.builder, SamBuilder::new());
+        self.builder = builder.rec_simple(&name, 0, "chr1", pos, "50M", "*", 0, 0);
+        self
+    }
+
     /// Put one non-duplicate pair on each of `tiles` tiles, giving the library a
     /// realistic tile spread.
     ///
@@ -260,6 +269,43 @@ fn a_compression_level_of_zero_is_rejected_as_ambiguous() {
     assert!(!result.status.success(), "level 0 should be rejected");
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("ambiguous"), "expected the ambiguity error, got: {stderr}");
+}
+
+/// Both temporary files — the tile spill and the `picard-exact` orphan buffer —
+/// are compressed by the one flag, so this is the only path where two zstd
+/// streams are live in a single run. A level that reached one but not the other
+/// would still pass every other test.
+#[test]
+fn compressing_both_temp_files_at_once_reports_the_same_numbers() {
+    fn run_both(extra: &[&str]) -> HashMap<String, String> {
+        let env = TestEnv::new();
+        let stats = env._tmp.path().join("stats.tsv");
+        let out = env._tmp.path().join("out.bam");
+        let mut input = Run::new();
+        input.spread_over_tiles(200);
+        for _ in 0..4 {
+            input.pair("FC", 1, 1101, 500_000);
+        }
+        for tile in [2101, 2102, 2103] {
+            input.pair("FC", 1, tile, 900_000);
+        }
+        // Single-end reads route through the picard-exact temp BAM; duplicates
+        // among them prove that buffer round-tripped rather than merely existed.
+        for _ in 0..3 {
+            input.single_end("FC", 1, 1101, 700_000);
+        }
+        input.write_to(&env.input);
+        let mut args = vec!["--single-end-strategy", "picard-exact"];
+        args.extend_from_slice(extra);
+        run_ok(&env.input, &stats, &out, &args);
+        parse_row(&stats)
+    }
+
+    let plain = run_both(&[]);
+    assert_eq!(run_both(&["--tmp-compression-level", "1"]), plain);
+    assert_eq!(run_both(&["--tmp-compression-level", "-5"]), plain);
+    assert_expected_split(&plain);
+    assert_eq!(plain["duplicate_orphans"], "2", "the temp BAM's own duplicates");
 }
 
 #[test]

@@ -510,7 +510,8 @@ Four strategies are supported:
   `picard-approx`, but **exact and order-independent**. dupblaster runs
   two passes: fully-mapped and unmapped pairs stream straight to the
   output, while every mapped-orphan / single-end read is buffered to a
-  temporary uncompressed BAM (see `--tmp-dir`). After the pair pass, the
+  temporary BAM (see `--tmp-dir`, and `--tmp-compression-level` to compress
+  it). After the pair pass, the
   pair table is consumed into a fragment table holding the 5' position of
   every paired read end, and the buffered fragments are re-read and marked
   against it — so an orphan is marked a duplicate of a pair regardless of

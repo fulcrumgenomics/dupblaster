@@ -262,7 +262,7 @@ pub enum SingleEndStrategy {
     /// Exact Picard fragment semantics via a deferred two-pass scheme:
     /// fully-mapped/unmapped pairs stream straight to the output while
     /// every mapped-orphan / single-end "fragment" block is buffered to a
-    /// temporary uncompressed BAM. After the pair pass completes, the pair
+    /// temporary BAM. After the pair pass completes, the pair
     /// table is *consumed* into a fragment table (via
     /// [`PairDupTable::drain_into_fragment_table`]) holding the 5' position
     /// of every paired read end; the buffered fragments are then re-read

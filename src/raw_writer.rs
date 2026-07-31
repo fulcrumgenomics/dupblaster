@@ -19,7 +19,8 @@
 //!
 //! All of the above is fed into a [`bgzf::Writer`] which compresses + CRCs
 //! it into BGZF blocks. The BGZF EOF marker is emitted automatically on
-//! `finish()`.
+//! `finish()`. Temporary output may additionally sit inside a zstd frame; see
+//! [`RawBamWriter::open_temp`].
 
 use std::io::{self, Write};
 use std::path::Path;
