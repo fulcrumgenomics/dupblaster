@@ -21,7 +21,7 @@ fn pair_order_swap_does_not_change_duplicate_decision() {
         .rec_simple("rB", 99, "chr1", 100, "50M", "=", 200, 150)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     assert_eq!(recs[0], ("rA".into(), 99));
     assert_eq!(recs[1], ("rA".into(), 147));
@@ -43,7 +43,7 @@ fn three_identical_pairs_only_first_kept_as_non_duplicate() {
         .rec_simple("r3", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     // r1 is the representative (no dup flag); r2 and r3 are duplicates.
     assert_eq!(recs[0], ("r1".into(), 99));
@@ -68,7 +68,7 @@ fn remove_dups_drops_duplicate_records_from_output() {
         .rec_simple("r3", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &["-r"]);
+    let recs = run_and_capture(&env.input, &bam_out, &["-r"]).flags;
 
     // Only the kept pair survives. No record carries FLAG_DUPLICATE
     // because the dup records have been removed.
@@ -94,7 +94,7 @@ fn cross_chromosome_pairs_at_distinct_positions_are_not_dups() {
         .rec_simple("rB", 145, "chr2", 400, "50M", "chr1", 300, 0)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     for (qname, flag) in &recs {
         assert_eq!(
@@ -119,7 +119,7 @@ fn cross_chromosome_pairs_at_identical_positions_are_dups() {
         .rec_simple("rB", 145, "chr2", 200, "50M", "chr1", 100, 0)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     assert_eq!(recs[0], ("rA".into(), 97));
     assert_eq!(recs[1], ("rA".into(), 145));

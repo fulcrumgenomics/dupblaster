@@ -36,7 +36,7 @@ fn ten_thousand_pairs_with_thousand_dups() {
     sb.write_to(&env.input);
 
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     let total = recs.len();
     let dup_count = recs.iter().filter(|(_, f)| f & FLAG_DUPLICATE != 0).count();

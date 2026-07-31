@@ -7,10 +7,10 @@
 //! the user.
 //!
 //! Long-form flags follow GNU style (`--kebab-case`) — diverging from C++
-//! samblaster's `--camelCase` convention. Short flags (`-i`, `-o`, `-r`, `-q`)
-//! match upstream. The SV-extraction flags from upstream (`-d`, `-s`, `-u`,
-//! `-a`, `-e`, `-M`, `--maxSplitCount`, …) have been intentionally dropped —
-//! see README for the rationale.
+//! samblaster's `--camelCase` convention. Short flags `-i`, `-o`, `-r`, and `-q`
+//! match upstream; `-l` and `-m` are dupblaster additions. The SV-extraction
+//! flags from upstream (`-d`, `-s`, `-u`, `-a`, `-e`, `-M`, `--maxSplitCount`,
+//! …) have been intentionally dropped — see README for the rationale.
 
 mod cigar;
 mod complexity;
@@ -59,6 +59,23 @@ use crate::tiles::{DEFAULT_SPILL_BUCKETS, TileSpiller};
 /// Crate-level build identifier shown in `--version` and the `@PG VN:` tag.
 const DUPBLASTER_BUILD: &str = env!("CARGO_PKG_VERSION");
 
+/// Upstream repository, shown in the `--help` banner and the startup banner.
+/// A macro rather than a `const` so the one definition can be `concat!`-ed into
+/// the compile-time `--help` text as well as printed at runtime.
+macro_rules! repo_url {
+    () => {
+        "https://github.com/fulcrumgenomics/dupblaster"
+    };
+}
+
+/// Attribution banner heading both `-h` and `--help`. It carries the pointer to
+/// the full documentation, so no individual option's help has to.
+macro_rules! help_banner {
+    () => {
+        concat!("dupblaster by Fulcrum Genomics\n", repo_url!(), "\n\n")
+    };
+}
+
 /// Global allocator — mimalloc outperforms the system allocator on the
 /// workload of many small, short-lived hash-set entries that dominate
 /// dupblaster's hot path.
@@ -73,39 +90,24 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// the code that consumes it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum SingleEndStrategyCli {
-    /// (Default) Strand-aware 5'-aligned coordinate key. A forward
-    /// orphan and a reverse orphan at the same 5' position are NOT
-    /// duplicates of each other. Picard's `fragSort` uses an equivalent
-    /// key.
+    /// Identical to the position key used in paired-end data.
     #[value(name = "strand-aware")]
     StrandAware,
-    /// Strand-aware keying plus a Picard-style cross-check: each end of
-    /// a fully-mapped pair is also registered in a fragment-level
-    /// table, so subsequent orphans / single-end reads at those
-    /// positions are marked as duplicates of the pair. Approximate
-    /// (order-sensitive in a streaming pass — an orphan that arrives
-    /// before its corresponding pair will pass through as non-dup).
-    /// Uses ~2x the dup-table memory of `strand-aware`.
-    #[value(name = "picard-approx")]
-    PicardApprox,
-    /// Exact Picard fragment semantics. Pairs stream straight through;
-    /// mapped-orphan / single-end reads are buffered to a temporary
-    /// uncompressed BAM, then re-processed after the pair pass against a
-    /// fragment table holding every paired read end — so "fragments never
-    /// beat pairs" holds exactly, independent of input order (unlike
-    /// `picard-approx`). Costs a temporary on-disk copy of the fragment
-    /// blocks and emits those fragments at the *end* of the output stream
-    /// (not in input order). Intended for paired data, where orphans are a
-    /// small fraction. See `--tmp-dir`.
+    /// Matches Picard MarkDuplicates exactly by buffering orphans to a temp BAM
+    /// (see `--tmp-dir`) and processing after pairs. Emits orphans at the end of
+    /// the output rather than in input order.
     #[value(name = "picard-exact")]
     PicardExact,
-    /// samblaster v0.1.23+ legacy behavior: leftmost-aligned coordinate
-    /// with the strand bit dropped, so a forward orphan and a reverse
-    /// orphan whose alignments share a leftmost position collide. NOT
-    /// recommended for short-read PE data — see the README's "single-end
-    /// strategies" section for the full discussion. Provided only for
-    /// byte-compatibility with samblaster output on long-read singleton
-    /// workflows.
+    /// Strand-aware, plus each end of a mapped pair is registered in a fragment
+    /// table so later orphans are marked as dups of pairs. Order-sensitive in one
+    /// pass, but an orphan preceding its pair passes as non-dup. Approximately
+    /// doubles memory usage.
+    #[value(name = "picard-approx")]
+    PicardApprox,
+    /// samblaster v0.1.23+ behavior: leftmost coordinate with the strand bit
+    /// dropped, so forward and reverse orphans sharing a leftmost position
+    /// collide. NOT recommended for short-read PE data; provided for
+    /// byte-compatibility on long-read singleton workflows.
     #[value(name = "samblaster-legacy")]
     SamblasterLegacy,
 }
@@ -117,8 +119,8 @@ impl SingleEndStrategyCli {
     fn to_strategy(self) -> SingleEndStrategy {
         match self {
             Self::StrandAware => SingleEndStrategy::StrandAware,
-            Self::PicardApprox => SingleEndStrategy::PicardApprox,
             Self::PicardExact => SingleEndStrategy::PicardExact,
+            Self::PicardApprox => SingleEndStrategy::PicardApprox,
             Self::SamblasterLegacy => SingleEndStrategy::SamblasterLegacy,
         }
     }
@@ -131,11 +133,10 @@ impl SingleEndStrategyCli {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum MethylationModeCli {
     /// Directional bisulfite / enzymatic-conversion prep (WGBS, EM-seq, TAPS).
-    /// Keys each pair in template (first-of-pair → second-of-pair) order
-    /// instead of coordinate-canonical order, so the two original strands
-    /// (OT/OB) of a fragment at one locus are kept distinct while same-strand
-    /// PCR copies still collapse. Correct for any prep that ligates adapters
-    /// before conversion. Does NOT handle non-directional / PBAT libraries.
+    /// Keys pairs in template order rather than coordinate-canonical order, so a
+    /// fragment's two original strands (OT/OB) at one locus stay distinct while
+    /// same-strand PCR copies still collapse. Does NOT handle non-directional /
+    /// PBAT.
     #[value(name = "directional")]
     Directional,
 }
@@ -158,183 +159,139 @@ fn parse_compression_level(s: &str) -> Result<CompressionLevel, String> {
     CompressionLevel::new(n).map_err(|e| format!("{e}"))
 }
 
-/// Short one-line `about` text shown by `--help`.
-const SHORT_ABOUT: &str = "Mark or remove duplicate reads in a query-grouped SAM/BAM file.";
-/// Full `about` text shown by `--help --help` (long form).
-const LONG_ABOUT: &str = "Mark or remove duplicates in a query-grouped SAM/BAM file.\n\
-Input must be query-grouped (all alignments for the same QNAME adjacent, \
-typically straight from the aligner); output is always BAM (uncompressed by \
-default — see --compression-level).";
+/// `--help` heading for the IO and indexing knobs whose defaults suit
+/// essentially every run — grouped away from the options a caller chooses
+/// between.
+const TUNING_HEADING: &str = "Advanced tuning (rarely needed)";
+
+/// Short `about` text shown by `-h`.
+const SHORT_ABOUT: &str =
+    concat!(help_banner!(), "Mark or remove duplicate reads in a query-grouped SAM/BAM file.");
+/// Full `about` text shown by `--help` (long form).
+const LONG_ABOUT: &str = concat!(
+    help_banner!(),
+    "Mark or remove duplicates in a query-grouped SAM/BAM file.\n\
+     Input must be query-grouped (same-QNAME alignments adjacent, as straight from \
+     an aligner); output is always BAM, uncompressed unless -l says otherwise.",
+);
 
 /// Parsed command-line arguments — see `--help` for per-flag descriptions.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "dupblaster", disable_version_flag = true, about = SHORT_ABOUT, long_about = LONG_ABOUT)]
 pub struct Args {
-    /// Input SAM/BAM file [stdin].
+    /// Input SAM/BAM file [default: stdin].
     #[arg(short = 'i', long = "input")]
     pub input: Option<PathBuf>,
 
-    /// Output BAM file [stdout]. The path must end in `.bam` — output is
-    /// always BAM, never SAM. Use `-` for stdout (no extension check).
+    /// Output BAM file [default: stdout]. Must end in `.bam`, or be `-` for
+    /// stdout.
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 
-    /// BGZF compression level for the output BAM (0-9 typical, up to 12
-    /// for libdeflate's strongest tier). Level 0 (the default) produces
-    /// "stored" BGZF blocks — same as `samtools view -u` and what most
-    /// dupblaster pipelines want, since the downstream sort recompresses.
-    /// Use a non-zero value when piping to a non-recompressing sink.
-    #[arg(long = "compression-level",
+    /// BGZF compression level for the output BAM, 0-12.
+    #[arg(short = 'l',
+          long = "compression-level",
           default_value = "0",
           value_parser = parse_compression_level)]
     pub compression_level: CompressionLevel,
 
-    /// Remove duplicate reads from the output instead of just flagging them.
+    /// Remove duplicates from the output instead of flagging them.
     #[arg(short = 'r', long = "remove-dups")]
     pub remove_dups: bool,
 
-    /// Add MC (mate CIGAR) and MQ (mate MAPQ) tags to all paired SAM output.
-    #[arg(long = "add-mate-tags")]
+    /// Add MC (mate CIGAR) and MQ (mate MAPQ) tags to all paired output.
+    #[arg(short = 'm', long = "add-mate-tags")]
     pub add_mate_tags: bool,
 
     /// Suppress abort on unmated alignments.
     #[arg(long = "ignore-unmated")]
     pub ignore_unmated: bool,
 
-    /// Maximum expected read length (in bp). Affects only the synthetic-
-    /// genome padding used by the duplicate-detection index and a "reads
-    /// longer than this" warning counter; no algorithmic effect at typical
-    /// short-read sizes. Bump if running on long reads. The upper bound
-    /// keeps `2 * max_read_length` (the per-contig padding) well within
-    /// `i32`, so the super-contig length arithmetic can't overflow.
-    #[arg(long = "max-read-length",
-          default_value_t = 1000,
-          value_parser = clap::value_parser!(i32).range(1..=10_000_000))]
-    pub max_read_length: i32,
-
-    /// Strategy for keying single-end / orphan reads in the dedup hash
-    /// table. The default (`strand-aware`) matches Picard's `fragSort`
-    /// behavior at the single-end-key level. See the README's "single-end
-    /// strategies" section for a discussion of the options.
+    /// How to key single-end / orphan reads.
     #[arg(long = "single-end-strategy",
           value_enum,
           default_value_t = SingleEndStrategyCli::StrandAware)]
     pub single_end_strategy: SingleEndStrategyCli,
 
-    /// Disable library-aware duplicate marking. By default, when the header
-    /// declares more than one library (distinct `@RG LB:` values), duplicates
-    /// are only called *within* a library — matching Picard MarkDuplicates, and
-    /// the `--stats` TSV reports one row per library. This flag forces a single
-    /// combined dedup table across all reads (samblaster's library-agnostic
-    /// behavior). No effect when the header has ≤1 library, where the two modes
-    /// are identical.
+    /// Identify duplicates across libraries instead of within libraries.
+    ///
+    /// Libraries are identified from `@RG LB:` entries, and by default
+    /// de-duplication is restricted to within a library, with statistics reported
+    /// per-library. Has no effect when the header declares ≤1 library.
     #[arg(long = "library-unaware")]
     pub library_unaware: bool,
 
-    /// Methylation-aware duplicate marking for bisulfite / enzymatic-conversion
-    /// data. Omitted by default (standard WGS keying, which stays
-    /// Picard-exact-capable). With `directional`, pairs are keyed in template
-    /// order so the two original strands (OT/OB) of a fragment at the same
-    /// locus are kept distinct — the correct behavior for WGBS / EM-seq / TAPS,
-    /// where collapsing them would discard independent methylation information.
-    /// Non-directional / PBAT libraries are not supported. See the README's
-    /// "methylation mode" section.
+    /// Methylation-aware pair keying for strand-aware libraries; off by default.
     #[arg(long = "methylation-mode", value_enum)]
     pub methylation_mode: Option<MethylationModeCli>,
 
-    /// Directory for dupblaster's temporary files. Defaults to the system temp
-    /// dir (`$TMPDIR`). Everything written here is deleted when dupblaster exits.
-    ///
-    /// The sequencing-vs-library duplicate split writes here on EVERY run, since
-    /// it is on by default: 16 bytes per both-ends-mapped pair, spilled to a
-    /// subdirectory and read back once the output BAM is closed. That is roughly
-    /// 5 GB for a 30x human genome and 50 GB at 300x, so point this at a volume
-    /// with room — or pass `--no-sequencing-dups` if you don't want the metric.
-    /// dupblaster does not try to predict how much it will need, since with a
-    /// streamed input it cannot know; a spill write that fails is a hard error.
-    ///
-    /// `--single-end-strategy picard-exact` also buffers orphan / single-end reads
-    /// to an uncompressed BAM here between its two passes, which is much smaller —
-    /// a fraction of paired data.
+    /// Directory for temporary files [default: the system temp dir, `$TMPDIR`].
     #[arg(long = "tmp-dir")]
     pub tmp_dir: Option<PathBuf>,
 
-    /// Write a per-library TSV summary of run metrics to PATH (one row per
-    /// library; a `.gz`/`.bgz` suffix gzip-compresses it). Schema: see the
-    /// README. Columns include sample, library, template/dup counts,
-    /// `frac_duplicates`, and a Picard-style `estimated_library_size`.
+    /// Write a TSV of per-library metrics to PATH.
     #[arg(long = "stats")]
     pub stats: Option<PathBuf>,
 
-    /// Sample name written to the `sample` column of `--stats` output. If
-    /// omitted, dupblaster comma-joins the unique `@RG SM:` values from the
-    /// input header (empty if none are present).
+    /// Sample name for the `sample` column of the TSV outputs. Defaults to the
+    /// unique `@RG SM:` values, comma-joined.
     #[arg(long = "sample")]
     pub sample: Option<String>,
 
-    /// Enable duplication-complexity metrics, writing four per-library QC files
-    /// with this path prefix — a TSV and a PDF plot for each of:
-    ///   `<PREFIX>.duplication-sampled.{tsv,pdf}`   — duplicate rate vs. sequencing
-    ///     depth, sampled every `--complexity-interval` templates; and
-    ///   `<PREFIX>.duplication-spectrum.{tsv,pdf}`  — the group-size histogram η_k:
-    ///     how many molecules were seen 1×, 2×, … (multi-library plots are faceted
-    ///     into the one PDF).
-    /// Each library is reported on one category: its paired subset (`pairs`) if it
-    /// has any pairs — the clean two-endpoint estimator — else its single-end
-    /// signatures (`single_end`) for a solely single-end library. Works under any
-    /// --single-end-strategy. Off by default; when unset, no extra work or memory
-    /// is spent.
+    /// Write per-library duplication-complexity QC with this path prefix. Off by
+    /// default, and costs nothing when unset.
+    ///
+    /// Writes `<PREFIX>.duplication-{sampled,spectrum}.{tsv,pdf}` containing
+    /// i) duplication stats sampled every `--complexity-interval`, and ii)
+    /// a family size histogram of how many molecules were seen how many times.
     #[arg(long = "complexity-metrics")]
     pub complexity_metrics: Option<PathBuf>,
 
-    /// Snapshot cadence for the `--complexity-metrics` ladder, in templates.
-    /// A row group is emitted every N templates per library (plus a final row
-    /// at the true total). Only meaningful with `--complexity-metrics`.
+    /// Snapshot cadence for the `--complexity-metrics` sampling, in templates.
     #[arg(long = "complexity-interval",
           default_value_t = 1_000_000,
           value_parser = clap::value_parser!(u64).range(1..))]
     pub complexity_interval: u64,
 
-    /// Don't split duplicates into sequencing and library components.
+    /// Don't split duplicates into sequencing ("optical") and library components.
     ///
-    /// The split is on by default. It classifies duplicates dupblaster has already
-    /// marked — it never changes which reads are marked — so turning it off only
-    /// blanks the `sequencing_duplicates` / `library_duplicates` columns and skips
-    /// the per-sequencing-unit table. See `--read-name-format`.
-    ///
-    /// Worth passing to reclaim the ~16 bytes of temp space per pair (about 5 GB
-    /// for a 30x human genome) or the ~7% wall time, of which only about a third
-    /// is felt by a downstream process in a pipeline.
+    /// Sequencing vs. library duplicate classification is on by default. Disabling
+    /// i) does not affect the output BAM, ii) reduces tmp file usage by
+    /// approximately 10-20MiB per 1m read pairs, iii) reduces CPU usage by 5-10%.
     #[arg(long = "no-sequencing-dups")]
     pub no_sequencing_dups: bool,
 
-    /// Read-name layout to take each template's sequencing unit and imaging tile
-    /// from, for the sequencing-vs-library duplicate split. Two duplicates imaged
-    /// on one tile are copies of one molecule; on different tiles they are
-    /// independent.
+    /// Read/query name format in the BAM file - used to extract flowcell/lane/tile
+    /// or equivalent for sequencing duplicate classification [default: illumina].
     ///
-    /// Use `illumina` for instrument:run:flowcell:lane:tile:x:y (CASAVA 1.8+,
-    /// bcl2fastq, BCL Convert); `element` for Element AVITI, which shares that
-    /// layout; or `regex:PATTERN`, a pattern with `(?<su>...)` and `(?<tile>...)`
-    /// capture groups, for platforms without a preset. [default: illumina]
+    /// `illumina`: instrument:run:flowcell:lane:tile:x:y (CASAVA 1.8+, bcl2fastq,
+    /// BCL Convert).
     ///
-    /// The layout is never guessed beyond that default, because mis-parsing one
-    /// would silently produce a confident wrong number. A read name the layout
-    /// cannot parse is a hard error: on a platform without a preset, either name
-    /// the layout with `regex:PATTERN` or pass `--no-sequencing-dups`.
+    /// `element`: matches the illumina format, for Element AVITI.
+    ///
+    /// `regex:PATTERN`: PATTERN needs a `(?<su>...)` capture group for the
+    /// sequencing unit (e.g. flowcell+lane) and a `(?<tile>...)` group for the
+    /// tile. The groups are found by name, not by position, and a pattern missing
+    /// either is rejected up front. Both tokens are compared as opaque text, so
+    /// they need no particular shape.
+    ///
+    /// `illumina` written as a regex, to adapt for another platform:
+    ///
+    /// `--read-name-format 'regex:^[^:]+:[^:]+:(?<su>[^:]+:[^:]+):(?<tile>[^:]+):[^:]+:[^:]+'`
+    ///
+    /// The unit spans two fields because a tile number only identifies a place
+    /// within one lane of one flowcell.
     #[arg(long = "read-name-format", value_name = "FORMAT")]
     pub read_name_format: Option<ReadNameFormat>,
 
-    /// Files the `--read-name-format` spill is split across. Clamped to the
-    /// process's open-file limit. Exposed only to measure the trade-off between
-    /// descriptor use and per-bucket sort size.
-    #[arg(long = "spill-buckets", hide = true, default_value_t = DEFAULT_SPILL_BUCKETS,
-          value_parser = clap::value_parser!(u32).range(1..))]
-    pub spill_buckets: u32,
-
-    /// Output fewer statistics.
+    /// Print only the duplicate summary on stderr, not the progress and
+    /// resource-usage lines.
     #[arg(short = 'q', long = "quiet")]
     pub quiet: bool,
+
+    /// Print the dupblaster version to stdout and exit.
+    #[arg(short = 'V', long = "version")]
+    pub show_version: bool,
 
     /// Minimum bins per side for the partitioned dedup hash table.
     /// Controls cell count via `cells ≈ (bins+1)² × 4`. Lower values
@@ -358,37 +315,40 @@ pub struct Args {
           value_parser = clap::value_parser!(u32).range(1..=8192))]
     pub min_bins: u32,
 
-    /// Verify BGZF CRC32 on input. Default: on for file input, off for stdin
-    /// (where the producer is assumed trusted, e.g. piped from bwa-mem).
-    /// Mutually exclusive with `--no-check-crc`.
-    #[arg(long = "check-crc", conflicts_with = "no_check_crc")]
+    /// Verify BGZF CRC32 on input. Defaults to on for files and off for stdin.
+    #[arg(long = "check-crc", conflicts_with = "no_check_crc", help_heading = TUNING_HEADING)]
     pub check_crc: bool,
 
-    /// Skip BGZF CRC32 verification on input regardless of source.
-    /// Mutually exclusive with `--check-crc`.
-    #[arg(long = "no-check-crc", conflicts_with = "check_crc")]
+    /// Skip BGZF CRC32 verification whatever the input source.
+    #[arg(long = "no-check-crc", conflicts_with = "check_crc", help_heading = TUNING_HEADING)]
     pub no_check_crc: bool,
 
-    /// Size (MB) of the user-space ring buffer between the input IO thread
-    /// and the worker. Big enough to absorb upstream bursts (bwa-mem dumps
-    /// ~250 MB of reads in tight bursts every few seconds). Default 16 MB
-    /// is plenty when the worker drain rate exceeds the producer's burst
-    /// rate — increase if your producer is unusually fast or bursty.
-    #[arg(long = "read-buffer-mb", default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    /// Size in MB of the ring buffer between the input IO thread and the worker.
+    ///
+    /// The default absorbs typical aligner bursts (bwa-mem emits ~250 MB every
+    /// few seconds); raise it for a faster or burstier producer.
+    #[arg(long = "read-buffer-mb", default_value_t = 16, help_heading = TUNING_HEADING,
+          value_parser = clap::value_parser!(u32).range(1..=4096))]
     pub read_buffer_mb: u32,
 
-    /// Size (MB) of the user-space ring buffer between the worker and the
-    /// output IO thread. Larger than the read buffer by default because
-    /// downstream sorters (samtools sort, mako) periodically pause input
-    /// for 1-3 s while flushing a sort chunk to disk. Default 64 MB
-    /// absorbs ~2-5 s of downstream blocking at typical bwa-mem-limited
-    /// output rates; bump to 256+ for slower downstreams.
-    #[arg(long = "write-buffer-mb", default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    /// Size in MB of the ring buffer between the worker and the output IO thread.
+    ///
+    /// Bigger than the read buffer because downstream sorters pause input for
+    /// 1-3 s while flushing a chunk to disk; raise it to 256+ for slower sinks.
+    #[arg(long = "write-buffer-mb", default_value_t = 64, help_heading = TUNING_HEADING,
+          value_parser = clap::value_parser!(u32).range(1..=4096))]
     pub write_buffer_mb: u32,
 
-    /// Print the dupblaster version to stdout and exit.
-    #[arg(short = 'V', long = "version")]
-    pub show_version: bool,
+    /// Maximum expected read length in bp; raise it for long reads.
+    ///
+    /// Sets the per-contig padding in the duplicate-detection index and the
+    /// threshold for the "reads longer than this" warning; no algorithmic effect
+    /// at short-read sizes.
+    // The 10 Mbp ceiling keeps `2 * max_read_length` (the per-contig padding)
+    // well inside `i32`, so the super-contig length arithmetic can't overflow.
+    #[arg(long = "max-read-length", default_value_t = 1000, help_heading = TUNING_HEADING,
+          value_parser = clap::value_parser!(i32).range(1..=10_000_000))]
+    pub max_read_length: i32,
 }
 
 impl Args {
@@ -492,7 +452,8 @@ fn run(args: Args) -> Result<ExitCode> {
     }
     let started = StartedRun::now();
     if !args.quiet {
-        eprintln!("dupblaster: Version {DUPBLASTER_BUILD}");
+        eprintln!("dupblaster: Version {DUPBLASTER_BUILD} by Fulcrum Genomics");
+        eprintln!("dupblaster: {}", repo_url!());
     }
 
     // Open input. The first byte tells us SAM vs BAM: 0x1f is the BGZF
@@ -585,7 +546,7 @@ fn run(args: Args) -> Result<ExitCode> {
         let spiller = TileSpiller::new(
             args.read_name_format.clone().unwrap_or_default(),
             processor.bin_count(),
-            args.spill_buckets,
+            DEFAULT_SPILL_BUCKETS,
             args.tmp_dir.as_deref(),
         )
         .context("preparing the sequencing-vs-library duplicate spill")?;
@@ -1171,7 +1132,6 @@ mod tests {
             complexity_interval: 1_000_000,
             no_sequencing_dups: true,
             read_name_format: None,
-            spill_buckets: DEFAULT_SPILL_BUCKETS,
             quiet: true,
             min_bins: 32,
             check_crc: false,
@@ -1298,5 +1258,17 @@ mod tests {
         // `pbat` is intentionally not implemented yet — it must be rejected at
         // parse time rather than silently treated as directional.
         assert!(Args::try_parse_from(["dupblaster", "--methylation-mode", "pbat"]).is_err());
+    }
+
+    #[test]
+    fn short_l_sets_compression_level() {
+        let args = Args::try_parse_from(["dupblaster", "-l", "6"]).unwrap();
+        assert_eq!(u8::from(args.compression_level), 6);
+    }
+
+    #[test]
+    fn short_m_sets_add_mate_tags() {
+        let args = Args::try_parse_from(["dupblaster", "-m"]).unwrap();
+        assert!(args.add_mate_tags);
     }
 }

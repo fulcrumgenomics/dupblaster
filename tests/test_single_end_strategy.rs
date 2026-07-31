@@ -33,11 +33,9 @@ fn samblaster_legacy_two_rev_orphans_same_leftmost_collide() {
         .rec_simple("rB", FLAG_REVERSE, "chr1", 100, "50M", "*", 0, 0)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(
-        &env.input,
-        &bam_out,
-        &["--single-end-strategy", "samblaster-legacy"],
-    );
+    let recs =
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "samblaster-legacy"])
+            .flags;
     assert_eq!(recs[0], ("rA".into(), FLAG_REVERSE));
     assert_eq!(recs[1], ("rB".into(), FLAG_REVERSE | FLAG_DUPLICATE));
 }
@@ -61,11 +59,9 @@ fn samblaster_legacy_fwd_and_rev_orphan_same_leftmost_collide() {
         .rec_simple("rB", FLAG_REVERSE, "chr1", 100, "50M", "*", 0, 0)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(
-        &env.input,
-        &bam_out,
-        &["--single-end-strategy", "samblaster-legacy"],
-    );
+    let recs =
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "samblaster-legacy"])
+            .flags;
     assert_eq!(recs[0], ("rA".into(), 0));
     // Under legacy, the rev orphan at the same leftmost as rA IS marked dup.
     assert_eq!(recs[1], ("rB".into(), FLAG_REVERSE | FLAG_DUPLICATE));
@@ -86,7 +82,7 @@ fn strand_aware_fwd_and_rev_orphan_same_leftmost_do_not_collide() {
     let bam_out = env._tmp.path().join("out.bam");
     // strand-aware is the default; pass it explicitly for documentation.
     let recs =
-        run_and_extract_flags(&env.input, &bam_out, &["--single-end-strategy", "strand-aware"]);
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "strand-aware"]).flags;
     for (qname, flag) in &recs {
         assert_eq!(
             flag & FLAG_DUPLICATE,
@@ -109,7 +105,7 @@ fn strand_aware_two_rev_orphans_same_position_collide() {
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
     let recs =
-        run_and_extract_flags(&env.input, &bam_out, &["--single-end-strategy", "strand-aware"]);
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "strand-aware"]).flags;
     assert_eq!(recs[0], ("rA".into(), FLAG_REVERSE));
     assert_eq!(recs[1], ("rB".into(), FLAG_REVERSE | FLAG_DUPLICATE));
 }
@@ -126,7 +122,7 @@ fn strand_aware_two_fwd_orphans_same_position_collide() {
         .rec_simple("rB", 0, "chr1", 100, "50M", "*", 0, 0)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
     assert_eq!(recs[0], ("rA".into(), 0));
     assert_eq!(recs[1], ("rB".into(), FLAG_DUPLICATE));
 }
@@ -158,7 +154,7 @@ fn picard_approx_pe_then_orphan_at_same_coord_marks_orphan_dup() {
     // Under picard-approx, the orphan rB collides with rA's R1 in the
     // fragment table → marked dup.
     let recs_picard =
-        run_and_extract_flags(&env.input, &bam_out, &["--single-end-strategy", "picard-approx"]);
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-approx"]).flags;
     assert_eq!(recs_picard[0], ("rA".into(), 99));
     assert_eq!(recs_picard[1], ("rA".into(), 147));
     assert_eq!(recs_picard[2], ("rB".into(), 73 | FLAG_DUPLICATE));
@@ -168,7 +164,7 @@ fn picard_approx_pe_then_orphan_at_same_coord_marks_orphan_dup() {
     // passes through as non-dup.
     let bam_out2 = env._tmp.path().join("out2.bam");
     let recs_strand =
-        run_and_extract_flags(&env.input, &bam_out2, &["--single-end-strategy", "strand-aware"]);
+        run_and_capture(&env.input, &bam_out2, &["--single-end-strategy", "strand-aware"]).flags;
     for (qname, flag) in &recs_strand {
         assert_eq!(
             flag & FLAG_DUPLICATE,
@@ -198,7 +194,7 @@ fn picard_approx_orphan_then_pe_at_same_coord_does_not_mark_orphan_dup() {
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
     let recs =
-        run_and_extract_flags(&env.input, &bam_out, &["--single-end-strategy", "picard-approx"]);
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-approx"]).flags;
     for (qname, flag) in &recs {
         assert_eq!(
             flag & FLAG_DUPLICATE,
@@ -223,7 +219,7 @@ fn picard_approx_still_marks_pair_pair_duplicates() {
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
     let recs =
-        run_and_extract_flags(&env.input, &bam_out, &["--single-end-strategy", "picard-approx"]);
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-approx"]).flags;
     assert_eq!(recs[0], ("rA".into(), 99));
     assert_eq!(recs[1], ("rA".into(), 147));
     assert_eq!(recs[2], ("rB".into(), 99 | FLAG_DUPLICATE));

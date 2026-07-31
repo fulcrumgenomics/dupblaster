@@ -37,7 +37,7 @@ fn duplicate_block_propagates_flag_to_supplementary() {
         )
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     // r1 records: no dup flag.
     assert_eq!(recs[0], ("r1".into(), 99));
@@ -62,7 +62,7 @@ fn duplicate_block_propagates_flag_to_secondary() {
         .rec_simple("r2", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     assert_eq!(recs[0], ("r1".into(), 99));
     assert_eq!(recs[1], ("r1".into(), 147));
@@ -98,7 +98,7 @@ fn duplicate_block_propagates_flag_to_both_secondary_and_supplementary() {
         .rec_simple("r2", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     assert_eq!(recs[0], ("r1".into(), 99));
     assert_eq!(recs[1], ("r1".into(), 147));
@@ -155,7 +155,7 @@ fn non_duplicate_block_with_secondary_and_supplementary_keeps_flags_unchanged() 
         )
         .write_to(&env.input);
     let bam_out = env._tmp.path().join("out.bam");
-    let recs = run_and_extract_flags(&env.input, &bam_out, &[]);
+    let recs = run_and_capture(&env.input, &bam_out, &[]).flags;
 
     // No record should have 0x400 set.
     for (qname, flag) in &recs {

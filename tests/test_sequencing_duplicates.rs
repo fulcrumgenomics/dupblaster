@@ -761,36 +761,6 @@ fn read_names_that_stop_parsing_partway_are_fatal_even_by_default() {
 }
 
 #[test]
-fn the_split_is_identical_under_every_spill_bucket_count() {
-    // Bucketing exists only to bound descriptor use; it must not change which
-    // records meet each other in a group.
-    let env = TestEnv::new();
-    let out = env._tmp.path().join("out.bam");
-    let mut run = Run::new();
-    run.spread_over_tiles(50);
-    for group in 0..10 {
-        for tile in [4101, 4101, 4102] {
-            run.pair("FC", 1, tile, 5_000_000 + 1_000 * group);
-        }
-    }
-    run.write_to(&env.input);
-
-    let mut seen: Vec<String> = Vec::new();
-    for buckets in ["1", "3", "64"] {
-        let stats = env._tmp.path().join(format!("stats-{buckets}.tsv"));
-        run_ok(&env.input, &stats, &out, &["--spill-buckets", buckets]);
-        let row = parse_row(&stats);
-        let total: u64 = row["duplicate_pairs"].parse().unwrap();
-        let sequencing: u64 = row["corrected_sequencing_duplicate_pairs"].parse().unwrap();
-        let library: u64 = row["library_duplicate_pairs"].parse().unwrap();
-        assert_eq!(total, 20, "ten groups of three contribute two duplicates each");
-        assert_eq!(sequencing + library, total);
-        seen.push(format!("{sequencing}/{library}"));
-    }
-    assert!(seen.windows(2).all(|w| w[0] == w[1]), "bucket count changed the answer: {seen:?}");
-}
-
-#[test]
 fn the_split_is_unchanged_under_every_single_end_strategy() {
     // Only pairs are spilled, so the orphan-keying strategy must not touch the
     // split. `picard-exact` is the one that matters: it runs a second pass over

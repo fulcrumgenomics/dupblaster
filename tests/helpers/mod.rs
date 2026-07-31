@@ -288,14 +288,20 @@ pub const FLAG_SECONDARY: u16 = 0x100;
 pub const FLAG_DUPLICATE: u16 = 0x400;
 pub const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
-/// Run the dupblaster binary on `sam_input` writing BAM to `bam_out`, then
-/// decode back and return `(qname, flag)` tuples in output order. Extra
-/// arguments to dupblaster are passed verbatim.
-pub fn run_and_extract_flags(
-    sam_input: &Path,
-    bam_out: &Path,
-    extra: &[&str],
-) -> Vec<(String, u16)> {
+/// What a successful dupblaster run produced, for tests to assert on.
+pub struct RunOutput {
+    /// `(QNAME, FLAG)` for every record of the output BAM, in output order.
+    pub flags: Vec<(String, u16)>,
+    /// Everything the run wrote to stderr: the startup banner, progress lines,
+    /// any warnings, and the duplicate summary.
+    pub stderr: String,
+}
+
+/// Run the dupblaster binary on `sam_input` writing BAM to `bam_out`, then decode
+/// it back into `(qname, flag)` tuples in output order, alongside the run's
+/// stderr. Extra arguments to dupblaster are passed verbatim. Panics if the run
+/// exits non-zero.
+pub fn run_and_capture(sam_input: &Path, bam_out: &Path, extra: &[&str]) -> RunOutput {
     let out = dupblaster()
         .args(["-i"])
         .arg(sam_input)
@@ -310,11 +316,12 @@ pub fn run_and_extract_flags(
         String::from_utf8_lossy(&out.stderr)
     );
     let (_header, records) = read_recs_and_header(bam_out);
-    records
+    let flags = records
         .iter()
         .map(|r| {
             let qname = r.name().map(|n| n.to_string()).unwrap_or_default();
             (qname, u16::from(r.flags()))
         })
-        .collect()
+        .collect();
+    RunOutput { flags, stderr: String::from_utf8_lossy(&out.stderr).into_owned() }
 }
