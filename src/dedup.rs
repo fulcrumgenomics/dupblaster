@@ -1134,17 +1134,16 @@ fn isqrt_ceil(n: u32) -> u32 {
 
 /// Write a CIGAR string (e.g. `"5S45M5S"`) into `out` from packed BAM ops.
 /// Avoids the per-op `String` allocation that `cigar_to_string()` performs.
+/// Op lengths render via `itoa` into a stack buffer rather than through
+/// `core::fmt`, whose per-op `Formatter` machinery measures at 1% of
+/// worker-thread samples on a mate-tagged run.
 fn write_cigar_text<I: IntoIterator<Item = u32>>(ops: I, out: &mut Vec<u8>) {
-    use std::io::Write as _;
+    let mut digits = itoa::Buffer::new();
     for word in ops {
-        let len = word >> 4;
         let code = (word & 0xf) as usize;
         // Same op-code table as `parse_cigar_ops` in sam_reader.rs.
         const OPS: [u8; 9] = *b"MIDNSHP=X";
-        // itoa would be faster, but `write!` into a Vec<u8> uses no
-        // intermediate heap allocation — the lookup-table-based digit
-        // path in core::fmt fills directly into our buffer.
-        let _ = write!(out, "{len}");
+        out.extend_from_slice(digits.format(word >> 4).as_bytes());
         // Valid BAM only uses op codes 0..=8; a higher code means corrupt
         // input. `'?'` keeps us from panicking on it, but flag it in debug.
         debug_assert!(code < OPS.len(), "invalid CIGAR op code {code}");
@@ -1285,5 +1284,50 @@ mod tests {
         let idx = LibraryIndex::from_header(&header, true);
         assert_eq!(idx.num_libs(), 1);
         assert_eq!(idx.name(0), ALL_READS);
+    }
+
+    /// Pack a CIGAR op the way BAM does: length in the high 28 bits, op code in
+    /// the low 4, indexing `MIDNSHP=X`.
+    fn op(len: u32, code: u32) -> u32 {
+        (len << 4) | code
+    }
+
+    fn cigar_text(ops: &[u32]) -> String {
+        let mut out = Vec::new();
+        write_cigar_text(ops.iter().copied(), &mut out);
+        String::from_utf8(out).expect("cigar text is ASCII")
+    }
+
+    #[test]
+    fn cigar_text_renders_a_single_digit_op_length() {
+        assert_eq!(cigar_text(&[op(5, 4)]), "5S");
+    }
+
+    #[test]
+    fn cigar_text_renders_multi_digit_op_lengths() {
+        assert_eq!(cigar_text(&[op(5, 4), op(145, 0), op(10, 4)]), "5S145M10S");
+    }
+
+    #[test]
+    fn cigar_text_renders_a_zero_op_length() {
+        assert_eq!(cigar_text(&[op(0, 0)]), "0M");
+    }
+
+    #[test]
+    fn cigar_text_renders_the_widest_op_length() {
+        // 28 bits of length is the most BAM can encode, and 10 digits is the
+        // widest the decimal buffer must hold.
+        assert_eq!(cigar_text(&[op(u32::MAX >> 4, 0)]), "268435455M");
+    }
+
+    #[test]
+    fn cigar_text_renders_every_op_code() {
+        let ops: Vec<u32> = (0..9).map(|code| op(1, code)).collect();
+        assert_eq!(cigar_text(&ops), "1M1I1D1N1S1H1P1=1X");
+    }
+
+    #[test]
+    fn cigar_text_renders_an_empty_op_list_as_star() {
+        assert_eq!(cigar_text(&[]), "*");
     }
 }
