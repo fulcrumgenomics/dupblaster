@@ -90,7 +90,7 @@ const UNKNOWN_LIBRARY: &str = "Unknown Library";
 
 /// Display name for the single combined bucket when library splitting is
 /// turned off (`--library-aware off`) over a header that *does* declare
-/// multiple libraries — signalling the merge to anyone reading `--stats`.
+/// multiple libraries — signalling the merge to anyone reading the run summary.
 const ALL_READS: &str = "All Reads";
 
 /// Maps each read to a dense library bucket, built once from the header.
@@ -119,7 +119,7 @@ impl LibraryIndex {
     pub fn from_header(header: &Header, disabled: bool) -> Self {
         // Collect (RG:ID, LB) pairs and the distinct LB set. BTreeSet keeps the
         // library order deterministic across runs (sorted by LB), so bucket
-        // indices — and therefore the `--stats` row order — are stable.
+        // indices — and therefore the run-summary row order — are stable.
         let mut rg_lb: Vec<(Vec<u8>, String)> = Vec::new();
         let mut distinct: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (id, map) in header.read_groups() {
@@ -163,7 +163,7 @@ impl LibraryIndex {
         self.names.len() as u32
     }
 
-    /// Display name for a bucket, for `--stats` rows.
+    /// Display name for a bucket, for run-summary rows.
     pub fn name(&self, idx: u32) -> &str {
         &self.names[idx as usize]
     }
@@ -233,7 +233,7 @@ impl LibraryStats {
     }
 }
 
-/// Run-wide statistics — printed at exit and exposed via `--stats` TSV.
+/// Run-wide statistics — printed at exit and exposed via the run-summary TSV.
 ///
 /// Template-level counters live in [`LibraryStats`], one per library bucket
 /// (just one in single-library mode). The run-wide totals consumed by the
@@ -246,7 +246,7 @@ pub struct Stats {
     /// clamped into its contig because its clipping extended more than
     /// `--max-read-length` past a contig edge. A processing artifact (not a
     /// library metric): counted once per template, surfaced via stderr/log
-    /// and the exit code, never written to `--stats`. Run-wide (not split by
+    /// and the exit code, never written to the metrics files. Run-wide (not split by
     /// library) because it's a property of the run configuration.
     pub clamped_template_count: u64,
 }
@@ -394,7 +394,7 @@ impl RecordProcessor {
     }
 
     /// The per-library occurrence counters, if `--duplication-spectrum` was on.
-    /// Indexed by library bucket, parallel to the `--stats` library rows.
+    /// Indexed by library bucket, parallel to the run-summary library rows.
     pub fn counts(&self) -> Option<&[CountsMap]> {
         self.counts.as_deref()
     }

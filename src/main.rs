@@ -1,9 +1,9 @@
 //! dupblaster — the command-line application.
 //!
 //! This binary is the whole tool: CLI parsing ([`Args`]), end-to-end run
-//! orchestration ([`run`]), and the end-of-run resource-usage footer. The
-//! reusable engine and IO live in `dupblaster_lib` (`dedup`, `sig`, the
-//! readers/writers, `metrics`, …) — this file wires them together and talks to
+//! orchestration ([`run`]), and the end-of-run resource-usage footer. The engine
+//! and IO live in sibling modules of this same crate ([`dedup`], [`sig`], the
+//! readers/writers, [`metrics`], …) — this file wires them together and talks to
 //! the user.
 //!
 //! Long-form flags follow GNU style (`--kebab-case`) — diverging from C++
@@ -241,8 +241,9 @@ pub struct Args {
     /// `.sequencing-units.tsv` — one row per flowcell-and-lane, unless
     /// `--sequencing-duplicate-detection off`.
     ///
-    /// `.duplication-sampled.{tsv,pdf}` and `.duplication-spectrum.{tsv,pdf}` —
-    /// unless `--duplication-spectrum` is off.
+    /// `.duplication-sampled.{tsv,pdf}` — the duplication ladder, always.
+    ///
+    /// `.duplication-spectrum.{tsv,pdf}` — only with `--duplication-spectrum on`.
     #[arg(long = "metrics-prefix", value_name = "PREFIX")]
     pub metrics_prefix: PathBuf,
 
@@ -1100,7 +1101,7 @@ fn command_line_for_pg() -> String {
 /// Print the end-of-run duplicate summary to stderr, including the coordinate-
 /// clamping warning when any templates were affected.
 fn print_run_stats(stats: &Stats, args: &Args) {
-    // The stderr summary is run-wide; per-library breakdowns go to `--stats`.
+    // The stderr summary is run-wide; per-library breakdowns go to the metrics files.
     let totals = stats.totals();
     if totals.id_count == 0 {
         eprintln!("dupblaster: No reads processed.");

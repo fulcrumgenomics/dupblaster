@@ -256,18 +256,18 @@ DuckDB.
 | `duplicate_templates` | Templates marked as duplicates of another template. |
 | `frac_duplicates` | Picard-style read-level fraction: `(orphan_dups + 2*pair_dups) / (orphan_reads + 2*pair_reads)`. |
 | `mapped_pairs` | Templates with both reads mapped. |
+| `unmapped_pairs` | Templates with both reads unmapped. |
 | `duplicate_pairs` | Mapped pairs marked duplicate. |
+| `raw_sequencing_duplicate_pairs` | Duplicate pairs made on the flowcell, uncorrected: `Σ (tile members − 1)` over duplicate groups. The per-sequencing-unit table sums to exactly this. Empty under `--sequencing-duplicate-detection off`, or when a library has no pairs or sits on a single tile. |
+| `corrected_sequencing_duplicate_pairs` | The same count corrected for tiles that collide by chance. **This is the figure to use.** |
+| `library_duplicate_pairs` | The residual `duplicate_pairs − corrected_sequencing_duplicate_pairs`; the two sum exactly. Blank under the same conditions as the two columns above, since a residual of an unknown is unknown. |
+| `frac_duplicate_pairs` | `duplicate_pairs / mapped_pairs` — the pair-level rate, as distinct from the read-level `frac_duplicates`. |
+| `frac_sequencing_duplicate_pairs` | `corrected_sequencing_duplicate_pairs / mapped_pairs` — the same denominator as `frac_duplicate_pairs`, so the two are directly comparable and one is a component of the other. For "what share of my duplication was optical", take the ratio of the two. |
+| `estimated_library_size` | Lander-Waterman estimate of the library's distinct molecules, with sequencing duplicates removed from the observed total (Picard's `ESTIMATED_LIBRARY_SIZE` convention). Empty when not estimable — including the degenerate case where *every* duplicate is a sequencing duplicate, which leaves no resampling to infer from. |
 | `mapped_orphans` | Templates with exactly one read mapped. |
 | `duplicate_orphans` | Mapped orphans marked duplicate. |
 | `unmapped_orphans` | Templates with one read present and unmapped (no mapped mate). |
-| `unmapped_pairs` | Templates with both reads unmapped. |
 | `unmated_templates` | Templates with a stray half (skipped unless `--ignore-unmated`). |
-| `estimated_library_size` | Lander-Waterman estimate of the library's distinct molecules, with sequencing duplicates removed from the observed total (Picard's `ESTIMATED_LIBRARY_SIZE` convention). Empty when not estimable — including the degenerate case where *every* duplicate is a sequencing duplicate, which leaves no resampling to infer from. |
-| `raw_sequencing_duplicate_pairs` | Duplicate pairs made on the flowcell, uncorrected: `Σ (tile members − 1)` over duplicate groups. The per-sequencing-unit table sums to exactly this. Empty under `--sequencing-duplicate-detection off`, or when a library has no pairs or sits on a single tile. |
-| `corrected_sequencing_duplicate_pairs` | The same count corrected for tiles that collide by chance. **This is the figure to use.** |
-| `library_duplicate_pairs` | The residual `duplicate_pairs − corrected_sequencing_duplicates`; the two sum exactly. |
-| `frac_duplicate_pairs` | `duplicate_pairs / mapped_pairs` — the pair-level rate, as distinct from the read-level `frac_duplicates`. |
-| `frac_sequencing_duplicate_pairs` | `corrected_sequencing_duplicates / duplicate_pairs`. |
 
 ## Sequencing vs. library duplicates (`--sequencing-duplicate-detection`)
 
@@ -557,7 +557,7 @@ Four strategies are supported:
   Matches Picard's fragment *dup counts / partitions* exactly; it does not
   attempt to reproduce Picard's choice of *which* read in a duplicate set
   is the representative.
-* **`samblaster-legacy`**. samblaster's post-v0.1.25 (Feb 2020)
+* **`samblaster-legacy`**. samblaster's v0.1.23+ (March 2020)
   behavior: leftmost-aligned reference coordinate with the strand
   bit dropped, so a forward orphan and a reverse orphan at the same
   leftmost-aligned position collide. Produces false positives on
