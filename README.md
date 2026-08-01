@@ -205,11 +205,7 @@ won't recompress.
 
 ## CLI summary
 
-Feature toggles take `on` or `off` (`--sequencing-duplicate-detection off`), rather than coming in
-`--thing` / `--no-thing` pairs. The spelling then says what you meant regardless of
-which release you are on, and a changed default never renames a flag. The value is
-optional — a bare `--sequencing-duplicate-detection` means `on` — and `true`/`false`, `yes`/`no`
-and `1`/`0` are accepted too.
+Three flags whose default may reasonably change — `--library-aware`, `--duplication-spectrum` and `--sequencing-duplicate-detection` — take `on` or `off` rather than coming in `--thing` / `--no-thing` pairs, so the spelling says what you meant regardless of which release you are on and a changed default never renames a flag. Their value is optional, so a bare `--sequencing-duplicate-detection` means `on`, and `true`/`false`, `yes`/`no` and `1`/`0` are accepted too. The rest are ordinary presence flags: `--remove-dups`, `--add-mate-tags` and `--ignore-unmated` take no value, and `--check-crc` / `--no-check-crc` remain a pair because the default depends on whether input is a file or stdin.
 
 The most common flags:
 
@@ -225,12 +221,12 @@ The most common flags:
 | `--methylation-mode <MODE>` | Methylation-aware keying for bisulfite / enzymatic-conversion data. Off by default. `directional` keeps the two original strands (OT/OB) of a fragment distinct. See [§ Methylation mode](#methylation-mode). |
 | `--tmp-dir <DIR>` | Directory for dupblaster's temporary files, deleted on exit (default: `$TMPDIR`). **The sequencing-vs-library duplicate split writes here on every run** — 16 bytes per pair, so ~5 GB for a 30x human genome and ~50 GB at 300x. Point this at a volume with room, or pass `--sequencing-duplicate-detection off`. Also used by `--single-end-strategy picard-exact` for its orphan buffer. |
 | `--tmp-compression-level <LEVEL>` | Compress dupblaster's temporary files with zstd, `-7` to `9` (default: uncompressed) — both the duplicate-split spill and the `picard-exact` orphan buffer. On a whole-genome run, levels `-5` to `1` cut the spill by roughly a third to a half for a few percent more runtime; the orphan buffer compresses better still. The saving is smaller on smaller inputs, and memory grows with the level (see below). Negative levels are zstd's fast tiers. Storage only — duplicate flags and metrics are identical either way. |
-| `--library-aware <on\|off>` | Call duplicates within each library. Default `on`; `off` pools every read into one dedup table (samblaster behavior). No effect when the header has ≤1 library. See [§ Library awareness](#library-awareness). |
+| `--library-aware` | Takes `on` or `off`, default `on`: call duplicates within each library. `off` pools every read into one dedup table (samblaster behavior). No effect when the header has ≤1 library. See [§ Library awareness](#library-awareness). |
 | `--metrics-prefix <PREFIX>` | **Required.** Prefix every metrics file derives from: `.duplicate-metrics.tsv`, `.sequencing-units.tsv`, `.duplication-sampled.{tsv,pdf}`, `.duplication-spectrum.{tsv,pdf}`. |
 | `--sample <NAME>` | Override the `sample` column in every metrics file. |
-| `--duplication-spectrum <on\|off>` | Add the group-size histogram (η_k). Default `off` — it is the one metric with a real memory cost, measured at +1.0 GB peak RSS. See [§ Complexity metrics](#complexity-metrics). |
+| `--duplication-spectrum` | Takes `on` or `off`, default `off`: add the group-size histogram (η_k). Off because it is the one metric with a real memory cost, measured at +1.0 GB peak RSS. See [§ Complexity metrics](#complexity-metrics). |
 | `--sampling-interval <N>` | Snapshot cadence (in templates) for the duplication-sampled ladder. Default 1,000,000. |
-| `--sequencing-duplicate-detection <on\|off>` | Split duplicates into sequencing (on-flowcell) and library components. Default `on`; it classifies duplicates rather than changing which reads are marked. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---sequencing-duplicate-detection). |
+| `--sequencing-duplicate-detection` | Takes `on` or `off`, default `on`: split duplicates into sequencing (on-flowcell) and library components. It classifies duplicates rather than changing which reads are marked. See [§ Sequencing vs. library duplicates](#sequencing-vs-library-duplicates---sequencing-duplicate-detection). |
 | `--read-name-format <FORMAT>` | Read-name layout the split takes the sequencing unit and tile from: `illumina` (default), `element`, or `regex:PATTERN`. A name the layout cannot parse is a hard error. |
 
 Run `dupblaster --help` for the full list. The IO ring buffers
@@ -263,7 +259,7 @@ DuckDB.
 | `library_duplicate_pairs` | The residual `duplicate_pairs − corrected_sequencing_duplicate_pairs`; the two sum exactly. Blank under the same conditions as the two columns above, since a residual of an unknown is unknown. |
 | `frac_duplicate_pairs` | `duplicate_pairs / mapped_pairs` — the pair-level rate, as distinct from the read-level `frac_duplicates`. |
 | `frac_sequencing_duplicate_pairs` | `corrected_sequencing_duplicate_pairs / mapped_pairs` — the same denominator as `frac_duplicate_pairs`, so the two are directly comparable and one is a component of the other. For "what share of my duplication was optical", take the ratio of the two. |
-| `estimated_library_size` | Lander-Waterman estimate of the library's distinct molecules, with sequencing duplicates removed from the observed total (Picard's `ESTIMATED_LIBRARY_SIZE` convention). Empty when not estimable — including the degenerate case where *every* duplicate is a sequencing duplicate, which leaves no resampling to infer from. |
+| `estimated_library_size` | Lander-Waterman estimate of the library's distinct molecules, with sequencing duplicates removed from the observed total (Picard's `ESTIMATED_LIBRARY_SIZE` convention). Under `--sequencing-duplicate-detection off`, or wherever the split is not estimable, it falls back to the uncorrected estimate rather than blanking. Empty only when there is nothing to estimate from: no pairs, no duplicate pairs, or the degenerate case where *every* duplicate is a sequencing duplicate, which leaves the observed total equal to the unique count. |
 | `mapped_orphans` | Templates with exactly one read mapped. |
 | `duplicate_orphans` | Mapped orphans marked duplicate. |
 | `unmapped_orphans` | Templates with one read present and unmapped (no mapped mate). |
@@ -315,7 +311,7 @@ Two things to know before reaching for a high level. The spill is split across 6
 
 Those two account for the whole 25.9 s above.
 
-In `bwa-mem … \| dupblaster … \| samtools sort`, the sort sees end-of-input as soon as the main pass ends and proceeds while dupblaster is still decomposing. The overhead the pipeline actually feels is the first row alone — about **+2.5%**.
+In `bwa-mem … | dupblaster … | samtools sort`, the sort sees end-of-input as soon as the main pass ends and proceeds while dupblaster is still decomposing. The overhead the pipeline actually feels is the first row alone — about **+2.5%**.
 
 ### How it works
 
