@@ -892,7 +892,6 @@ fn for_each_block(
         pool.push(RawRecord::new());
     }
     let mut block_len: usize = 0;
-    let mut current_qname: Vec<u8> = Vec::new();
     loop {
         if pool.len() == block_len {
             pool.push(RawRecord::new());
@@ -902,21 +901,15 @@ fn for_each_block(
         if !got {
             break;
         }
-        let new_qname_differs =
-            block_len > 0 && pool[read_idx].read_name() != current_qname.as_slice();
-        if new_qname_differs {
+        // The block's own first record holds the QNAME to compare against, so
+        // there is no separate copy of it to keep in step.
+        if block_len > 0 && pool[read_idx].read_name() != pool[0].read_name() {
             on_block(&mut pool[..block_len])?;
-            if read_idx != 0 {
-                pool.swap(0, read_idx);
-            }
+            // `read_idx == block_len > 0`, so this always moves the record just
+            // read into slot 0, where it becomes the new block's QNAME anchor.
+            pool.swap(0, read_idx);
             block_len = 1;
-            current_qname.clear();
-            current_qname.extend_from_slice(pool[0].read_name());
         } else {
-            if block_len == 0 {
-                current_qname.clear();
-                current_qname.extend_from_slice(pool[0].read_name());
-            }
             block_len += 1;
         }
     }
