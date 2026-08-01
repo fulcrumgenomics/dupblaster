@@ -170,7 +170,7 @@ fn duplicates_on_one_tile_are_reported_as_sequencing_duplicates() {
 /// spill would have to corrupt it consistently to still produce these numbers.
 fn split_with_flags(extra: &[&str]) -> HashMap<String, String> {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     let mut input = Run::new();
     input.spread_over_tiles(200);
@@ -182,7 +182,7 @@ fn split_with_flags(extra: &[&str]) -> HashMap<String, String> {
     }
     input.write_to(&env.input);
     run_ok(&env.input, &stats, &out, extra);
-    parse_row(&stats)
+    parse_row(&summary(&stats))
 }
 
 /// The metrics the mixed input must report at any compression level.
@@ -217,7 +217,7 @@ fn the_highest_accepted_level_reports_the_expected_split() {
 #[test]
 fn an_uncompressed_run_reports_no_on_disk_size() {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     let mut input = Run::new();
     input.spread_over_tiles(200);
@@ -239,7 +239,7 @@ fn an_uncompressed_run_reports_no_on_disk_size() {
 #[test]
 fn a_compressed_run_reports_the_on_disk_size_and_a_ratio() {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     let mut input = Run::new();
     input.spread_over_tiles(200);
@@ -258,7 +258,7 @@ fn a_compressed_run_reports_the_on_disk_size_and_a_ratio() {
 #[test]
 fn a_compression_level_above_the_accepted_range_is_rejected() {
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     let mut input = Run::new();
     input.pair("FC", 1, 1101, 500_000);
@@ -275,7 +275,7 @@ fn a_compression_level_of_zero_is_rejected_as_ambiguous() {
     // zstd reads 0 as "the default level" while `--compression-level 0` in the same
     // CLI means "stored", so 0 here would silently turn compression on.
     let env = TestEnv::new();
-    let stats = env._tmp.path().join("stats.tsv");
+    let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
     let mut input = Run::new();
     input.pair("FC", 1, 1101, 500_000);
@@ -295,7 +295,7 @@ fn a_compression_level_of_zero_is_rejected_as_ambiguous() {
 fn compressing_both_temp_files_at_once_reports_the_same_numbers() {
     fn run_both(extra: &[&str]) -> HashMap<String, String> {
         let env = TestEnv::new();
-        let stats = env._tmp.path().join("stats.tsv");
+        let stats = env._tmp.path().join("metrics");
         let out = env._tmp.path().join("out.bam");
         let mut input = Run::new();
         input.spread_over_tiles(200);
@@ -314,7 +314,7 @@ fn compressing_both_temp_files_at_once_reports_the_same_numbers() {
         let mut args = vec!["--single-end-strategy", "picard-exact"];
         args.extend_from_slice(extra);
         run_ok(&env.input, &stats, &out, &args);
-        parse_row(&stats)
+        parse_row(&summary(&stats))
     }
 
     let plain = run_both(&[]);
