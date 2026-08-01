@@ -74,7 +74,7 @@ pub struct ProcessorOptions {
     /// affected — the single-end/orphan path is already strand-aware, so it
     /// keeps OT/OB orphans separate in every mode.
     pub methylation_mode: Option<MethylationMode>,
-    /// Collect per-signature occurrence counts for the `--complexity-metrics`
+    /// Collect per-signature occurrence counts for the `--duplication-spectrum`
     /// group-size histogram. When `false` (the default) no counting structure
     /// is allocated and the dedup path is unchanged. Works under every
     /// single-end strategy — a library's single-end counts are only ever
@@ -335,14 +335,14 @@ pub struct RecordProcessor {
     /// `add_mate_tags` writes mate CIGAR into here so we don't allocate a
     /// fresh `String` per pair. Reused across blocks.
     mate_cigar_scratch: Vec<u8>,
-    /// Per-library occurrence counters for the `--complexity-metrics` histogram,
+    /// Per-library occurrence counters for the `--duplication-spectrum` histogram,
     /// `Some` only when `opts.collect_counts` is set. Indexed by library bucket,
     /// parallel to `dups`. `None` (the default) means no counting and no extra
     /// memory.
     counts: Option<Vec<CountsMap>>,
     /// Spills every pair's `(signature, tile)` so duplicates can be split into
     /// sequencing and library components after the output is closed. `Some` only
-    /// unless `--sequencing-dups off` was given; attached by
+    /// unless `--sequencing-duplicate-detection off` was given; attached by
     /// [`Self::attach_tile_spiller`] because it needs `bin_count`, which is not
     /// known until the bins are built.
     tiles: Option<TileSpiller>,
@@ -393,7 +393,7 @@ impl RecordProcessor {
         }
     }
 
-    /// The per-library occurrence counters, if `--complexity-metrics` was on.
+    /// The per-library occurrence counters, if `--duplication-spectrum` was on.
     /// Indexed by library bucket, parallel to the `--stats` library rows.
     pub fn counts(&self) -> Option<&[CountsMap]> {
         self.counts.as_deref()
@@ -468,7 +468,7 @@ impl RecordProcessor {
     /// Process one QNAME block: resolve its library, mark/flag duplicates,
     /// update `stats`, and write output. Returns the library bucket the block
     /// was attributed to, so a caller tracking per-library metrics (e.g. the
-    /// `--complexity-metrics` ladder) knows which library's counters advanced.
+    /// `--duplication-sampled` ladder) knows which library's counters advanced.
     pub fn process_block(
         &mut self,
         block: &mut [RawRecord],
@@ -695,7 +695,7 @@ impl RecordProcessor {
             let _ =
                 frag.check_or_insert(s_derived.bin_num, s_derived.bin_pos, s_derived.is_reverse);
         }
-        // Complexity-metrics counting (only when `--complexity-metrics` is on).
+        // Spectrum counting (only when `--duplication-spectrum` is on).
         // Reuses the same `slot` fed to `insert_pair`, so a counted signature
         // matches the dedup signature exactly.
         if let Some(counts) = self.counts.as_mut() {
@@ -745,7 +745,7 @@ impl RecordProcessor {
                 self.pair_table(lib).insert_orphan(slot)
             }
         };
-        // Complexity-metrics counting (only when `--complexity-metrics` is on).
+        // Spectrum counting (only when `--duplication-spectrum` is on).
         // `observe_single_end` runs under every strategy; single-end counts stay
         // faithful because `CountsMap` only ever *reports* them for a library
         // with no pairs, whose fragment keyspace therefore holds no pair-ends —

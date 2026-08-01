@@ -1,6 +1,6 @@
 //! A struct-of-arrays (SoA) SwissTable that tracks a per-key occurrence count.
 //!
-//! This is the storage cell of the `--complexity-metrics` count side-table (see
+//! This is the storage cell of the `--duplication-spectrum` count side-table (see
 //! [`crate::counts`]): a set of signatures, each with a `u16` count, used to
 //! build the group-size histogram (η_k). It only ever holds signatures seen
 //! **≥2×** — singletons are recovered by subtraction — so it stays small.

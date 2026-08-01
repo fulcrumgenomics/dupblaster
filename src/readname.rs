@@ -82,7 +82,7 @@ impl Default for ReadNameFormat {
     /// [`Self::ColonDelimited`] — the layout of every Illumina instrument since
     /// CASAVA 1.8, and of Element AVITI, so the overwhelmingly common case needs
     /// no flag. A read name this layout cannot parse fails the run: see
-    /// [`Self::parse_error`], and `--sequencing-dups off` for the way out.
+    /// [`Self::parse_error`], and `--sequencing-duplicate-detection off` for the way out.
     fn default() -> Self {
         Self::ColonDelimited
     }

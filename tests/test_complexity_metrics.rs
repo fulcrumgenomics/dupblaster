@@ -30,7 +30,7 @@ fn run_and_read(
         .arg(&out)
         .args(["--metrics-prefix"])
         .arg(prefix)
-        .args(["--sequencing-dups", "off"])
+        .args(["--sequencing-duplicate-detection", "off"])
         .args(extra)
         .output()
         .expect("dupblaster ran");
@@ -48,8 +48,11 @@ fn run_ladder(input: &Path, prefix: &Path, extra: &[&str]) -> Vec<HashMap<String
     run_and_read(input, prefix, ".duplication-sampled.tsv", extra)
 }
 
+/// The spectrum is opt-in, so every histogram test switches it on explicitly.
 fn run_histogram(input: &Path, prefix: &Path, extra: &[&str]) -> Vec<HashMap<String, String>> {
-    run_and_read(input, prefix, ".duplication-spectrum.tsv", extra)
+    let mut args = vec!["--duplication-spectrum", "on"];
+    args.extend_from_slice(extra);
+    run_and_read(input, prefix, ".duplication-spectrum.tsv", &args)
 }
 
 /// Parse a multi-row TSV into a vector of column→value maps.
@@ -213,7 +216,7 @@ fn ladder_pairs_curve_snapshots_at_intervals() {
         );
     }
     b.write_to(&env.input);
-    let rows = run_ladder(&env.input, &prefix, &["--complexity-interval", "2"]);
+    let rows = run_ladder(&env.input, &prefix, &["--sampling-interval", "2"]);
     let lib = rows[0]["library"].clone();
     let totals: Vec<&str> = rows
         .iter()
@@ -279,10 +282,10 @@ fn writes_pdf_plots_for_both_metrics() {
     let env = TestEnv::new();
     let prefix = env._tmp.path().join("cm");
     write_pe_triple_plus_two_singletons(&env.input);
-    // `run_ladder` runs the binary, which writes all four outputs; then check
-    // the two PDFs exist and are real PDFs (a single-library run, so the
-    // histogram plot is the unqualified `<prefix>.duplication-spectrum.pdf`).
-    let _ = run_ladder(&env.input, &prefix, &[]);
+    // One run with both metrics on writes all four outputs; then check the two
+    // PDFs exist and are real PDFs (a single-library run, so the histogram plot is
+    // the unqualified `<prefix>.duplication-spectrum.pdf`).
+    let _ = run_ladder(&env.input, &prefix, &["--duplication-spectrum", "on"]);
     for suffix in [".duplication-sampled.pdf", ".duplication-spectrum.pdf"] {
         let mut p = prefix.as_os_str().to_owned();
         p.push(suffix);

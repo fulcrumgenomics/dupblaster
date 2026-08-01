@@ -187,7 +187,7 @@ fn stats_tsv_has_all_expected_columns() {
     assert_eq!(cols, expected);
 }
 
-/// Under `--sequencing-dups off` the decomposition columns are present but empty,
+/// Under `--sequencing-duplicate-detection off` the decomposition columns are present but empty,
 /// so a consumer sees a stable schema and can tell "not measured" from "zero".
 #[test]
 fn decomposition_columns_are_blank_when_the_split_is_disabled() {
@@ -199,7 +199,7 @@ fn decomposition_columns_are_blank_when_the_split_is_disabled() {
         .rec_simple("r1", 99, "chr1", 100, "50M", "=", 200, 150)
         .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
-    // The shared helper already passes --sequencing-dups off.
+    // The shared helper already passes --sequencing-duplicate-detection off.
     run_with_stats(&env.input, &stats, &out, &[]);
     let text = std::fs::read_to_string(summary(&stats)).unwrap();
     let mut lines = text.lines();

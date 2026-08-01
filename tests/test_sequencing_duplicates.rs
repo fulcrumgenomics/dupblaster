@@ -521,7 +521,7 @@ fn removing_sequencing_duplicates_raises_the_library_size_estimate() {
     let corrected_prefix = env._tmp.path().join("on");
     run_ok(&env.input, &corrected_prefix, &out, &[]);
     let plain_prefix = env._tmp.path().join("off");
-    run_ok(&env.input, &plain_prefix, &out, &["--sequencing-dups", "off"]);
+    run_ok(&env.input, &plain_prefix, &out, &["--sequencing-duplicate-detection", "off"]);
 
     let corrected: u64 =
         parse_row(&summary(&corrected_prefix))["estimated_library_size"].parse().unwrap();
@@ -849,7 +849,7 @@ fn the_split_runs_by_default_with_no_flags_at_all() {
 }
 
 #[test]
-fn sequencing_dups_off_turns_the_split_off() {
+fn sequencing_duplicate_detection_off_turns_the_split_off() {
     let env = TestEnv::new();
     let stats = env._tmp.path().join("metrics");
     let out = env._tmp.path().join("out.bam");
@@ -859,7 +859,8 @@ fn sequencing_dups_off_turns_the_split_off() {
         run.pair("FC", 1, 1101, 500_000);
     }
     run.write_to(&env.input);
-    let result = run_default(&env.input, &stats, &out, &["--sequencing-dups", "off"]);
+    let result =
+        run_default(&env.input, &stats, &out, &["--sequencing-duplicate-detection", "off"]);
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
 
     let row = parse_row(&summary(&stats));
@@ -888,7 +889,10 @@ fn unparseable_read_names_fail_the_run_even_with_no_flags() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("SRR1234567.1"), "should quote the name: {stderr}");
     assert!(stderr.contains("--read-name-format"), "should offer the layout flag: {stderr}");
-    assert!(stderr.contains("--sequencing-dups off"), "should offer the opt-out: {stderr}");
+    assert!(
+        stderr.contains("--sequencing-duplicate-detection off"),
+        "should offer the opt-out: {stderr}"
+    );
 }
 
 #[test]
@@ -902,7 +906,8 @@ fn the_split_can_be_skipped_on_a_platform_without_a_preset() {
         .rec_simple("F350009384L1C001R0010000000", 99, "chr1", 100, "50M", "=", 200, 150)
         .rec_simple("F350009384L1C001R0010000000", 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
-    let result = run_default(&env.input, &stats, &out, &["--sequencing-dups", "off"]);
+    let result =
+        run_default(&env.input, &stats, &out, &["--sequencing-duplicate-detection", "off"]);
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     assert_eq!(parse_row(&summary(&stats))["duplicate_pairs"], "0");
 }

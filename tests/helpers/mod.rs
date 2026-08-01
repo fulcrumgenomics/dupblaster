@@ -27,13 +27,12 @@ pub fn rust_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_dupblaster"))
 }
 
-/// A `dupblaster` command with the two costly metrics switched off.
+/// A `dupblaster` command with the sequencing-vs-library split switched off.
 ///
-/// The sequencing-vs-library split is on by default and treats a read name it
-/// cannot parse as a fatal error, while these tests use short synthetic names like
-/// `r1` that carry no flowcell or tile. Complexity metrics are off for the same
-/// reason in reverse — they are irrelevant to what most tests assert and would
-/// render a PDF per run. Tests *of* either feature build their own command so they
+/// That split is on by default and treats a read name it cannot parse as a fatal
+/// error, while these tests use short synthetic names like `r1` that carry no
+/// flowcell or tile. The spectrum is already off by default; the sampled ladder is
+/// unconditional. Tests *of* either feature build their own command so they
 /// exercise the default.
 ///
 /// Note this command still needs `--metrics-prefix`, which is required: use
@@ -41,7 +40,7 @@ pub fn rust_binary() -> PathBuf {
 /// `--version`) or is meant to fail before the run starts.
 pub fn dupblaster() -> Command {
     let mut command = Command::new(rust_binary());
-    command.args(["--sequencing-dups", "off", "--complexity-metrics", "off"]);
+    command.args(["--sequencing-duplicate-detection", "off"]);
     command
 }
 

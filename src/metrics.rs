@@ -70,7 +70,7 @@ pub struct Metrics {
     /// exactly this figure.
     ///
     /// `None` — an empty cell — whenever the split was not computed:
-    /// `--sequencing-dups off` was passed, the library has no both-ends-mapped
+    /// `--sequencing-duplicate-detection off` was passed, the library has no both-ends-mapped
     /// pairs, or it sits on a single tile and so carries no information at all.
     /// The per-sequencing-unit file's `tiles` column distinguishes the last case.
     pub raw_sequencing_duplicate_pairs: Option<u64>,

@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Accepted levels are `-7` to `9`: higher levels are rejected because the spill holds one compression context per bucket, so memory grows steeply with the level, and `0` is rejected as ambiguous (zstd reads it as "the default level", not "off" — omit the flag to disable compression). This affects storage only — the duplicate flags and every reported metric are byte-identical at any level.
 - **Duplicates are now split into a sequencing and a library component, on by default.** A **sequencing** duplicate is a copy made on the flowcell (cluster/ExAmp); a **library** duplicate is an independent molecule — a PCR copy, or one that happens to share a locus. They call for opposite responses (loading density versus library complexity) and a single duplicate rate cannot tell them apart. Two duplicates imaged on the same tile are copies of one molecule; on different tiles they are independent.
   - Adds `raw_sequencing_duplicate_pairs`, `corrected_sequencing_duplicate_pairs`, `library_duplicate_pairs`, `frac_duplicate_pairs`, and `frac_sequencing_duplicate_pairs` to the run summary, and writes a per-sequencing-unit table beside it (`<PREFIX>.sequencing-units.tsv`) with per-flowcell/lane template counts, tile counts and sequencing-duplicate rates. That table's counts sum *exactly* to `raw_sequencing_duplicate_pairs`.
-  - Both-ends-mapped pairs only. **`--sequencing-dups off`** turns it off; it only ever *classifies* duplicates, so disabling it never changes which reads are marked.
+  - Both-ends-mapped pairs only. **`--sequencing-duplicate-detection off`** turns it off; it only ever *classifies* duplicates, so disabling it never changes which reads are marked.
   - **Threshold-free**: tile *identity* only, never a pixel radius. Same-tile displacement distributions differ radically between runs (40.7% of same-tile pairs within 20 px on one sample against 2.8% on another), so no fixed radius generalizes — `samtools markdup -d 2500` over-called one of our two labelled samples and under-called the other. It also handles coincidental duplicates with no special case, which is what makes the metric meaningful on RNA-seq and amplicon data.
   - Corrected for tiles that collide **by chance**, by inferring how many independent molecules a group's observed tile count implies, rather than by subtracting the collisions expected of all its members, which over-corrects. A library on a single tile carries no information at all — every duplicate is on "the" tile whether it was clustered or not — so its counts are left blank rather than reported as zero.
   - Validated against read-name ground truth on a 333M-template EM-seq sample: 62.8% of chr20 duplicate pairs sequencing, 64.9% genome-wide, with a tile count exact to the tile (6,334). The per-sequencing-unit column sums to `raw_sequencing_duplicate_pairs` exactly (53,070,208) rather than approximately.
@@ -27,12 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Every metrics option now hangs off `--metrics-prefix`, and feature toggles take `on`/`off`.** `--stats <PATH>` is removed; `--complexity-metrics` and `--sequencing-dups` are toggles rather than a path and a `--no-` flag; `--library-unaware` becomes `--library-aware off`. A toggle's value is optional, so a bare `--sequencing-dups` means `on`, and `true`/`false`, `yes`/`no`, `1`/`0` are accepted. The spelling then says what you meant regardless of release, and changing a default never renames a flag — which matters here because the complexity default is one line to flip if its memory cost warrants it.
-- **Complexity metrics are on by default**, rather than opt-in behind a second path argument. `--complexity-metrics off` skips them.
+- **Every metrics option now hangs off `--metrics-prefix`, and feature flags take `on`/`off`.** `--stats <PATH>` is removed. `--sequencing-duplicate-detection` (was `--no-sequencing-dups`) and `--library-aware` (was `--library-unaware`) are toggles; `--complexity-interval` is now `--sampling-interval`, matching the `.duplication-sampled` file it paces. A toggle's value is optional, so a bare `--sequencing-duplicate-detection` means `on`, and `true`/`false`, `yes`/`no`, `1`/`0` are accepted. The spelling then says what you meant regardless of release, and changing a default never renames a flag.
+- **The duplicate-rate ladder is written on every run**, with no flag: it snapshots counters the run summary already maintains, measured at 334 rows and 32 KB on a 333M-template sample, and its cost is indistinguishable from zero against a ~200 MB run-to-run RSS spread. `--complexity-metrics` is gone.
+- **The group-size histogram is opt-in** via `--duplication-spectrum on`. It is the one metric with a real cost: counting occurrences per signature measured **+1.0 GB peak RSS and +4.6% wall time** on that sample (4.25 GB → 5.2 GB, 344 s → 360 s), so it is off unless asked for.
 - **The sequencing-vs-library split is no longer computed and discarded.** It ran on every invocation but was only ever written when `--stats` was given, so a run without it paid the full cost — a spill of 16 bytes per pair, read back and decomposed — for a number nothing consumed.
 - **`--help` is far more compact.** Every option's description was rewritten to say the same thing in less prose, and the detail that earns its keep moved into the long form: `-h` is now a one-to-two-line-per-option summary, with the full text under `--help`. Per-option "see the README" pointers are gone — the repository link in the banner is the single pointer to full documentation.
 - `--check-crc`, `--no-check-crc`, `--read-buffer-mb`, `--write-buffer-mb`, and `--max-read-length` are grouped under an **"Advanced tuning (rarely needed)"** heading in `--help`, separating the knobs whose defaults suit essentially every run from the options a caller actually chooses between. No behavior change.
-- **`estimated_library_size` now has sequencing duplicates removed from the observed total**, following Picard's `ESTIMATED_LIBRARY_SIZE` convention (subtracted from `n`, not from the unique count). Flowcell duplicates are not evidence a library is exhausted, so counting them as saturation understates it — worth 2.3x on one 30x WGS sample. Under `--sequencing-dups off` the column falls back to the previous uncorrected value.
+- **`estimated_library_size` now has sequencing duplicates removed from the observed total**, following Picard's `ESTIMATED_LIBRARY_SIZE` convention (subtracted from `n`, not from the unique count). Flowcell duplicates are not evidence a library is exhausted, so counting them as saturation understates it — worth 2.3x on one 30x WGS sample. Under `--sequencing-duplicate-detection off` the column falls back to the previous uncorrected value.
 
 ### Fixed
 
@@ -44,19 +45,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 **The metrics CLI changed shape.** `--metrics-prefix` is required and every metrics file derives from it:
 
+| 0.2.0 | now |
+|---|---|
+| `--stats <PATH>` | `--metrics-prefix <PREFIX>` (required) |
+| `--complexity-metrics <PREFIX>` | the ladder is unconditional; `--duplication-spectrum on` for the histogram |
+| `--complexity-interval <N>` | `--sampling-interval <N>` |
+| `--no-sequencing-dups` | `--sequencing-duplicate-detection off` |
+| `--library-unaware` | `--library-aware off` |
+
 ```console
 # 0.2.0
 dupblaster -i in.bam -o out.bam --stats s.tsv --complexity-metrics qc --no-sequencing-dups
 # now
-dupblaster -i in.bam -o out.bam --metrics-prefix s --sequencing-dups off
+dupblaster -i in.bam -o out.bam --metrics-prefix s --sequencing-duplicate-detection off
 ```
 
 The run summary is `<PREFIX>.duplicate-metrics.tsv` rather than the path `--stats` was given, and it can no longer be gzip-compressed by suffix, since a derived name is always `.tsv`. Every one of these files is one row per library, per flowcell-and-lane, or per group size, so that costs little.
 
-Then two consequences of the split being on by default. Both are one flag to resolve, and `--sequencing-dups off` restores 0.2.0 behaviour for everything the split touches. (The partial-BAM change under **Fixed** applies regardless of that flag.)
+Then two consequences of the split being on by default. Both are one flag to resolve, and `--sequencing-duplicate-detection off` restores 0.2.0 behaviour for everything the split touches. (The partial-BAM change under **Fixed** applies regardless of that flag.)
 
-- **Temporary disk is now used on every run** — 16 bytes per both-ends-mapped pair under `--tmp-dir` (`$TMPDIR` by default): ~5 GB for a 30x human genome, ~50 GB at 300x. dupblaster deliberately does not try to predict the requirement, since with a streamed input it cannot know the shape of what is coming; a spill write that fails is a hard error rather than a silently dropped metric. Point `--tmp-dir` at a volume with room, or pass `--sequencing-dups off`.
-- **Read names that are not Illumina/Element-shaped now fail the run.** MGI, Ultima, pre-CASAVA-1.8 Illumina, and anything whose names were rewritten (SRA accessions, simulated data) need either `--sequencing-dups off` or `--read-name-format regex:PATTERN`. The error message names both.
+- **Temporary disk is now used on every run** — 16 bytes per both-ends-mapped pair under `--tmp-dir` (`$TMPDIR` by default): ~5 GB for a 30x human genome, ~50 GB at 300x. dupblaster deliberately does not try to predict the requirement, since with a streamed input it cannot know the shape of what is coming; a spill write that fails is a hard error rather than a silently dropped metric. Point `--tmp-dir` at a volume with room, or pass `--sequencing-duplicate-detection off`.
+- **Read names that are not Illumina/Element-shaped now fail the run.** MGI, Ultima, pre-CASAVA-1.8 Illumina, and anything whose names were rewritten (SRA accessions, simulated data) need either `--sequencing-duplicate-detection off` or `--read-name-format regex:PATTERN`. The error message names both.
 ## [0.2.0] - 2026-07-28
 
 ### Added

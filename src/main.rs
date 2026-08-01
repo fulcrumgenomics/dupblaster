@@ -239,10 +239,10 @@ pub struct Args {
     /// `.duplicate-metrics.tsv` — one row per library, the run summary.
     ///
     /// `.sequencing-units.tsv` — one row per flowcell-and-lane, unless
-    /// `--sequencing-dups off`.
+    /// `--sequencing-duplicate-detection off`.
     ///
     /// `.duplication-sampled.{tsv,pdf}` and `.duplication-spectrum.{tsv,pdf}` —
-    /// unless `--complexity-metrics off`.
+    /// unless `--duplication-spectrum` is off.
     #[arg(long = "metrics-prefix", value_name = "PREFIX")]
     pub metrics_prefix: PathBuf,
 
@@ -296,25 +296,25 @@ pub struct Args {
     #[arg(long = "sample")]
     pub sample: Option<String>,
 
-    /// Write duplication-complexity QC alongside the run summary.
+    /// Write `.duplication-spectrum.{tsv,pdf}`: a family-size histogram of how
+    /// many molecules were seen how many times.
     ///
-    /// Adds `.duplication-sampled.{tsv,pdf}` — duplication sampled every
-    /// `--complexity-interval` templates — and `.duplication-spectrum.{tsv,pdf}`,
-    /// a family-size histogram of how many molecules were seen how many times.
-    /// Turning this off costs no output BAM change and reclaims the per-signature
-    /// count table, which holds only signatures seen 2+ times.
-    #[arg(long = "complexity-metrics", value_name = "on|off",
-          num_args = 0..=1, default_value = "on", default_missing_value = "on",
+    /// Off by default because it is the one metric with a real memory cost — it
+    /// counts occurrences per signature, which measured +1.0 GB peak RSS on a
+    /// 333M-template sample (4.25 GB to 5.2 GB) for +4.6% wall time. Worth asking
+    /// for when you need the shape of the duplicate distribution rather than just
+    /// its rate.
+    #[arg(long = "duplication-spectrum", value_name = "on|off",
+          num_args = 0..=1, default_value = "off", default_missing_value = "on",
           hide_possible_values = true,
           value_parser = clap::builder::BoolishValueParser::new())]
-    pub complexity_metrics: bool,
+    pub duplication_spectrum: bool,
 
-    /// Snapshot cadence for the `--complexity-metrics` sampling, in templates.
-    /// Ignored when `--complexity-metrics off`.
-    #[arg(long = "complexity-interval",
+    /// Snapshot cadence for `.duplication-sampled.{tsv,pdf}`, in templates.
+    #[arg(long = "sampling-interval",
           default_value_t = 1_000_000,
           value_parser = clap::value_parser!(u64).range(1..))]
-    pub complexity_interval: u64,
+    pub sampling_interval: u64,
 
     /// Split duplicates into sequencing ("optical") and library components.
     ///
@@ -322,11 +322,11 @@ pub struct Args {
     /// the run summary. Turning it off i) does not affect the output BAM, ii)
     /// reduces tmp file usage by approximately 10-20MiB per 1m read pairs, iii)
     /// reduces CPU usage by 5-10%.
-    #[arg(long = "sequencing-dups", value_name = "on|off",
+    #[arg(long = "sequencing-duplicate-detection", value_name = "on|off",
           num_args = 0..=1, default_value = "on", default_missing_value = "on",
           hide_possible_values = true,
           value_parser = clap::builder::BoolishValueParser::new())]
-    pub sequencing_dups: bool,
+    pub sequencing_duplicate_detection: bool,
 
     /// Read/query name format in the BAM file - used to extract flowcell/lane/tile
     /// or equivalent for sequencing duplicate classification [default: illumina].
@@ -493,7 +493,7 @@ fn main() -> ExitCode {
 /// → writer, drive the QNAME-block loop, and emit the summary, metrics, and
 /// resource footer. Returns the process exit code.
 /// Fail fast if the directory that would hold `path` (an output file, or the
-/// prefix the `--complexity-metrics` files derive from) is missing or not
+/// prefix the metrics files derive from) is missing or not
 /// writable — so a bad location errors up front instead of after a full
 /// processing pass (those files are written only at the end). Probes by creating
 /// and removing a temp file in that directory.
@@ -611,7 +611,7 @@ fn run(args: Args) -> Result<ExitCode> {
         RecordProcessor::from_ref_lengths(&ref_lengths, opts, args.min_bins, library_index);
     // Attached after construction because the spiller is sized against
     // `bin_count`, which only exists once the bins are built.
-    if args.sequencing_dups {
+    if args.sequencing_duplicate_detection {
         let spiller = TileSpiller::new(
             args.read_name_format.clone().unwrap_or_default(),
             processor.bin_count(),
@@ -645,19 +645,17 @@ fn run(args: Args) -> Result<ExitCode> {
     }
 
     // Optional duplication-complexity metrics. The recorder and per-library
-    // counters are constructed only when `--complexity-metrics` is set, so the
+    // counters are constructed only when `--duplication-sampled` is on, so the
     // default path allocates nothing and its performance/RSS are unchanged.
     // Works under every single-end strategy: each library is reported on its
     // paired subset when it has any pairs (a strategy-independent key), and on
     // single-end signatures only when it has none — the case where the fragment
     // keyspace is guaranteed free of pair-ends and so is clean under Picard too.
-    let mut ladder = args.complexity_metrics.then(|| {
-        LadderRecorder::new(
-            num_libs as usize,
-            args.complexity_interval,
-            resolve_sample(&header, args.sample.as_deref()),
-        )
-    });
+    let mut ladder = LadderRecorder::new(
+        num_libs as usize,
+        args.sampling_interval,
+        resolve_sample(&header, args.sample.as_deref()),
+    );
 
     // dupblaster requires query-grouped input: records are read in maximal
     // runs sharing a QNAME ("blocks") and each block is processed as a unit.
@@ -680,9 +678,7 @@ fn run(args: Args) -> Result<ExitCode> {
             let lib = processor.process_block(block, &mut stats, &mut out)?;
             // One comparison per template in the common case; the recorder
             // snapshots only when a library crosses an interval boundary.
-            if let Some(rec) = ladder.as_mut() {
-                rec.observe(lib, &stats.libraries[lib as usize]);
-            }
+            ladder.observe(lib, &stats.libraries[lib as usize]);
             Ok(())
         })
         .context("processing record block")
@@ -701,7 +697,7 @@ fn run(args: Args) -> Result<ExitCode> {
     print_run_stats(&stats, &args);
 
     // Finalize the primary BAM output *before* writing the optional QC side
-    // files (`--stats`, `--complexity-metrics`). Their rows/counts are already
+    // files. Their rows/counts are already
     // fully in memory, so a hiccup writing them (a bad prefix path, a full disk,
     // a kuva render error) must not abort the run before `finish()` has flushed
     // the BGZF EOF block and surfaced any main-output write error — an error
@@ -765,7 +761,7 @@ fn run(args: Args) -> Result<ExitCode> {
 
     // The per-unit table is a different granularity (one flowcell-and-lane per
     // row), so it gets its own file beside the per-library one. `decomposition` is
-    // `Some` exactly when `--sequencing-dups` is on.
+    // `Some` exactly when `--sequencing-duplicate-detection` is on.
     if let Some(result) = decomposition.as_ref() {
         let sample = resolve_sample(&header, args.sample.as_deref());
         let rows = SequencingUnitMetrics::rows(&result.units, &stats, &sample);
@@ -773,10 +769,11 @@ fn run(args: Args) -> Result<ExitCode> {
             .context("writing sequencing-unit TSV")?;
     }
 
-    // Emit the duplicate-rate ladder (`ladder` is `Some` exactly when
-    // `--complexity-metrics` is on). `finalize` appends the final per-library
-    // snapshot and sorts rows for a stable file order.
-    if let Some(mut rec) = ladder {
+    // The duplicate-rate ladder is written on every run: it snapshots counters the
+    // run summary already maintains, so it costs nothing measurable. `finalize`
+    // appends the final per-library snapshot and sorts rows for a stable file order.
+    {
+        let mut rec = ladder;
         rec.finalize(&stats);
         let path = ladder_path(prefix);
         write_ladder_rows(rec.rows(), &path).context("writing duplication-sampled TSV")?;
@@ -785,7 +782,7 @@ fn run(args: Args) -> Result<ExitCode> {
     }
 
     // Group-size histogram (η_k), from the per-library occurrence counts, which
-    // are only collected when `--complexity-metrics` is on.
+    // are only collected when `--duplication-spectrum` is on.
     if let Some(counts) = processor.counts() {
         let sample = resolve_sample(&header, args.sample.as_deref());
         let rows = histogram_rows(counts, &stats, &sample);
@@ -820,7 +817,7 @@ fn processor_options(args: &Args) -> ProcessorOptions {
         max_read_length: args.max_read_length,
         single_end_strategy: args.single_end_strategy.to_strategy(),
         methylation_mode: args.methylation_mode.map(MethylationModeCli::to_mode),
-        collect_counts: args.complexity_metrics,
+        collect_counts: args.duplication_spectrum,
     }
 }
 
@@ -947,7 +944,7 @@ fn run_picard_exact(
     out: &mut RawBamWriter,
     header: &Header,
     args: &Args,
-    ladder: &mut Option<LadderRecorder>,
+    ladder: &mut LadderRecorder,
 ) -> Result<()> {
     // A modest ring is plenty: fragments are a small fraction of paired data,
     // and this writer targets local disk rather than a bursty downstream.
@@ -971,9 +968,7 @@ fn run_picard_exact(
         let mut pool: Vec<RawRecord> = Vec::with_capacity(8);
         for_each_block(reader, &mut pool, |block| {
             let lib = processor.process_block_phase1(block, stats, out, &mut temp_writer)?;
-            if let Some(rec) = ladder.as_mut() {
-                rec.observe(lib, &stats.libraries[lib as usize]);
-            }
+            ladder.observe(lib, &stats.libraries[lib as usize]);
             Ok(())
         })
         .context("processing record block (picard-exact pass 1)")?;
@@ -1003,9 +998,7 @@ fn run_picard_exact(
     for_each_block(&mut temp_reader, &mut pool, |block| {
         recovered += block.len() as u64;
         let lib = processor.process_fragment_block(block, stats, out)?;
-        if let Some(rec) = ladder.as_mut() {
-            rec.observe(lib, &stats.libraries[lib as usize]);
-        }
+        ladder.observe(lib, &stats.libraries[lib as usize]);
         Ok(())
     })
     .context("processing fragment block (picard-exact pass 2)")?;
@@ -1253,9 +1246,9 @@ mod tests {
             methylation_mode: None,
             tmp_dir: None,
             sample: None,
-            complexity_metrics: false,
-            complexity_interval: 1_000_000,
-            sequencing_dups: false,
+            duplication_spectrum: false,
+            sampling_interval: 1_000_000,
+            sequencing_duplicate_detection: false,
             read_name_format: None,
             tmp_compression_level: None,
             quiet: true,
@@ -1406,26 +1399,34 @@ mod tests {
     }
 
     #[test]
-    fn toggles_default_to_on() {
+    fn toggle_defaults() {
         let args = parse(&[]).unwrap();
-        assert!(args.complexity_metrics);
-        assert!(args.sequencing_dups);
+        assert!(args.sequencing_duplicate_detection);
         assert!(args.library_aware);
+        assert!(
+            !args.duplication_spectrum,
+            "the spectrum costs ~1 GB peak RSS, so it is the one opt-in"
+        );
     }
 
     #[test]
     fn a_bare_toggle_means_on() {
         // Habitual `--flag` usage must not error just because the flag takes an
-        // optional value.
-        assert!(parse(&["--complexity-metrics"]).unwrap().complexity_metrics);
-        assert!(parse(&["--sequencing-dups"]).unwrap().sequencing_dups);
+        // optional value — including for a toggle whose default is off.
+        assert!(parse(&["--duplication-spectrum"]).unwrap().duplication_spectrum);
+        assert!(
+            parse(&["--sequencing-duplicate-detection"]).unwrap().sequencing_duplicate_detection
+        );
         assert!(parse(&["--library-aware"]).unwrap().library_aware);
     }
 
     #[test]
     fn off_turns_a_toggle_off() {
-        assert!(!parse(&["--complexity-metrics", "off"]).unwrap().complexity_metrics);
-        assert!(!parse(&["--sequencing-dups", "off"]).unwrap().sequencing_dups);
+        assert!(
+            !parse(&["--sequencing-duplicate-detection", "off"])
+                .unwrap()
+                .sequencing_duplicate_detection
+        );
         assert!(!parse(&["--library-aware", "off"]).unwrap().library_aware);
     }
 
@@ -1433,13 +1434,13 @@ mod tests {
     fn toggles_accept_the_usual_boolean_spellings() {
         for off in ["off", "false", "no", "0", "OFF", "False"] {
             assert!(
-                !parse(&["--complexity-metrics", off]).unwrap().complexity_metrics,
+                !parse(&["--library-aware", off]).unwrap().library_aware,
                 "{off} should read as off"
             );
         }
         for on in ["on", "true", "yes", "1", "ON"] {
             assert!(
-                parse(&["--complexity-metrics", on]).unwrap().complexity_metrics,
+                parse(&["--duplication-spectrum", on]).unwrap().duplication_spectrum,
                 "{on} should read as on"
             );
         }
@@ -1447,13 +1448,21 @@ mod tests {
 
     #[test]
     fn a_toggle_rejects_a_non_boolean_value() {
-        assert!(parse(&["--complexity-metrics", "maybe"]).is_err());
+        assert!(parse(&["--duplication-spectrum", "maybe"]).is_err());
     }
 
     #[test]
     fn a_toggle_cannot_be_given_twice() {
         // Contradicting yourself is a mistake worth reporting, not something to
         // resolve silently by taking the last value.
-        assert!(parse(&["--sequencing-dups", "on", "--sequencing-dups", "off"]).is_err());
+        assert!(
+            parse(&[
+                "--sequencing-duplicate-detection",
+                "on",
+                "--sequencing-duplicate-detection",
+                "off",
+            ])
+            .is_err()
+        );
     }
 }

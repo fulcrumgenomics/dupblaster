@@ -472,7 +472,7 @@ impl TileSpiller {
         // to name both ways forward.
         let id = self.dictionary.observe(library, name).context(
             "cannot split sequencing from library duplicates. Pass --read-name-format to name \
-             this platform's read-name layout, or --sequencing-dups off to skip the split",
+             this platform's read-name layout, or --sequencing-duplicate-detection off to skip the split",
         )?;
         // Narrowing is checked in `new` via the partition cell count.
         let record = SpillRecord { sig: slot.sig, off: slot.off as u32, id };
@@ -1492,7 +1492,7 @@ mod tests {
         // and the guidance about how to proceed on the outer one.
         let message = format!("{err:#}");
         assert!(message.contains("SRR1234567.1"), "{message}");
-        assert!(message.contains("--sequencing-dups off"), "{message}");
+        assert!(message.contains("--sequencing-duplicate-detection off"), "{message}");
     }
 
     #[test]
