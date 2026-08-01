@@ -955,13 +955,33 @@ impl RecordProcessor {
             if has(rec.flags(), FLAG_FIRST_SEGMENT) != target_first_bit {
                 continue;
             }
-            let has_mc = rec.tags().find_string(b"MC").is_some();
-            // `find_int` matches any of c/C/s/S/i/I subtypes. We must use it
-            // (not `find_uint8`) because fgumi's `append_int` emits `c` for
-            // MAPQ values 0..=127 — virtually all real MAPQ scores. Using
-            // `find_uint8` (only matches `C`) would miss those and append a
-            // duplicate `MQ` tag on every run-through.
-            let has_mq = rec.tags().find_int(b"MQ").is_some();
+            // One walk of the aux section answers both questions. `find_string`
+            // plus `find_int` restart the walk from the front each time, and
+            // this runs for every record of every tagged template — the two
+            // scans measured 11.9% of worker-thread samples on a store-only
+            // input, where no decompression hides them.
+            //
+            // The type tests are what those two finders accept, so a record
+            // carrying one of these tags under another type still counts as not
+            // having it. `MQ` admits every integer subtype rather than just `C`
+            // because fgumi's `append_int` emits `c` for MAPQ values 0..=127 —
+            // virtually all real MAPQ scores — and missing those would append a
+            // duplicate `MQ` on every run-through.
+            let mut has_mc = false;
+            let mut has_mq = false;
+            for entry in rec.tags().iter() {
+                match &entry.tag {
+                    b"MC" => has_mc |= entry.type_byte == b'Z',
+                    b"MQ" => {
+                        has_mq |=
+                            matches!(entry.type_byte, b'c' | b'C' | b's' | b'S' | b'i' | b'I');
+                    }
+                    _ => {}
+                }
+                if has_mc && has_mq {
+                    break;
+                }
+            }
             let mut editor = rec.tags_editor();
             if !has_mc {
                 editor.append_string(b"MC", &self.mate_cigar_scratch);
