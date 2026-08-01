@@ -60,11 +60,11 @@ dupblaster -i in.bam -o out.bam --stats s.tsv --complexity-metrics qc --no-seque
 dupblaster -i in.bam -o out.bam --metrics-prefix s --sequencing-duplicate-detection off
 ```
 
-The run summary is `<PREFIX>.duplicate-metrics.tsv` rather than the path `--stats` was given, and it can no longer be gzip-compressed by suffix, since a derived name is always `.tsv`. Every one of these files is one row per library, per flowcell-and-lane, or per group size, so that costs little.
+The run summary is `<PREFIX>.duplicate-metrics.tsv` rather than the path `--stats` was given, and it can no longer be gzip-compressed by suffix, since a derived name is always `.tsv`. Each metrics TSV is one row per library, per flowcell-and-lane, or per group size, so that costs little; the PDFs are plots and were never compressed.
 
 Then two consequences of the split being on by default. Both are one flag to resolve, and `--sequencing-duplicate-detection off` restores 0.2.0 behaviour for everything the split touches. (The partial-BAM change under **Fixed** applies regardless of that flag.)
 
-- **Temporary disk is now used on every run** — 16 bytes per both-ends-mapped pair under `--tmp-dir` (`$TMPDIR` by default): ~5 GB for a 30x human genome, ~50 GB at 300x. dupblaster deliberately does not try to predict the requirement, since with a streamed input it cannot know the shape of what is coming; a spill write that fails is a hard error rather than a silently dropped metric. Point `--tmp-dir` at a volume with room, or pass `--sequencing-duplicate-detection off`.
+- **Temporary disk is now written on every run** — 16 bytes per both-ends-mapped pair under `--tmp-dir` (`$TMPDIR` by default): ~5 GB for a 30x human genome, ~50 GB at 300x. dupblaster deliberately does not try to predict the requirement, since with a streamed input it cannot know the shape of what is coming; a spill write that fails is a hard error rather than a silently dropped metric. Point `--tmp-dir` at a volume with room, or pass `--sequencing-duplicate-detection off`.
 - **Read names that are not Illumina/Element-shaped now fail the run.** MGI, Ultima, pre-CASAVA-1.8 Illumina, and anything whose names were rewritten (SRA accessions, simulated data) need either `--sequencing-duplicate-detection off` or `--read-name-format regex:PATTERN`. The error message names both.
 ## [0.2.0] - 2026-07-28
 

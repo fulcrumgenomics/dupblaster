@@ -321,10 +321,13 @@ pub struct RunOutput {
 pub fn run_and_capture(sam_input: &Path, bam_out: &Path, extra: &[&str]) -> RunOutput {
     // `--metrics-prefix` is required, so derive one beside `bam_out` rather than
     // making every caller invent a path it does not care about. Skipped when the
-    // caller supplies its own, since dupblaster rejects the flag twice over.
+    // caller supplies its own, since dupblaster rejects the flag twice over —
+    // matching `--metrics-prefix=VALUE` as well as the space-separated form.
+    let supplied =
+        extra.iter().any(|a| *a == "--metrics-prefix" || a.starts_with("--metrics-prefix="));
     let mut command = dupblaster();
     command.args(["-i"]).arg(sam_input).args(["-o"]).arg(bam_out);
-    if !extra.contains(&"--metrics-prefix") {
+    if !supplied {
         command.args(["--metrics-prefix"]).arg(bam_out.with_extension("metrics"));
     }
     let out = command.args(extra).output().expect("rust dupblaster ran");

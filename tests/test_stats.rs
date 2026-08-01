@@ -266,3 +266,23 @@ fn stats_tsv_handles_empty_input_without_crashing() {
     // estimated_library_size: empty cell since there are no pairs.
     assert_eq!(m["estimated_library_size"], "");
 }
+
+/// The shared runner injects a `--metrics-prefix` unless the caller supplies one.
+/// clap accepts the attached form too, so the check must match it — otherwise the
+/// run gets two prefixes and dupblaster rejects the flag as repeated.
+#[test]
+fn an_attached_metrics_prefix_is_not_duplicated_by_the_runner() {
+    let env = TestEnv::new();
+    let out = env._tmp.path().join("out.bam");
+    let prefix = env._tmp.path().join("attached");
+    SamBuilder::new()
+        .sq("chr1", 1_000_000)
+        .rec_simple("r1", 99, "chr1", 100, "50M", "=", 200, 150)
+        .rec_simple("r1", 147, "chr1", 200, "50M", "=", 100, -150)
+        .write_to(&env.input);
+
+    let attached = format!("--metrics-prefix={}", prefix.display());
+    let run = run_and_capture(&env.input, &out, &[&attached]);
+    assert!(run.stderr.contains("as duplicates"), "the run should have completed: {}", run.stderr);
+    assert!(summary(&prefix).exists(), "metrics should land under the attached prefix");
+}

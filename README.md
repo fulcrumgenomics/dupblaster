@@ -137,26 +137,27 @@ automatically (see [§ Library awareness](#library-awareness)).
 ```sh
 # Remove duplicates instead of flagging them (leaner BAM out):
 bwa-mem3 mem --bam=0 -t 8 ref.fa r1.fq.gz r2.fq.gz \
-    | dupblaster --remove-dups -o - \
+    | dupblaster --remove-dups --metrics-prefix sample.dupblaster -o - \
     | mako sort -o sample.bam -
 
 # Add MC (mate CIGAR) and MQ (mate MAPQ) tags, which some downstream callers
 # and UMI tools expect:
 bwa-mem3 mem --bam=0 -t 8 ref.fa r1.fq.gz r2.fq.gz \
-    | dupblaster --add-mate-tags -o - \
+    | dupblaster --add-mate-tags --metrics-prefix sample.dupblaster -o - \
     | mako sort -o sample.bam -
 
 # Exact, order-independent orphan handling (Picard's "fragments don't beat
 # pairs"). Orphans are emitted at the end of the stream, so sort downstream:
 bwa-mem3 mem --bam=0 -t 8 ref.fa r1.fq.gz r2.fq.gz \
-    | dupblaster --single-end-strategy picard-exact --tmp-dir /scratch -o - \
+    | dupblaster --single-end-strategy picard-exact --tmp-dir /scratch \
+        --metrics-prefix sample.dupblaster -o - \
     | mako sort -o sample.bam -
 
 # Bisulfite / EM-seq / TAPS (directional preps): keep the two original strands
 # (OT/OB) of each fragment distinct so methylation isn't lost to dup-collapsing.
 # Use any bisulfite aligner that emits query-grouped output (e.g. bwa-meth):
 bwa-meth.py --reference ref.fa r1.fq.gz r2.fq.gz \
-    | dupblaster --methylation-mode directional -o - \
+    | dupblaster --methylation-mode directional --metrics-prefix sample.dupblaster -o - \
     | mako sort -o sample.bam -
 ```
 
@@ -419,7 +420,7 @@ The summary TSV is `<PREFIX>.duplicate-metrics.tsv` rather than the path given t
 
 Two further things changed because the split is on by default:
 
-1. **dupblaster reads temporary disk on every run** — 16 bytes per both-ends-mapped pair under `--tmp-dir` (`$TMPDIR` by default), so ~5 GB for a 30x human genome and ~50 GB at 300x. It does not try to predict the requirement, because with a streamed input it cannot know the shape of what is coming; a spill write that fails is a hard error rather than a silently dropped metric.
+1. **dupblaster writes temporary disk on every run** — 16 bytes per both-ends-mapped pair under `--tmp-dir` (`$TMPDIR` by default), so ~5 GB for a 30x human genome and ~50 GB at 300x. It does not try to predict the requirement, because with a streamed input it cannot know the shape of what is coming; a spill write that fails is a hard error rather than a silently dropped metric.
 2. **Read names that are not Illumina/Element-shaped now fail the run.** If your BAMs come from MGI or Ultima, predate CASAVA 1.8, or had their names rewritten (SRA accessions, simulated data), add `--sequencing-duplicate-detection off` — or describe the layout with `--read-name-format regex:PATTERN` to get the metric.
 
 Both are single-flag fixes; `--sequencing-duplicate-detection off` restores 0.2.0 behaviour for everything the split touches.
