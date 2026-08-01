@@ -439,6 +439,7 @@ dependencies = [
  "env_logger",
  "fgoxide",
  "fgumi-raw-bam",
+ "itoa 1.0.18",
  "kuva",
  "libc",
  "libdeflater",
