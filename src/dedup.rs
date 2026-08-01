@@ -762,7 +762,7 @@ impl RecordProcessor {
     /// Phase 1 of [`SingleEndStrategy::PicardExact`]: emit pairs and
     /// unmapped/unmated blocks straight to `out` exactly as the single-pass
     /// path would, but *defer* every mapped-fragment block by writing its
-    /// whole record group to `temp` (an uncompressed BAM). Deferred blocks are
+    /// whole record group to `temp` (a BAM). Deferred blocks are
     /// neither dup-marked nor counted here — that happens in phase 2, after
     /// the fragment table is complete. Mate tags are added to fragment blocks
     /// before buffering so the buffered copy matches single-pass output.

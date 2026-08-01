@@ -393,14 +393,19 @@ pub(crate) struct SequencingUnitStats {
 pub(crate) struct TileSpiller {
     /// Interns triples and accumulates the tile shares the correction needs.
     dictionary: TileDictionary,
-    /// One append-only buffered file per bucket.
-    buckets: Vec<BufWriter<File>>,
+    /// One append-only buffered file per bucket. Emptied by
+    /// [`TileSpiller::finish_spill`], which must run before the buckets are read.
+    buckets: Vec<BufWriter<SpillSink>>,
     /// Owns the bucket files; removes them when dropped.
     dir: TempDir,
     /// `buckets.len()`, cached as a `u32` for the hot-path modulo.
     bucket_count: u32,
     /// Records appended so far, for reporting how much temp space was used.
     spilled: u64,
+    /// zstd level the bucket files were written with; `None` means raw records.
+    /// Retained only so the post-pass knows *whether* to decode — zstd recovers the
+    /// level itself from each frame header.
+    level: Option<i32>,
 }
 
 impl TileSpiller {
@@ -415,6 +420,7 @@ impl TileSpiller {
         bin_count: u32,
         buckets: u32,
         tmp_dir: Option<&Path>,
+        level: Option<i32>,
     ) -> Result<Self> {
         let stride = u64::from(stride_for(bin_count));
         if stride * stride > u64::from(u32::MAX) {
@@ -435,9 +441,8 @@ impl TileSpiller {
         let mut writers = Vec::with_capacity(bucket_count as usize);
         for bucket in 0..bucket_count {
             let path = dir.path().join(format!("spill-{bucket:04}"));
-            let file = File::create(&path)
-                .with_context(|| format!("creating spill bucket {}", path.display()))?;
-            writers.push(BufWriter::with_capacity(BUCKET_BUFFER_BYTES, file));
+            let sink = SpillSink::create(&path, level)?;
+            writers.push(BufWriter::with_capacity(BUCKET_BUFFER_BYTES, sink));
         }
 
         Ok(Self {
@@ -446,6 +451,7 @@ impl TileSpiller {
             dir,
             bucket_count,
             spilled: 0,
+            level,
         })
     }
 
@@ -484,17 +490,13 @@ impl TileSpiller {
     /// and can take tens of seconds, and dupblaster sits in pipelines where a
     /// downstream sort is blocked on its stdout.
     pub(crate) fn decompose(mut self, num_libs: u32) -> Result<DecompositionResult> {
-        for (bucket, writer) in self.buckets.iter_mut().enumerate() {
-            writer.flush().with_context(|| {
-                format!("flushing spill bucket {bucket} (is the temp volume full?)")
-            })?;
-        }
+        self.finish_spill(false)?;
 
         let mut walker = GroupWalker::new(&self.dictionary, num_libs);
         let mut records: Vec<SpillRecord> = Vec::new();
         for bucket in 0..self.bucket_count {
             let path = self.dir.path().join(format!("spill-{bucket:04}"));
-            read_bucket(&path, &mut records)?;
+            read_bucket(&path, &mut records, self.level)?;
             // Sorting by ID last puts a group's records for one tile together, so
             // its distinct tiles are countable in a single pass with no scratch.
             records.sort_unstable_by_key(|record| {
@@ -522,7 +524,47 @@ impl TileSpiller {
         ((mixed >> 32) % u64::from(self.bucket_count)) as usize
     }
 
-    /// Bytes written to the spill, for the run's resource reporting.
+    /// Close every bucket stream, optionally totalling the bytes they occupy on
+    /// disk.
+    ///
+    /// Separate from [`Self::decompose`] because a compressed bucket cannot be
+    /// decoded until its frame epilogue is written — a correctness requirement, not
+    /// just a hook for reporting the size. `measure` is opt-in because totalling
+    /// costs one `stat` per bucket and the answer is already known when nothing
+    /// compressed the records.
+    ///
+    /// Safe to call twice, which is what lets [`Self::decompose`] guarantee the
+    /// streams are closed without knowing whether the caller already did it. It
+    /// accepts no further records afterwards.
+    pub(crate) fn finish_spill(&mut self, measure: bool) -> Result<Option<u64>> {
+        for (bucket, writer) in std::mem::take(&mut self.buckets).into_iter().enumerate() {
+            writer
+                .into_inner()
+                // `IntoInnerError` owns the writer, which anyhow cannot accept;
+                // the buffered bytes are lost either way, so keep just the cause.
+                .map_err(std::io::IntoInnerError::into_error)
+                .with_context(|| {
+                    format!("flushing spill bucket {bucket} (is the temp volume full?)")
+                })?
+                .finish()
+                .with_context(|| {
+                    format!("closing spill bucket {bucket} (is the temp volume full?)")
+                })?;
+        }
+        if !measure {
+            return Ok(None);
+        }
+        let mut on_disk = 0;
+        for bucket in 0..self.bucket_count {
+            let path = self.dir.path().join(format!("spill-{bucket:04}"));
+            on_disk += std::fs::metadata(&path)
+                .with_context(|| format!("sizing spill bucket {}", path.display()))?
+                .len();
+        }
+        Ok(Some(on_disk))
+    }
+
+    /// Logical bytes handed to the spill: `records × 16`, before compression.
     pub(crate) fn spilled_bytes(&self) -> u64 {
         self.spilled * SPILL_RECORD_BYTES as u64
     }
@@ -824,14 +866,104 @@ impl Memo {
     }
 }
 
+/// Write half of a spill bucket.
+///
+/// An enum rather than `Box<dyn Write>` because finishing a zstd stream consumes
+/// the encoder to write its frame epilogue, which a trait object cannot express.
+/// Dispatch cost is irrelevant: the [`BufWriter`] in front means a variant is
+/// selected once per 64 KB, not once per record.
+enum SpillSink {
+    Raw(File),
+    /// Boxed because the encoder is far larger than a `File`, and an unboxed
+    /// variant would inflate every element of the writer vector.
+    Zstd(Box<zstd::stream::write::Encoder<'static, File>>),
+}
+
+impl SpillSink {
+    /// Create the sink for one bucket file, compressing at `level` when given.
+    fn create(path: &Path, level: Option<i32>) -> Result<Self> {
+        let file = File::create(path)
+            .with_context(|| format!("creating spill bucket {}", path.display()))?;
+        match level {
+            None => Ok(Self::Raw(file)),
+            Some(level) => {
+                let encoder = zstd::stream::write::Encoder::new(file, level)
+                    .with_context(|| format!("starting zstd for {}", path.display()))?;
+                Ok(Self::Zstd(Box::new(encoder)))
+            }
+        }
+    }
+
+    /// Close the stream, writing the zstd frame epilogue if there is one.
+    ///
+    /// Must happen before the bucket is read back: without the epilogue the
+    /// decoder rejects the frame as truncated.
+    fn finish(self) -> Result<()> {
+        match self {
+            Self::Raw(mut file) => file.flush().context("flushing a spill bucket")?,
+            Self::Zstd(encoder) => {
+                encoder.finish().context("finishing a zstd spill bucket")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Write for SpillSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Raw(file) => file.write(buf),
+            Self::Zstd(encoder) => encoder.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Raw(file) => file.flush(),
+            Self::Zstd(encoder) => encoder.flush(),
+        }
+    }
+}
+
+/// Read half of a spill bucket, mirroring [`SpillSink`].
+enum SpillSource {
+    Raw(File),
+    Zstd(Box<zstd::stream::read::Decoder<'static, std::io::BufReader<File>>>),
+}
+
+impl SpillSource {
+    /// Open one bucket file for the post-pass. `level` only selects the decoder;
+    /// zstd reads its own parameters from the frame header.
+    fn open(path: &Path, level: Option<i32>) -> Result<Self> {
+        let file =
+            File::open(path).with_context(|| format!("opening spill bucket {}", path.display()))?;
+        match level {
+            None => Ok(Self::Raw(file)),
+            Some(_) => {
+                let decoder = zstd::stream::read::Decoder::new(file)
+                    .with_context(|| format!("starting zstd decode for {}", path.display()))?;
+                Ok(Self::Zstd(Box::new(decoder)))
+            }
+        }
+    }
+}
+
+impl Read for SpillSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Raw(file) => file.read(buf),
+            Self::Zstd(decoder) => decoder.read(buf),
+        }
+    }
+}
+
 /// Read every record of a bucket file into `records`, replacing its contents.
-fn read_bucket(path: &Path, records: &mut Vec<SpillRecord>) -> Result<()> {
+fn read_bucket(path: &Path, records: &mut Vec<SpillRecord>, level: Option<i32>) -> Result<()> {
     records.clear();
-    let mut file =
-        File::open(path).with_context(|| format!("opening spill bucket {}", path.display()))?;
+    let mut source = SpillSource::open(path, level)?;
     let mut buffer = vec![0u8; BUCKET_READ_RECORDS * SPILL_RECORD_BYTES];
     loop {
-        let filled = fill_buffer(&mut file, &mut buffer)
+        let filled = fill_buffer(&mut source, &mut buffer)
             .with_context(|| format!("reading spill bucket {}", path.display()))?;
         if filled == 0 {
             break;
@@ -852,12 +984,15 @@ fn read_bucket(path: &Path, records: &mut Vec<SpillRecord>) -> Result<()> {
     Ok(())
 }
 
-/// Fill `buffer` from `file`, returning how many bytes were read. Short only at
-/// end of file, so a record is never split across two calls.
-fn fill_buffer(file: &mut File, buffer: &mut [u8]) -> std::io::Result<usize> {
+/// Fill `buffer` from `source`, returning how many bytes were read. Short only at
+/// end of input, so a record is never split across two calls.
+///
+/// The loop is load-bearing under compression: a decoder returns whatever the
+/// current frame block holds, so short reads are routine rather than exceptional.
+fn fill_buffer(source: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0;
     while filled < buffer.len() {
-        match file.read(&mut buffer[filled..]) {
+        match source.read(&mut buffer[filled..]) {
             Ok(0) => break,
             Ok(read) => filled += read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1090,6 +1225,7 @@ mod tests {
             "illumina".parse().expect("illumina is a valid format"),
             TEST_BIN_COUNT,
             DEFAULT_SPILL_BUCKETS,
+            None,
             None,
         )
         .expect("spiller opens")
@@ -1386,6 +1522,7 @@ mod tests {
                 TEST_BIN_COUNT,
                 buckets,
                 None,
+                None,
             )
             .expect("spiller opens");
             for &(off, sig, tile) in &observations {
@@ -1396,6 +1533,95 @@ mod tests {
         assert!(
             results.windows(2).all(|pair| pair[0] == pair[1]),
             "bucket count changed the answer: {results:?}"
+        );
+    }
+
+    /// Records per bucket needed to refill the write buffer several times over, so
+    /// each compressed stream takes many writes rather than one.
+    ///
+    /// A real run always works this way; spreading the same count over the default
+    /// 64 buckets would leave each one under a single buffer's worth, so every
+    /// encoder would see exactly one write and the multi-write path would go
+    /// untested.
+    const RECORDS_PER_STREAM: u64 = 4 * (BUCKET_BUFFER_BYTES / SPILL_RECORD_BYTES) as u64;
+    /// Bucket count for round-trip tests, small so each stream stays busy.
+    const BUSY_STREAM_BUCKETS: u32 = 4;
+
+    /// A spiller over the default bucket count, compressing at `level`.
+    fn spiller_with_level(level: Option<i32>) -> TileSpiller {
+        TileSpiller::new(
+            "illumina".parse().expect("valid format"),
+            TEST_BIN_COUNT,
+            DEFAULT_SPILL_BUCKETS,
+            None,
+            level,
+        )
+        .expect("spiller opens")
+    }
+
+    /// Round-trip a busy spill at `level` and return the decomposition.
+    fn round_trip_at_level(level: Option<i32>) -> Decomposition {
+        let mut spiller = TileSpiller::new(
+            "illumina".parse().expect("valid format"),
+            TEST_BIN_COUNT,
+            BUSY_STREAM_BUCKETS,
+            None,
+            level,
+        )
+        .expect("spiller opens");
+        for i in 0..RECORDS_PER_STREAM * u64::from(BUSY_STREAM_BUCKETS) {
+            observe(&mut spiller, i as usize % 9, i % 977, (i % 31) as u32);
+        }
+        decompose(spiller)
+    }
+
+    #[test]
+    fn a_fast_tier_round_trips_every_record() {
+        // Negative levels select a different internal strategy, not just different
+        // parameters, so they need their own coverage.
+        assert_eq!(round_trip_at_level(Some(-5)), round_trip_at_level(None));
+    }
+
+    #[test]
+    fn the_default_level_round_trips_every_record() {
+        assert_eq!(round_trip_at_level(Some(3)), round_trip_at_level(None));
+    }
+
+    #[test]
+    fn the_highest_accepted_level_round_trips_every_record() {
+        assert_eq!(round_trip_at_level(Some(9)), round_trip_at_level(None));
+    }
+
+    #[test]
+    fn zstd_shrinks_a_busy_spill_below_its_logical_size() {
+        let mut spiller = TileSpiller::new(
+            "illumina".parse().expect("valid format"),
+            TEST_BIN_COUNT,
+            BUSY_STREAM_BUCKETS,
+            None,
+            Some(1),
+        )
+        .expect("spiller opens");
+        for i in 0..RECORDS_PER_STREAM * u64::from(BUSY_STREAM_BUCKETS) {
+            observe(&mut spiller, i as usize % 9, i % 977, (i % 31) as u32);
+        }
+        let logical = spiller.spilled_bytes();
+        let on_disk = spiller.finish_spill(true).expect("spill closes").expect("size measured");
+        assert!(on_disk < logical, "zstd grew the spill: {on_disk} vs {logical} logical");
+    }
+
+    #[test]
+    fn a_nearly_empty_spill_can_come_out_larger_than_its_logical_size() {
+        // Every bucket gets a complete frame whether or not it saw a record, so on a
+        // tiny input the per-bucket framing outweighs anything there was to
+        // compress. Pinned because the documented guidance warns about it.
+        let mut spiller = spiller_with_level(Some(3));
+        observe(&mut spiller, 0, 0, 1101);
+        let logical = spiller.spilled_bytes();
+        let on_disk = spiller.finish_spill(true).expect("spill closes").expect("size measured");
+        assert!(
+            on_disk > logical,
+            "expected framing to dominate one record: {on_disk} vs {logical} logical"
         );
     }
 

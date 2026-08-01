@@ -104,6 +104,15 @@ impl Run {
         self
     }
 
+    /// Add a mapped single-end read, which `picard-exact` defers to its temp BAM.
+    fn single_end(&mut self, flowcell: &str, lane: u32, tile: u32, pos: u32) -> &mut Self {
+        self.cluster += 1;
+        let name = read_name(flowcell, lane, tile, self.cluster);
+        let builder = std::mem::replace(&mut self.builder, SamBuilder::new());
+        self.builder = builder.rec_simple(&name, 0, "chr1", pos, "50M", "*", 0, 0);
+        self
+    }
+
     /// Put one non-duplicate pair on each of `tiles` tiles, giving the library a
     /// realistic tile spread.
     ///
@@ -140,6 +149,165 @@ fn duplicates_on_one_tile_are_reported_as_sequencing_duplicates() {
     assert_eq!(row["duplicate_pairs"], "3");
     assert_eq!(row["corrected_sequencing_duplicate_pairs"], "3");
     assert_eq!(row["library_duplicate_pairs"], "0");
+}
+
+/// Build an input mixing a same-tile group with a distinct-tile group, run it with
+/// `extra`, and return the metrics row. The mix means a level that corrupted the
+/// spill would have to corrupt it consistently to still produce these numbers.
+fn split_with_flags(extra: &[&str]) -> HashMap<String, String> {
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut input = Run::new();
+    input.spread_over_tiles(200);
+    for _ in 0..4 {
+        input.pair("FC", 1, 1101, 500_000);
+    }
+    for tile in [2101, 2102, 2103] {
+        input.pair("FC", 1, tile, 900_000);
+    }
+    input.write_to(&env.input);
+    run_ok(&env.input, &stats, &out, extra);
+    parse_row(&stats)
+}
+
+/// The metrics the mixed input must report at any compression level.
+fn assert_expected_split(row: &HashMap<String, String>) {
+    assert_eq!(row["corrected_sequencing_duplicate_pairs"], "3");
+    assert_eq!(row["library_duplicate_pairs"], "2");
+}
+
+// The unit tests cover the round trip inside TileSpiller; these cover the wiring,
+// so a level that never reaches the spiller cannot pass unnoticed.
+
+#[test]
+fn an_uncompressed_spill_reports_the_expected_split() {
+    assert_expected_split(&split_with_flags(&[]));
+}
+
+#[test]
+fn a_fast_tier_spill_reports_the_expected_split() {
+    assert_expected_split(&split_with_flags(&["--tmp-compression-level", "-5"]));
+}
+
+#[test]
+fn a_compressed_spill_reports_the_expected_split() {
+    assert_expected_split(&split_with_flags(&["--tmp-compression-level", "1"]));
+}
+
+#[test]
+fn the_highest_accepted_level_reports_the_expected_split() {
+    assert_expected_split(&split_with_flags(&["--tmp-compression-level", "9"]));
+}
+
+#[test]
+fn an_uncompressed_run_reports_no_on_disk_size() {
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut input = Run::new();
+    input.spread_over_tiles(200);
+    for _ in 0..4 {
+        input.pair("FC", 1, 1101, 500_000);
+    }
+    input.write_to(&env.input);
+
+    let result = run(&env.input, &stats, &out, &[]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "dupblaster failed: {stderr}");
+    assert!(stderr.contains("spilled tile records"), "expected the spill line: {stderr}");
+    assert!(
+        !stderr.contains("on disk"),
+        "an uncompressed run should not report an on-disk size: {stderr}"
+    );
+}
+
+#[test]
+fn a_compressed_run_reports_the_on_disk_size_and_a_ratio() {
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut input = Run::new();
+    input.spread_over_tiles(200);
+    for _ in 0..4 {
+        input.pair("FC", 1, 1101, 500_000);
+    }
+    input.write_to(&env.input);
+
+    let result = run(&env.input, &stats, &out, &["--tmp-compression-level", "1"]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "dupblaster failed: {stderr}");
+    assert!(stderr.contains("on disk"), "expected an on-disk size: {stderr}");
+    assert!(stderr.contains("x)"), "expected a ratio: {stderr}");
+}
+
+#[test]
+fn a_compression_level_above_the_accepted_range_is_rejected() {
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut input = Run::new();
+    input.pair("FC", 1, 1101, 500_000);
+    input.write_to(&env.input);
+
+    let result = run(&env.input, &stats, &out, &["--tmp-compression-level", "22"]);
+    assert!(!result.status.success(), "level 22 should be rejected");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("must be between"), "expected a range error, got: {stderr}");
+}
+
+#[test]
+fn a_compression_level_of_zero_is_rejected_as_ambiguous() {
+    // zstd reads 0 as "the default level" while `--compression-level 0` in the same
+    // CLI means "stored", so 0 here would silently turn compression on.
+    let env = TestEnv::new();
+    let stats = env._tmp.path().join("stats.tsv");
+    let out = env._tmp.path().join("out.bam");
+    let mut input = Run::new();
+    input.pair("FC", 1, 1101, 500_000);
+    input.write_to(&env.input);
+
+    let result = run(&env.input, &stats, &out, &["--tmp-compression-level", "0"]);
+    assert!(!result.status.success(), "level 0 should be rejected");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("ambiguous"), "expected the ambiguity error, got: {stderr}");
+}
+
+/// Both temporary files — the tile spill and the `picard-exact` orphan buffer —
+/// are compressed by the one flag, so this is the only path where two zstd
+/// streams are live in a single run. A level that reached one but not the other
+/// would still pass every other test.
+#[test]
+fn compressing_both_temp_files_at_once_reports_the_same_numbers() {
+    fn run_both(extra: &[&str]) -> HashMap<String, String> {
+        let env = TestEnv::new();
+        let stats = env._tmp.path().join("stats.tsv");
+        let out = env._tmp.path().join("out.bam");
+        let mut input = Run::new();
+        input.spread_over_tiles(200);
+        for _ in 0..4 {
+            input.pair("FC", 1, 1101, 500_000);
+        }
+        for tile in [2101, 2102, 2103] {
+            input.pair("FC", 1, tile, 900_000);
+        }
+        // Single-end reads route through the picard-exact temp BAM; duplicates
+        // among them prove that buffer round-tripped rather than merely existed.
+        for _ in 0..3 {
+            input.single_end("FC", 1, 1101, 700_000);
+        }
+        input.write_to(&env.input);
+        let mut args = vec!["--single-end-strategy", "picard-exact"];
+        args.extend_from_slice(extra);
+        run_ok(&env.input, &stats, &out, &args);
+        parse_row(&stats)
+    }
+
+    let plain = run_both(&[]);
+    assert_eq!(run_both(&["--tmp-compression-level", "1"]), plain);
+    assert_eq!(run_both(&["--tmp-compression-level", "-5"]), plain);
+    assert_expected_split(&plain);
+    assert_eq!(plain["duplicate_orphans"], "2", "the temp BAM's own duplicates");
 }
 
 #[test]

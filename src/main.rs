@@ -159,6 +159,48 @@ fn parse_compression_level(s: &str) -> Result<CompressionLevel, String> {
     CompressionLevel::new(n).map_err(|e| format!("{e}"))
 }
 
+/// Bounds on `--tmp-compression-level`, deliberately far narrower than the
+/// range libzstd advertises.
+///
+/// The ceiling is a memory limit, not a taste judgement. The duplicate-split spill
+/// keeps one compression context per bucket alive for the whole main pass, so the
+/// cost is `DEFAULT_SPILL_BUCKETS ×` one context — under 100 MB at level 1, but
+/// tens of gigabytes at zstd's maximum, which would OOM exactly the constrained
+/// runs this flag exists to rescue. Levels past 9 also barely shrink this data.
+///
+/// The picard-exact orphan buffer holds a single context, so the spill is what
+/// binds; both share this range rather than tracking their own.
+///
+/// The floor is where the fast tiers stop giving anything back: below roughly -7
+/// the temporary files stop getting smaller while still costing CPU.
+const MIN_TMP_COMPRESSION_LEVEL: i32 = -7;
+const MAX_TMP_COMPRESSION_LEVEL: i32 = 9;
+
+/// Parse and validate a `--tmp-compression-level` value.
+///
+/// Rejects 0 rather than forwarding it: zstd reads level 0 as "use the default"
+/// (3), while `--compression-level` in this same CLI reads 0 as "stored". One tool
+/// cannot have 0 mean both things, so here it means neither and the error says so.
+fn parse_tmp_compression_level(s: &str) -> Result<i32, String> {
+    let level: i32 = s.parse().map_err(|_| format!("not an integer: {s}"))?;
+    // libzstd stays the outer authority, in case a future release narrows below
+    // the band above.
+    let supported = zstd::compression_level_range();
+    let (min, max) = (
+        MIN_TMP_COMPRESSION_LEVEL.max(*supported.start()),
+        MAX_TMP_COMPRESSION_LEVEL.min(*supported.end()),
+    );
+    if level == 0 {
+        return Err("0 is ambiguous here: omit --tmp-compression-level entirely to leave \
+                    temporary files uncompressed, or pass 3 for zstd's default level"
+            .to_string());
+    }
+    if !(min..=max).contains(&level) {
+        return Err(format!("must be between {min} and {max}"));
+    }
+    Ok(level)
+}
+
 /// `--help` heading for the IO and indexing knobs whose defaults suit
 /// essentially every run — grouped away from the options a caller chooses
 /// between.
@@ -349,6 +391,16 @@ pub struct Args {
     #[arg(long = "max-read-length", default_value_t = 1000, help_heading = TUNING_HEADING,
           value_parser = clap::value_parser!(i32).range(1..=10_000_000))]
     pub max_read_length: i32,
+
+    /// Zstd compression level used to compress temporary files (-7 to 9).
+    ///
+    /// Unspecified uses no compression.  Levels -5 to 1 tend to offer
+    /// meaningful (1.5-2x) reduction in temp usage, for marginal (2-7%)
+    /// more CPU usage on realistic sized data.
+    #[arg(long = "tmp-compression-level", value_name = "LEVEL",
+          help_heading = TUNING_HEADING, allow_negative_numbers = true,
+          value_parser = parse_tmp_compression_level)]
+    pub tmp_compression_level: Option<i32>,
 }
 
 impl Args {
@@ -548,6 +600,7 @@ fn run(args: Args) -> Result<ExitCode> {
             processor.bin_count(),
             DEFAULT_SPILL_BUCKETS,
             args.tmp_dir.as_deref(),
+            args.tmp_compression_level,
         )
         .context("preparing the sequencing-vs-library duplicate spill")?;
         processor.attach_tile_spiller(spiller);
@@ -643,11 +696,33 @@ fn run(args: Args) -> Result<ExitCode> {
     // dupblaster sits in pipelines where a downstream sort or caller is blocked
     // on our stdout. This ordering is a hard requirement, not a preference.
     let decomposition = match processor.take_tile_spiller() {
-        Some(spiller) => {
+        Some(mut spiller) => {
+            // Closes the bucket streams, which the post-pass requires before it can
+            // decode them, and yields the on-disk total while the files are still
+            // there. Only measured when compression is on: statting every bucket is
+            // pointless work on the default path, where the answer is the logical
+            // size by construction.
+            let measure = !args.quiet && args.tmp_compression_level.is_some();
+            let on_disk =
+                spiller.finish_spill(measure).context("closing the duplicate-split spill")?;
             if !args.quiet {
+                let logical = spiller.spilled_bytes();
+                let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+                // A ratio needs something to divide; an empty spill has none. Note
+                // the figure can legitimately come out below 1.0 on a tiny input,
+                // where per-bucket framing outweighs what there was to compress.
+                let compressed = match (on_disk, logical) {
+                    (Some(on_disk), logical) if logical > 0 => format!(
+                        " ({:.1} MiB on disk, {:.2}x)",
+                        mib(on_disk),
+                        logical as f64 / on_disk.max(1) as f64
+                    ),
+                    _ => String::new(),
+                };
                 eprintln!(
-                    "dupblaster: decomposing duplicates from {:.1} MiB of spilled tile records",
-                    spiller.spilled_bytes() as f64 / (1024.0 * 1024.0),
+                    "dupblaster: decomposing duplicates from {:.1} MiB of spilled tile \
+                     records{compressed}",
+                    mib(logical),
                 );
             }
             Some(
@@ -840,7 +915,7 @@ fn for_each_block(
 ///
 /// **Pass 1** streams pairs and unmapped/unmated blocks straight to `out`
 /// while buffering every mapped-orphan / single-end block to a temporary
-/// uncompressed BAM. **Transition** drains the completed pair table into a
+/// BAM. **Transition** drains the completed pair table into a
 /// fragment table holding every paired read end. **Pass 2** re-reads the
 /// buffered blocks and marks each fragment that collides with a pair end (or
 /// an earlier fragment), emitting them after the pairs.
@@ -860,7 +935,6 @@ fn run_picard_exact(
     // A modest ring is plenty: fragments are a small fraction of paired data,
     // and this writer targets local disk rather than a bursty downstream.
     const TEMP_RING_BYTES: usize = 8 * 1024 * 1024;
-    let stored = CompressionLevel::new(0).expect("compression level 0 is valid");
 
     let temp = create_temp_bam(args.tmp_dir.as_deref())?;
     let temp_path = temp.path().to_path_buf();
@@ -872,9 +946,11 @@ fn run_picard_exact(
     }
 
     // Pass 1: pairs out, fragments deferred to the temp BAM.
+    let deferred;
     {
-        let mut temp_writer = RawBamWriter::open(Some(&temp_path), header, TEMP_RING_BYTES, stored)
-            .context("opening temp orphan BAM")?;
+        let mut temp_writer =
+            RawBamWriter::open_temp(&temp, header, TEMP_RING_BYTES, args.tmp_compression_level)
+                .context("opening temp orphan BAM")?;
         let mut pool: Vec<RawRecord> = Vec::with_capacity(8);
         for_each_block(reader, &mut pool, |block| {
             let lib = processor.process_block_phase1(block, stats, out, &mut temp_writer)?;
@@ -884,6 +960,7 @@ fn run_picard_exact(
             Ok(())
         })
         .context("processing record block (picard-exact pass 1)")?;
+        deferred = temp_writer.records_written();
         temp_writer.finish().context("finishing temp orphan BAM")?;
     }
 
@@ -893,12 +970,21 @@ fn run_picard_exact(
     // Pass 2: re-read the buffered fragments and mark them against the
     // now-complete fragment table. CRC verification is off — we wrote this
     // file ourselves moments ago.
-    let file = File::open(&temp_path).context("reopening temp orphan BAM for pass 2")?;
-    let buffered: Box<dyn BufRead> = Box::new(std::io::BufReader::new(file));
+    let file = temp.reopen().context("reopening temp orphan BAM for pass 2")?;
+    // Unlike the write side, this runs on the worker thread — there is no
+    // read-ahead for the temp file — so decompression is not free here.
+    let buffered: Box<dyn BufRead> = match args.tmp_compression_level {
+        None => Box::new(std::io::BufReader::new(file)),
+        Some(_) => Box::new(std::io::BufReader::new(
+            zstd::stream::read::Decoder::new(file).context("starting zstd decode of temp BAM")?,
+        )),
+    };
     let mut temp_reader = Reader::Bam(RawBamReader::new(buffered, false));
     temp_reader.read_header().context("reading temp orphan BAM header")?;
     let mut pool: Vec<RawRecord> = Vec::with_capacity(8);
+    let mut recovered: u64 = 0;
     for_each_block(&mut temp_reader, &mut pool, |block| {
+        recovered += block.len() as u64;
         let lib = processor.process_fragment_block(block, stats, out)?;
         if let Some(rec) = ladder.as_mut() {
             rec.observe(lib, &stats.libraries[lib as usize]);
@@ -907,12 +993,26 @@ fn run_picard_exact(
     })
     .context("processing fragment block (picard-exact pass 2)")?;
 
+    // A short read is not distinguishable from a clean end of stream: a truncated
+    // BGZF stream and a truncated zstd frame both surface as `UnexpectedEof`,
+    // which the BAM reader treats as the end. Without this check a damaged temp
+    // file would silently drop orphans from the output and still exit zero.
+    if recovered != deferred {
+        bail!(
+            "temp orphan BAM held {deferred} records but only {recovered} could be read back; \
+             the temporary file under --tmp-dir was truncated or corrupted"
+        );
+    }
+
     Ok(())
 }
 
-/// Create the temporary uncompressed BAM used by picard-exact to buffer
-/// fragment blocks. Honors `dir` (`--tmp-dir`) when given, else the system
-/// temp dir (`$TMPDIR`). The returned handle unlinks the file on drop.
+/// Create the temporary BAM used by picard-exact to buffer fragment blocks.
+/// Honors `dir` (`--tmp-dir`) when given, else the system temp dir (`$TMPDIR`).
+/// The returned handle unlinks the file on drop.
+///
+/// Whether its contents are compressed is [`RawBamWriter::open_temp`]'s business,
+/// driven by `--tmp-compression-level`.
 fn create_temp_bam(dir: Option<&std::path::Path>) -> Result<tempfile::NamedTempFile> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("dupblaster-orphans-").suffix(".bam");
@@ -1132,6 +1232,7 @@ mod tests {
             complexity_interval: 1_000_000,
             no_sequencing_dups: true,
             read_name_format: None,
+            tmp_compression_level: None,
             quiet: true,
             min_bins: 32,
             check_crc: false,

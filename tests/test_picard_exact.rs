@@ -187,3 +187,48 @@ fn picard_exact_respects_tmp_dir_flag() {
     let dup_count = recs.iter().filter(|(_, f)| f & FLAG_DUPLICATE != 0).count();
     assert_eq!(dup_count, 1, "result must be unchanged when using a custom --tmp-dir");
 }
+
+/// Build an input whose orphans must be buffered to the temp BAM, run it with
+/// `extra`, and return the emitted `(qname, flag)` records.
+fn orphan_run(extra: &[&str]) -> Vec<(String, u16)> {
+    let env = TestEnv::new();
+    let mut builder = SamBuilder::new().sq("chr1", 10_000_000);
+    // Enough orphans to fill the temp BAM's write buffer several times over, so
+    // the compressed stream takes many writes rather than one.
+    for i in 0..20_000u32 {
+        let pos = 100 + (i % 5_000) * 100;
+        builder = builder.rec_simple(&format!("r{i}"), 0, "chr1", pos, "50M", "*", 0, 0);
+    }
+    builder.write_to(&env.input);
+    let bam_out = env._tmp.path().join("out.bam");
+    let mut args = vec!["--single-end-strategy", "picard-exact"];
+    args.extend_from_slice(extra);
+    run_and_capture(&env.input, &bam_out, &args).flags
+}
+
+/// The temp orphan BAM is written through zstd when a level is set, and the
+/// records must survive the round trip unchanged. Compression is a storage
+/// detail of a file nobody outside the process ever sees.
+#[test]
+fn compressing_the_temp_bam_does_not_change_the_output() {
+    assert_eq!(orphan_run(&["--tmp-compression-level", "1"]), orphan_run(&[]));
+}
+
+#[test]
+fn compressing_the_temp_bam_at_a_fast_tier_does_not_change_the_output() {
+    assert_eq!(orphan_run(&["--tmp-compression-level", "-5"]), orphan_run(&[]));
+}
+
+#[test]
+fn compressing_the_temp_bam_at_the_highest_level_does_not_change_the_output() {
+    assert_eq!(orphan_run(&["--tmp-compression-level", "9"]), orphan_run(&[]));
+}
+
+#[test]
+fn the_compressed_temp_bam_marks_the_same_duplicates() {
+    // Guards against the round-trip tests agreeing on an empty answer.
+    let recs = orphan_run(&["--tmp-compression-level", "1"]);
+    let dups = recs.iter().filter(|(_, f)| f & FLAG_DUPLICATE != 0).count();
+    assert_eq!(recs.len(), 20_000);
+    assert_eq!(dups, 15_000, "4 reads per position, 5000 positions, 3 dups each");
+}
