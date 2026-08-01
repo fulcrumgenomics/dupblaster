@@ -42,22 +42,41 @@ This preserves all records (primary, secondary, and supplementary) and
 produces a fresh name-sorted BAM that every tool can consume on equal
 footing.
 
+## Two classes of tool
+
+Duplicate markers split into two classes that occupy **different points in a pipeline**, and the benchmark treats them differently as a result.
+
+**Streaming** markers (dupblaster, samblaster, dupsifter) consume query-grouped input in a single pass and live inside the `aligner | marker | sorter` pipe. They are timed in stock configuration — none has a compute-thread knob worth sweeping (dupblaster's threads hide IO latency rather than adding throughput; samblaster and dupsifter are single-threaded) — and they write **uncompressed** BAM, because the sort immediately downstream recompresses everything anyway.
+
+**Coordinate** markers (Picard, samtools markdup, FastDup) require coordinate-ordered input and run *after* the sort, as the last step producing the analysis-ready BAM. They are swept over thread counts (1 / 4 / 8 / 16 total CPU slots) where the tool has a knob, and they read *and* write at **compression level 1** — what a production sort/mark step actually emits. Level 6 buys little space for a lot of CPU, and durable archival is CRAM's job, not the working BAM's.
+
+**Runtimes are only ever compared within a class.** The two classes sit at different pipeline positions and are given different IO terms, so a head-to-head wall-clock number across them would not mean anything. Functional equivalence, by contrast, is computed for **every** tool in both classes — duplicate calls are comparable no matter where a tool runs.
+
 ## Tool matrix
 
-Ten tools are benchmarked (`TOOLS` list in the Snakefile):
+Eleven tools are benchmarked (`TOOLS` registry in the Snakefile, which carries each tool's class, input, sweep points, and reserved slots):
 
-| Tool                       | Mode / flag                           | Input prep               |
-|----------------------------|---------------------------------------|--------------------------|
-| `samblaster`               | default                               | name-sorted SAM text     |
-| `dupblaster-sam`           | default                               | name-sorted SAM text     |
-| `dupblaster-bam`           | default                               | name-sorted BAM          |
-| `dupblaster-picard-approx` | `--single-end-strategy picard-approx` | name-sorted BAM          |
-| `dupblaster-picard-exact`  | `--single-end-strategy picard-exact`  | name-sorted BAM          |
-| `picard`                   | `MarkDuplicates ASSUME_SORT_ORDER=queryname` | name-sorted BAM  |
-| `samtools-markdup`         | default (no `-S`)                     | coord-sorted BAM + fixmate |
-| `samtools-markdup-S`       | `-S` (propagate to secondary/supp)    | coord-sorted BAM + fixmate |
-| `samtools-markdup-seq-S`   | `-m s -S` (sequence mode + propagate) | coord-sorted BAM + fixmate |
-| `dupsifter`                | `-W` (WGS-only mode)                  | name-sorted BAM          |
+| Tool                       | Class      | Mode / flag                           | Input prep                 | Timed at        |
+|----------------------------|------------|---------------------------------------|----------------------------|-----------------|
+| `samblaster`               | streaming  | default                               | name-sorted SAM text       | stock           |
+| `dupblaster-sam`           | streaming  | default                               | name-sorted SAM text       | stock           |
+| `dupblaster-bam`           | streaming  | default                               | name-sorted BAM            | stock           |
+| `dupblaster-picard-approx` | streaming  | `--single-end-strategy picard-approx` | name-sorted BAM            | stock           |
+| `dupblaster-picard-exact`  | streaming  | `--single-end-strategy picard-exact`  | name-sorted BAM            | stock           |
+| `dupsifter`                | streaming  | `-W` (WGS-only mode)                  | name-sorted BAM            | stock           |
+| `picard`                   | coordinate | `MarkDuplicates ASSUME_SORT_ORDER=coordinate` | coord-sorted BAM   | stock (no thread flag) |
+| `samtools-markdup`         | coordinate | default (no `-S`)                     | coord-sorted BAM + fixmate | 8               |
+| `samtools-markdup-S`       | coordinate | `-S` (propagate to secondary/supp)    | coord-sorted BAM + fixmate | 8               |
+| `samtools-markdup-seq-S`   | coordinate | `-m s -S` (sequence mode + propagate) | coord-sorted BAM + fixmate | 1 / 4 / 8 / 16  |
+| `fastdup`                  | coordinate | `--num-threads N`                     | coord-sorted BAM           | 1 / 4 / 8 / 16  |
+
+Sweep points count **total CPU slots claimed**, not flag values: `samtools -@ N` is documented as "number of *additional* threads to use [0]", so a sweep point of 8 passes `-@ 7`, while FastDup's `--num-threads` is a total and gets 8 unmodified.
+
+Exactly **one command-line variant per tool is swept**, and it is the variant whose output most closely matches Picard's — a thread curve is only worth having for the configuration you would actually deploy against Picard-equivalent output. For markdup that is `-m s -S`: sequence mode reaches 100% paired-set concordance with Picard (vs 99.87% for the default `-m t`) and `-S` propagates the dup flag to supplementary records as Picard does. The other two markdup rows price a *flag* rather than a thread curve, so they run at the single mid-sweep point (8) and are read against the swept variant at that same point.
+
+Picard is timed on coordinate-sorted input with `ASSUME_SORT_ORDER=coordinate` — the way it is actually deployed, after the sort, rather than paying an internal queryname→coordinate sort inside its own timed window. (`run_picard`, which produces the equivalence *reference*, still reads the name-sorted BAM: its name-ordered output is what lets `bench-compare` co-stream without a re-sort, and Picard's duplicate sets don't depend on which order it is handed.)
+
+Picard and FastDup consume a **plain** coordinate-sorted BAM; only `samtools markdup` gets the `fixmate -m` variant, since only it reads the `MC` / `ms` tags. Each tool is charged for exactly the input it requires.
 
 The three dupblaster modes (`-sam`, `-bam`, `-picard-approx`) run the
 same binary; only the input format and `--single-end-strategy` differ.
@@ -83,6 +102,11 @@ apples-to-apples samtools mode for this comparison.
 `dupsifter` is the huishenlab samblaster-lineage tool, run in `-W`
 (WGS-only) mode because the bench data is unconverted WGS.
 
+`fastdup` ([zzhofict/FastDup](https://github.com/zzhofict/FastDup), *Bioinformatics* 2025, [doi:10.1093/bioinformatics/btaf633](https://doi.org/10.1093/bioinformatics/btaf633)) reimplements Picard's algorithm in C++ with a speculation-and-test scheme, so it should land on Picard's duplicate sets exactly. Two things to know about it:
+
+- **It cannot honor the level-1 standard.** FastDup has no compression-level control and always writes level 6 — no flag, no environment variable, and no undocumented filename extension (its `md_args.h` declares a `COMPRESSION_LEVEL` field that nothing reads). Its timed rows therefore carry a compression penalty its class-mates don't: measured on chr20 of HG03953, ~65% of its single-threaded CPU is libdeflate level-6 deflate. Reported upstream as [FastDup#5](https://github.com/zzhofict/FastDup/issues/5).
+- **It segfaults on input with no `@RG` header lines** (verified: exit 139 on bioconda 1.0.0, immediately after startup). Irrelevant here — the NYGC input carries 14 read groups — but worth knowing before adopting it.
+
 ## Timing design
 
 Each timed rule:
@@ -90,20 +114,31 @@ Each timed rule:
 1. Acquires the whole `bench` Snakemake resource pool (size 100), so no
    two timed rules ever run concurrently — wall-time isn't contaminated by
    another rule sharing CPU.
-2. Runs `env time -v` over the tool only, writing the tool's native,
-   **uncompressed** output (L0 BGZF or SAM text).
-3. After `env time -v` exits (outside the timed window), converts the raw
+2. Drops the page cache, then pre-warms only this tool's input, so every
+   timed read starts from the same state and runs at RAM speed. (Linux only,
+   via `/proc/sys/vm/drop_caches` — needs root or passwordless sudo. On
+   other hosts the rule warns and skips the drop; the pre-warm still runs.)
+3. Runs `env time -v` over the tool only, at the output compression its
+   class prescribes: uncompressed for the streaming tools, level 1 for the
+   coordinate tools (level 6 for FastDup, which offers no choice).
+4. After `env time -v` exits (outside the timed window), converts the raw
    output to the shared comparison artifact: a name-sorted L1 BGZF BAM
    (`out.nsort.bam`). Order-preserving tools recompress with
    `samtools view -b --output-fmt-option level=1`; coordinate-order tools
-   (`samtools-markdup`, `samtools-markdup-S`, `samtools-markdup-seq-S`) and
+   (the `samtools-markdup` variants and `fastdup`) and
    `dupblaster-picard-exact`
    (whose orphans are appended at the end) are name-sorted with
    `samtools sort -n -l 1`.
 
-Keeping recompression out of the timed window means output-format cost
-never penalizes a tool, while every comparison still gets uniformly
+Keeping that conversion out of the timed window means the *comparison*
+format never penalizes a tool, while every comparison still gets uniformly
 compressed, uniformly ordered input.
+
+### Cost metrics
+
+Every run in `results/bench.tsv` reports `wall_s` and **`cpu_s`** — actual CPU consumed (user + sys), the work the tool really did regardless of how it spread that work across threads. Stock runs report only those two, on a single-CPU assumption.
+
+Swept runs additionally report **`reserved_cpu_s`** (`nslots x wall_s`): the CPU you had to *claim* to run it, which is what a cloud instance or an SGE/Slurm reservation actually costs. It is the metric that prices a thread curve — `cpu_s` stays roughly flat as threads rise while wall time falls and `reserved_cpu_s` climbs, i.e. the same work spread wider at a higher reservation cost. The column is empty for stock runs, where the claim is one slot and the reserved cost is just `wall_s`.
 
 ## Comparison design
 
@@ -280,16 +315,23 @@ results/runs/<sample>/<tool>/rep<N>/time.txt        # GNU time -v output
 results/runs/<sample>/<tool>/rep<N>/out.nsort.bam   # name-sorted L1 comparison artifact
 results/runs/<sample>/<tool>/rep<N>/compare.txt     # bench-compare human-readable summary
 results/runs/<sample>/picard/rep<N>/metrics.txt     # Picard DuplicationMetrics
+results/runs/<sample>/fastdup/rep<N>/metrics.txt    # FastDup's Picard-format metrics
 results/runs/<sample>/dupsifter/rep<N>/dupsifter_stats.txt
 
-results/bench.tsv          # wall_s, user_s, sys_s, cpu_percent, max_rss_kb, exit_status
+# timed runs carry the sweep point: t<slots> is "stock" or the total CPU slots
+results/runs/<sample>/<tool>/t<slots>/rep<N>/time.devnull.txt
+
+results/bench.tsv          # per (sample, tool, sweep point, rep): both cost metrics
 results/setcmp.tsv         # set-equivalence concordance vs Picard (kf-keyed)
 results/orphan_triage.tsv  # four-bucket orphan-discordance triage
 results/inheritance.tsv    # dup-flag consistency across primary+secondary+supplementary
 ```
 
-`bench.tsv` columns: `sample`, `tool`, `rep`, `wall_s`, `user_s`, `sys_s`,
-`cpu_percent`, `max_rss_kb`, `exit_status`.
+`bench.tsv` columns: `sample`, `tool`, `tool_class`, `nslots`, `rep`,
+`wall_s`, `cpu_s`, `reserved_cpu_s`, `user_s`, `sys_s`, `cpu_percent`,
+`max_rss_kb`, `exit_status` (`reserved_cpu_s` is populated for swept runs
+only). Compare runtimes only within a `tool_class` — see
+[Two classes of tool](#two-classes-of-tool).
 
 `setcmp.tsv` columns: `sample`, `partner`, `pe_sets`, `pe_concordant`,
 `pe_concord_pct`, `orphan_sets`, `orphan_concordant`, `orphan_concord_pct`,
@@ -305,10 +347,14 @@ results/inheritance.tsv    # dup-flag consistency across primary+secondary+suppl
 
 ## Adding a new tool
 
-1. Add the tool name to the `TOOLS` list near the top of the Snakefile.
+1. Add an entry to the `TOOLS` registry near the top of the Snakefile,
+   declaring its `cls` (`streaming` or `coordinate`), which prepped `input`
+   it consumes, the `sweep` points to time it at (`STOCK` if it has no
+   thread knob), and — for stock-only tools — the `slots` to charge it for
+   the reserved-CPU metric.
 2. Add a `run_<tool-name>` rule that:
    - Takes the appropriate prepped input (`prep_namesorted_bam`,
-     `prep_namesorted_sam`, or `prep_fixmate_coord_bam`).
+     `prep_namesorted_sam`, `prep_coord_bam`, or `prep_fixmate_coord_bam`).
    - Declares `resources: bench = 100` to serialize it with the other
      timed rules.
    - Runs `env time -v -o {output.time_txt} <tool ...>` writing native
@@ -318,12 +364,16 @@ results/inheritance.tsv    # dup-flag consistency across primary+secondary+suppl
    - `run_dupblaster_bam` is a good template for a single-binary tool;
      `run_samtools_markdup` shows how to handle a coordinate-order tool
      that needs a post-hoc name sort.
-3. If the tool needs an input format that none of the existing prep rules
-   produces, add a `prep_<format>` rule with `temp()` output.
+3. Add its timed command to `_time_command` (and its output extension to
+   `_time_ext` if it writes SAM text), honoring the output compression its
+   class prescribes.
+4. If the tool needs an input format that none of the existing prep rules
+   produces, add a `prep_<format>` rule with `temp()` output and map it in
+   `_PREPPED_INPUT`.
 
-`collate_bench` and `compare` derive their tool lists from `TOOL_NAMES`
-and `[t for t in TOOL_NAMES if t != "picard"]` respectively, so the new
-tool is picked up automatically.
+`collate_bench` fans out over `timed_runs()` and `compare` over
+`[t for t in TOOL_NAMES if t != "picard"]`, both derived from the registry,
+so a new tool and its sweep points are picked up automatically.
 
 ## Adding a new sample
 
@@ -339,6 +389,17 @@ The reference download is shared and already cached after the first run.
 
 ## Caveats
 
+- **Never compare runtimes across classes.** The streaming and coordinate
+  classes are deliberately given different IO terms (uncompressed vs level-1
+  output) because they sit at different points in a pipeline. Within a class
+  the numbers are apples-to-apples; across classes they are not, and
+  `bench.tsv` carries `tool_class` so a plot can enforce that.
+- **FastDup's rows include a compression penalty its class-mates avoid.**
+  It has no compression-level control and always writes level 6 where Picard
+  and markdup are held to level 1 ([FastDup#5](https://github.com/zzhofict/FastDup/issues/5)).
+  On chr20 of HG03953 roughly 65% of its single-threaded CPU was
+  libdeflate level-6 deflate, so read its numbers as an upper bound on the
+  cost of its marking algorithm.
 - **Hardware sensitivity.** Wall-clock numbers depend heavily on the host:
   storage (local NVMe vs workstation SSD — slower IO widens the spread
   between BAM-native and SAM tools) and CPU (Picard's JVM shows 1.5–2× more
