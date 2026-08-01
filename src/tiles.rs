@@ -472,7 +472,7 @@ impl TileSpiller {
         // to name both ways forward.
         let id = self.dictionary.observe(library, name).context(
             "cannot split sequencing from library duplicates. Pass --read-name-format to name \
-             this platform's read-name layout, or --no-sequencing-dups to skip the split",
+             this platform's read-name layout, or --sequencing-duplicate-detection off to skip the split",
         )?;
         // Narrowing is checked in `new` via the partition cell count.
         let record = SpillRecord { sig: slot.sig, off: slot.off as u32, id };
@@ -573,7 +573,7 @@ impl TileSpiller {
 /// Everything the decomposition produces.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DecompositionResult {
-    /// One entry per library bucket, parallel to the `--stats` library rows.
+    /// One entry per library bucket, parallel to the run-summary library rows.
     pub libraries: Vec<Decomposition>,
     /// One entry per distinct `(library, sequencing unit)`.
     pub units: Vec<SequencingUnitStats>,
@@ -1492,7 +1492,7 @@ mod tests {
         // and the guidance about how to proceed on the outer one.
         let message = format!("{err:#}");
         assert!(message.contains("SRR1234567.1"), "{message}");
-        assert!(message.contains("--no-sequencing-dups"), "{message}");
+        assert!(message.contains("--sequencing-duplicate-detection off"), "{message}");
     }
 
     #[test]

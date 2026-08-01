@@ -20,6 +20,8 @@ fn run(extra: &[&str]) -> std::process::Output {
         .arg(&env.input)
         .args(["-o"])
         .arg(&out)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&out))
         .args(extra)
         .output()
         .expect("ran")

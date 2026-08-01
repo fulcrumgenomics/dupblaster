@@ -5,4 +5,10 @@ ci-lint = "clippy --workspace --all-targets -- -D warnings"
 # `cargo doc` accepts no trailing rustdoc args, hence `--config` rather than the
 # `-- -D warnings` form ci-lint uses. Scoping it to the alias instead of
 # `[build] rustdocflags` keeps a plain local `cargo doc` warn-only.
-ci-doc = ["doc", "--workspace", "--no-deps", "--locked", "--config", "build.rustdocflags=[\"-D\",\"warnings\"]"]
+#
+# A string, not an array: cargo merges config from every ancestor directory, and
+# it *concatenates* array values while *replacing* string ones. Worktrees live at
+# `.claude/worktrees/<name>`, inside the checkout, so both configs define this key
+# and the array form merged to `["doc", ..., "doc", ...]` — the second `doc` then
+# failing as a stray argument. The value has no spaces, so splitting is safe.
+ci-doc = "doc --workspace --no-deps --locked --config build.rustdocflags=[\"-D\",\"warnings\"]"

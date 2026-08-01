@@ -1,5 +1,5 @@
 //! Per-library occurrence counting for the duplicate group-size histogram
-//! (η_k), the second `--complexity-metrics` output.
+//! (η_k), the `--duplication-spectrum` output.
 //!
 //! ## One category per library
 //!
@@ -81,7 +81,7 @@ impl<K: CountKey> CountTable<K> {
 /// Per-library occurrence counter. Tracks the distinct-signature count and a
 /// count side-table (signatures seen ≥2×) for both-mapped pairs and — only while
 /// the library has seen no pairs — single-end/orphan fragments. Constructed only
-/// when `--complexity-metrics` is set. Fed pre-computed [`Slot`]s from the dedup
+/// when `--duplication-spectrum` is on. Fed pre-computed [`Slot`]s from the dedup
 /// path, so it holds no coordinate or strand logic of its own.
 pub struct CountsMap {
     /// Bin count, retained to rebuild the single-end table when it is dropped.

@@ -74,7 +74,7 @@ pub struct ProcessorOptions {
     /// affected — the single-end/orphan path is already strand-aware, so it
     /// keeps OT/OB orphans separate in every mode.
     pub methylation_mode: Option<MethylationMode>,
-    /// Collect per-signature occurrence counts for the `--complexity-metrics`
+    /// Collect per-signature occurrence counts for the `--duplication-spectrum`
     /// group-size histogram. When `false` (the default) no counting structure
     /// is allocated and the dedup path is unchanged. Works under every
     /// single-end strategy — a library's single-end counts are only ever
@@ -89,8 +89,8 @@ pub struct ProcessorOptions {
 const UNKNOWN_LIBRARY: &str = "Unknown Library";
 
 /// Display name for the single combined bucket when library splitting is
-/// turned off (`--library-unaware`) over a header that *does* declare
-/// multiple libraries — signalling the merge to anyone reading `--stats`.
+/// turned off (`--library-aware off`) over a header that *does* declare
+/// multiple libraries — signalling the merge to anyone reading the run summary.
 const ALL_READS: &str = "All Reads";
 
 /// Maps each read to a dense library bucket, built once from the header.
@@ -103,7 +103,7 @@ const ALL_READS: &str = "All Reads";
 ///
 /// Libraries are deduplicated by their `LB` value, **not** by `RG:ID` — two
 /// read groups sharing one `LB` are one library. Bucket 0 is the catch-all
-/// "unknown library". In single-library mode (`--library-unaware`, or a header
+/// "unknown library". In single-library mode (`--library-aware off`, or a header
 /// with ≤1 distinct `LB`) there is exactly one bucket and `lookup` is
 /// never consulted — the whole mechanism is a no-op with no per-read RG scan.
 pub struct LibraryIndex {
@@ -115,11 +115,11 @@ pub struct LibraryIndex {
 
 impl LibraryIndex {
     /// Build the index from the SAM header. `disabled` forces single-library
-    /// mode regardless of the header (the `--library-unaware` escape hatch).
+    /// mode regardless of the header (the `--library-aware off` escape hatch).
     pub fn from_header(header: &Header, disabled: bool) -> Self {
         // Collect (RG:ID, LB) pairs and the distinct LB set. BTreeSet keeps the
         // library order deterministic across runs (sorted by LB), so bucket
-        // indices — and therefore the `--stats` row order — are stable.
+        // indices — and therefore the run-summary row order — are stable.
         let mut rg_lb: Vec<(Vec<u8>, String)> = Vec::new();
         let mut distinct: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (id, map) in header.read_groups() {
@@ -163,7 +163,7 @@ impl LibraryIndex {
         self.names.len() as u32
     }
 
-    /// Display name for a bucket, for `--stats` rows.
+    /// Display name for a bucket, for run-summary rows.
     pub fn name(&self, idx: u32) -> &str {
         &self.names[idx as usize]
     }
@@ -233,7 +233,7 @@ impl LibraryStats {
     }
 }
 
-/// Run-wide statistics — printed at exit and exposed via `--stats` TSV.
+/// Run-wide statistics — printed at exit and exposed via the run-summary TSV.
 ///
 /// Template-level counters live in [`LibraryStats`], one per library bucket
 /// (just one in single-library mode). The run-wide totals consumed by the
@@ -246,7 +246,7 @@ pub struct Stats {
     /// clamped into its contig because its clipping extended more than
     /// `--max-read-length` past a contig edge. A processing artifact (not a
     /// library metric): counted once per template, surfaced via stderr/log
-    /// and the exit code, never written to `--stats`. Run-wide (not split by
+    /// and the exit code, never written to the metrics files. Run-wide (not split by
     /// library) because it's a property of the run configuration.
     pub clamped_template_count: u64,
 }
@@ -335,14 +335,14 @@ pub struct RecordProcessor {
     /// `add_mate_tags` writes mate CIGAR into here so we don't allocate a
     /// fresh `String` per pair. Reused across blocks.
     mate_cigar_scratch: Vec<u8>,
-    /// Per-library occurrence counters for the `--complexity-metrics` histogram,
+    /// Per-library occurrence counters for the `--duplication-spectrum` histogram,
     /// `Some` only when `opts.collect_counts` is set. Indexed by library bucket,
     /// parallel to `dups`. `None` (the default) means no counting and no extra
     /// memory.
     counts: Option<Vec<CountsMap>>,
     /// Spills every pair's `(signature, tile)` so duplicates can be split into
     /// sequencing and library components after the output is closed. `Some` only
-    /// unless `--no-sequencing-dups` was given; attached by
+    /// unless `--sequencing-duplicate-detection off` was given; attached by
     /// [`Self::attach_tile_spiller`] because it needs `bin_count`, which is not
     /// known until the bins are built.
     tiles: Option<TileSpiller>,
@@ -393,8 +393,8 @@ impl RecordProcessor {
         }
     }
 
-    /// The per-library occurrence counters, if `--complexity-metrics` was on.
-    /// Indexed by library bucket, parallel to the `--stats` library rows.
+    /// The per-library occurrence counters, if `--duplication-spectrum` was on.
+    /// Indexed by library bucket, parallel to the run-summary library rows.
     pub fn counts(&self) -> Option<&[CountsMap]> {
         self.counts.as_deref()
     }
@@ -468,7 +468,7 @@ impl RecordProcessor {
     /// Process one QNAME block: resolve its library, mark/flag duplicates,
     /// update `stats`, and write output. Returns the library bucket the block
     /// was attributed to, so a caller tracking per-library metrics (e.g. the
-    /// `--complexity-metrics` ladder) knows which library's counters advanced.
+    /// `--duplication-sampled` ladder) knows which library's counters advanced.
     pub fn process_block(
         &mut self,
         block: &mut [RawRecord],
@@ -695,7 +695,7 @@ impl RecordProcessor {
             let _ =
                 frag.check_or_insert(s_derived.bin_num, s_derived.bin_pos, s_derived.is_reverse);
         }
-        // Complexity-metrics counting (only when `--complexity-metrics` is on).
+        // Spectrum counting (only when `--duplication-spectrum` is on).
         // Reuses the same `slot` fed to `insert_pair`, so a counted signature
         // matches the dedup signature exactly.
         if let Some(counts) = self.counts.as_mut() {
@@ -745,7 +745,7 @@ impl RecordProcessor {
                 self.pair_table(lib).insert_orphan(slot)
             }
         };
-        // Complexity-metrics counting (only when `--complexity-metrics` is on).
+        // Spectrum counting (only when `--duplication-spectrum` is on).
         // `observe_single_end` runs under every strategy; single-end counts stay
         // faithful because `CountsMap` only ever *reports* them for a library
         // with no pairs, whose fragment keyspace therefore holds no pair-ends —

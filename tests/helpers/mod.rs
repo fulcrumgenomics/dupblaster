@@ -31,13 +31,30 @@ pub fn rust_binary() -> PathBuf {
 ///
 /// That split is on by default and treats a read name it cannot parse as a fatal
 /// error, while these tests use short synthetic names like `r1` that carry no
-/// flowcell or tile. Switching it off keeps each test on the behaviour it actually
-/// asserts. Tests *of* the split build their own command so they exercise the
-/// default.
+/// flowcell or tile. The spectrum is already off by default; the sampled ladder is
+/// unconditional. Tests *of* either feature build their own command so they
+/// exercise the default.
+///
+/// Note this command still needs `--metrics-prefix`, which is required: use
+/// [`metrics_prefix_in`] unless the invocation short-circuits parsing (`--help`,
+/// `--version`) or is meant to fail before the run starts.
 pub fn dupblaster() -> Command {
     let mut command = Command::new(rust_binary());
-    command.arg("--no-sequencing-dups");
+    command.args(["--sequencing-duplicate-detection", "off"]);
     command
+}
+
+/// A `--metrics-prefix` value inside `dir`, for tests that only need the required
+/// flag satisfied and do not assert on the metrics files themselves.
+pub fn metrics_prefix_in(dir: &Path) -> PathBuf {
+    dir.join("metrics")
+}
+
+/// A `--metrics-prefix` beside a test's output BAM, so the metrics land in the
+/// same temp directory the test already cleans up. For tests that must satisfy the
+/// required flag without asserting on the metrics files.
+pub fn metrics_prefix_for(bam_out: impl AsRef<Path>) -> PathBuf {
+    bam_out.as_ref().with_extension("metrics")
 }
 
 /// Builder for a SAM file in memory; writes to a temp file on demand.
@@ -302,14 +319,18 @@ pub struct RunOutput {
 /// stderr. Extra arguments to dupblaster are passed verbatim. Panics if the run
 /// exits non-zero.
 pub fn run_and_capture(sam_input: &Path, bam_out: &Path, extra: &[&str]) -> RunOutput {
-    let out = dupblaster()
-        .args(["-i"])
-        .arg(sam_input)
-        .args(["-o"])
-        .arg(bam_out)
-        .args(extra)
-        .output()
-        .expect("rust dupblaster ran");
+    // `--metrics-prefix` is required, so derive one beside `bam_out` rather than
+    // making every caller invent a path it does not care about. Skipped when the
+    // caller supplies its own, since dupblaster rejects the flag twice over —
+    // matching `--metrics-prefix=VALUE` as well as the space-separated form.
+    let supplied =
+        extra.iter().any(|a| *a == "--metrics-prefix" || a.starts_with("--metrics-prefix="));
+    let mut command = dupblaster();
+    command.args(["-i"]).arg(sam_input).args(["-o"]).arg(bam_out);
+    if !supplied {
+        command.args(["--metrics-prefix"]).arg(bam_out.with_extension("metrics"));
+    }
+    let out = command.args(extra).output().expect("rust dupblaster ran");
     assert!(
         out.status.success(),
         "rust dupblaster failed: {}",

@@ -61,7 +61,17 @@ fn piped_stdout_is_a_valid_bam_stream() {
     // fails the test, not just this one string.
     let dir = tempdir().unwrap();
     let sam = tiny_input(dir.path());
-    let r = dupblaster().arg("-i").arg(&sam).arg("-o").arg("-").output().unwrap();
+    // The metrics prefix goes in the temp dir, not beside `-`, which would derive
+    // a path in the working directory.
+    let r = dupblaster()
+        .arg("-i")
+        .arg(&sam)
+        .arg("-o")
+        .arg("-")
+        .arg("--metrics-prefix")
+        .arg(metrics_prefix_in(dir.path()))
+        .output()
+        .unwrap();
     assert!(r.status.success(), "stderr: {}", String::from_utf8_lossy(&r.stderr));
 
     let piped = dir.path().join("piped.bam");

@@ -1,6 +1,6 @@
 //! Optional PDF plots for the complexity metrics.
 //!
-//! Rendered with [`kuva`] when `--complexity-metrics` is set, alongside the TSVs
+//! Rendered with [`kuva`] alongside each complexity TSV that is switched on
 //! in [`crate::complexity`] and [`crate::counts`]. Everything here is plot
 //! presentation only — the numbers come from the TSV row types.
 //!

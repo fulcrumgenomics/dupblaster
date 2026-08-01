@@ -1,4 +1,5 @@
-//! Duplication-complexity metrics (opt-in via `--complexity-metrics`).
+//! Duplication-complexity metrics: the sampled ladder here, the group-size
+//! spectrum in [`crate::counts`].
 //!
 //! This module produces the **duplication-sampled ladder**: periodic snapshots
 //! taken every N templates as the input streams by, each carrying a cumulative
@@ -28,7 +29,7 @@
 //! stream in pass 1 and fragments in pass 2. At finalize the non-reported
 //! category's rows are dropped.
 //!
-//! Everything here is gated behind `--complexity-metrics`; when the flag is off
+//! Everything here is gated behind `--duplication-sampled`; when the flag is off
 //! no recorder is constructed and the hot path is byte-for-byte unchanged.
 
 use std::collections::HashMap;
@@ -78,9 +79,9 @@ impl LibraryLadder {
 
 /// Accumulates ladder snapshots as templates stream by. One recorder per run,
 /// with per-library, per-category snapshot bookkeeping; constructed only when
-/// `--complexity-metrics` is set.
+/// `--duplication-sampled` is on.
 pub struct LadderRecorder {
-    /// Snapshot cadence in templates (the `--complexity-interval` value).
+    /// Snapshot cadence in templates (the `--sampling-interval` value).
     interval: u64,
     /// Per-library snapshot bookkeeping, indexed by library bucket.
     libs: Vec<LibraryLadder>,

@@ -328,7 +328,7 @@ pub(crate) fn stride_for(bin_count: u32) -> u32 {
 ///
 /// Computed once per observation (from an alignment's canonicalized
 /// coordinates) and reused for **both** the dedup [`DupTable`] check and the
-/// `--complexity-metrics` count side-table, so the signature is never recomputed
+/// `--duplication-spectrum` count side-table, so the signature is never recomputed
 /// just to touch the counter — and the two structures group signatures
 /// identically by construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

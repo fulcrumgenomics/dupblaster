@@ -33,7 +33,15 @@ fn default_output_is_uncompressed_bgzf() {
     let env = TestEnv::new();
     build_input(&env);
     let out = env._tmp.path().join("out.bam");
-    let r = dupblaster().args(["-i"]).arg(&env.input).args(["-o"]).arg(&out).output().unwrap();
+    let r = dupblaster()
+        .args(["-i"])
+        .arg(&env.input)
+        .args(["-o"])
+        .arg(&out)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&out))
+        .output()
+        .unwrap();
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
 
     let bytes = std::fs::read(&out).unwrap();
@@ -48,7 +56,15 @@ fn level_6_produces_smaller_output_than_default() {
     build_input(&env);
 
     let out0 = env._tmp.path().join("out0.bam");
-    let r = dupblaster().args(["-i"]).arg(&env.input).args(["-o"]).arg(&out0).output().unwrap();
+    let r = dupblaster()
+        .args(["-i"])
+        .arg(&env.input)
+        .args(["-o"])
+        .arg(&out0)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&out0))
+        .output()
+        .unwrap();
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
     let size_0 = std::fs::metadata(&out0).unwrap().len();
 
@@ -58,6 +74,8 @@ fn level_6_produces_smaller_output_than_default() {
         .arg(&env.input)
         .args(["-o"])
         .arg(&out6)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&out6))
         .args(["--compression-level", "6"])
         .output()
         .unwrap();
@@ -81,6 +99,8 @@ fn compressed_output_round_trips() {
         .arg(&env.input)
         .args(["-o"])
         .arg(&out)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&out))
         .args(["--compression-level", "6"])
         .output()
         .unwrap();
@@ -100,6 +120,8 @@ fn rejects_out_of_range_compression_level() {
         .arg(&env.input)
         .args(["-o"])
         .arg(&out)
+        .args(["--metrics-prefix"])
+        .arg(metrics_prefix_for(&out))
         .args(["--compression-level", "13"])
         .output()
         .unwrap();
