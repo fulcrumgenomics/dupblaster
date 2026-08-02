@@ -497,11 +497,7 @@ impl TileSpiller {
         for bucket in 0..self.bucket_count {
             let path = self.dir.path().join(format!("spill-{bucket:04}"));
             read_bucket(&path, &mut records, self.level)?;
-            // Sorting by ID last puts a group's records for one tile together, so
-            // its distinct tiles are countable in a single pass with no scratch.
-            records.sort_unstable_by_key(|record| {
-                (walker.library_of[record.id as usize], record.off, record.sig, record.id)
-            });
+            sort_bucket(&mut records, &walker.library_of, num_libs);
             walker.walk(&records);
         }
         Ok(walker.finish())
@@ -957,6 +953,30 @@ impl Read for SpillSource {
     }
 }
 
+/// Sort one bucket into the `(library, off, sig, id)` order [`GroupWalker::walk`]
+/// reads: a duplicate group is a run of equal `(library, off, sig)`, and sorting
+/// by ID last puts a group's records for one tile together, so its distinct tiles
+/// are countable in a single pass with no scratch.
+///
+/// A single-library run — the overwhelmingly common case — holds the library term
+/// constant, leaving exactly `(off, sig, id)`: 32 + 64 + 32 bits, which pack into
+/// one `u128` whose numeric order *is* the tuple's lexicographic order. That
+/// compares in a couple of instructions rather than walking a four-field tuple,
+/// and drops the `library_of` lookup that would otherwise run twice per
+/// comparison. A whole-genome bucket holds millions of records and the sort costs
+/// `O(n log n)` comparisons, so the narrower key is worth the branch.
+fn sort_bucket(records: &mut [SpillRecord], library_of: &[u32], num_libs: u32) {
+    if num_libs == 1 {
+        records.sort_unstable_by_key(|record| {
+            (u128::from(record.off) << 96) | (u128::from(record.sig) << 32) | u128::from(record.id)
+        });
+    } else {
+        records.sort_unstable_by_key(|record| {
+            (library_of[record.id as usize], record.off, record.sig, record.id)
+        });
+    }
+}
+
 /// Read every record of a bucket file into `records`, replacing its contents.
 fn read_bucket(path: &Path, records: &mut Vec<SpillRecord>, level: Option<i32>) -> Result<()> {
     records.clear();
@@ -1137,6 +1157,70 @@ mod tests {
             alternating.library_tiles(1)[0].collision_rate,
             runs.library_tiles(1)[0].collision_rate
         );
+    }
+
+    #[test]
+    fn the_single_library_sort_matches_the_general_one() {
+        // Ids stay small so the general path's `library_of` table can cover them;
+        // one library throughout, which is the case the fast path assumes.
+        let records = vec![
+            SpillRecord { sig: 7, off: 2, id: 5 },
+            SpillRecord { sig: 7, off: 1, id: 9 },
+            SpillRecord { sig: 3, off: 2, id: 1 },
+            SpillRecord { sig: 7, off: 2, id: 2 },
+            SpillRecord { sig: 3, off: 2, id: 4 },
+            SpillRecord { sig: u64::MAX, off: 0, id: 0 },
+        ];
+        let library_of = vec![0u32; 10];
+        let mut packed = records.clone();
+        let mut tupled = records;
+        sort_bucket(&mut packed, &library_of, 1);
+        sort_bucket(&mut tupled, &library_of, 2);
+        assert_eq!(packed, tupled);
+    }
+
+    #[test]
+    fn the_single_library_sort_orders_by_off_then_sig_then_id() {
+        // Includes the extremes of every field, which the packed key must carry
+        // without the shifts colliding. `library_of` is unread on this path.
+        let mut records = vec![
+            SpillRecord { sig: 7, off: 2, id: 5 },
+            SpillRecord { sig: 7, off: 1, id: 9 },
+            SpillRecord { sig: 3, off: 2, id: 1 },
+            SpillRecord { sig: 7, off: 2, id: 2 },
+            SpillRecord { sig: 3, off: 2, id: 4 },
+            SpillRecord { sig: u64::MAX, off: 0, id: 0 },
+            SpillRecord { sig: 0, off: u32::MAX, id: u32::MAX },
+        ];
+        sort_bucket(&mut records, &[], 1);
+        let keys: Vec<(u32, u64, u32)> = records.iter().map(|r| (r.off, r.sig, r.id)).collect();
+        assert_eq!(
+            keys,
+            vec![
+                (0, u64::MAX, 0),
+                (1, 7, 9),
+                (2, 3, 1),
+                (2, 3, 4),
+                (2, 7, 2),
+                (2, 7, 5),
+                (u32::MAX, 0, u32::MAX),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_multi_library_sort_groups_by_library_first() {
+        // Ids 0 and 2 are library 1; id 1 is library 0. Library must outrank
+        // `off`, so the lone library-0 record sorts ahead of both others despite
+        // having the largest `off`.
+        let library_of = vec![1, 0, 1];
+        let mut records = vec![
+            SpillRecord { sig: 1, off: 1, id: 0 },
+            SpillRecord { sig: 1, off: 9, id: 1 },
+            SpillRecord { sig: 1, off: 2, id: 2 },
+        ];
+        sort_bucket(&mut records, &library_of, 2);
+        assert_eq!(records.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 0, 2]);
     }
 
     #[test]
