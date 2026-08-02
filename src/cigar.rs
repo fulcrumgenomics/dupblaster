@@ -1,9 +1,8 @@
 //! CIGAR analysis helpers.
 //!
-//! dupblaster needs four numbers from a CIGAR string: the leading soft/hard
-//! clip count (`sclip`), the trailing soft/hard clip count (`eclip`), the
-//! reference-consuming aligned length (`ra_len`), and the query-consuming
-//! aligned length (`qa_len`).
+//! dupblaster needs three numbers from a CIGAR string: the leading soft/hard
+//! clip count (`sclip`), the trailing soft/hard clip count (`eclip`), and the
+//! reference-consuming aligned length (`ra_len`).
 
 /// Output of parsing a CIGAR for dupblaster's needs.
 #[derive(Debug, Default, Clone, Copy)]
@@ -14,9 +13,6 @@ pub struct CigarInfo {
     pub eclip: i32,
     /// Reference-consuming aligned length (sum of M/=/X/D/N op lengths).
     pub ra_len: i32,
-    /// Query-consuming aligned length (sum of M/=/X/I op lengths, excludes
-    /// clips).
-    pub qa_len: i32,
 }
 
 impl CigarInfo {
@@ -38,7 +34,6 @@ impl CigarInfo {
                 // M, =, X
                 0 | 7 | 8 => {
                     info.ra_len += len;
-                    info.qa_len += len;
                     first = false;
                 }
                 // S, H
@@ -51,9 +46,8 @@ impl CigarInfo {
                 }
                 // D, N
                 2 | 3 => info.ra_len += len,
-                // I
-                1 => info.qa_len += len,
-                // P — consumes neither query nor reference
+                // I and P consume no reference and no clip, so neither moves a
+                // 5' position — the only thing these numbers are used for.
                 _ => {}
             }
         }
@@ -83,7 +77,6 @@ mod tests {
         assert_eq!(info.sclip, 0);
         assert_eq!(info.eclip, 0);
         assert_eq!(info.ra_len, 100);
-        assert_eq!(info.qa_len, 100);
     }
 
     #[test]
@@ -92,7 +85,6 @@ mod tests {
         assert_eq!(info.sclip, 5);
         assert_eq!(info.eclip, 0);
         assert_eq!(info.ra_len, 95);
-        assert_eq!(info.qa_len, 95);
     }
 
     #[test]
@@ -101,7 +93,6 @@ mod tests {
         assert_eq!(info.sclip, 0);
         assert_eq!(info.eclip, 5);
         assert_eq!(info.ra_len, 95);
-        assert_eq!(info.qa_len, 95);
     }
 
     #[test]
@@ -118,7 +109,6 @@ mod tests {
         assert_eq!(info.sclip, 3);
         assert_eq!(info.eclip, 2);
         assert_eq!(info.ra_len, 100); // M+M+M = 95 + D5 = 100
-        assert_eq!(info.qa_len, 97); // M+M+M = 95 + I2 = 97
     }
 
     #[test]
@@ -137,6 +127,5 @@ mod tests {
         assert_eq!(info.sclip, 5);
         assert_eq!(info.eclip, 3);
         assert_eq!(info.ra_len, 90); // 40 + 50
-        assert_eq!(info.qa_len, 92); // 40 + 2 + 50
     }
 }
