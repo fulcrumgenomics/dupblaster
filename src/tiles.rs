@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -123,15 +123,14 @@ pub(crate) struct TileDictionary {
     format: ReadNameFormat,
     /// Packed triple key → serial ID. See [`Self::pack_key`] for the encoding.
     ///
-    /// Deliberately std's default hasher, despite this being a per-template path.
-    /// A hand-rolled FNV-1a was measured against it and came out ~2% *slower*
-    /// end-to-end (5.13 s against 5.03 s over 8.4M templates, three runs each):
-    /// the keys are only ~20 bytes, so SipHash's word-at-a-time processing beats a
-    /// byte-at-a-time multiply loop, and FNV's weak low bits cost extra probes.
-    /// A word-at-a-time hasher might win, but it would need a new dependency and a
-    /// measurement to justify it — not the reflex that a fast hasher is always
-    /// faster.
-    ids: HashMap<Box<[u8]>, u32>,
+    /// FxHash rather than std's default SipHash: this map is probed once per
+    /// template on input whose neighbours don't share a tile, and the keys are
+    /// ~22 bytes, short enough that SipHash's per-word mixing dominates the
+    /// probe. Fixed-key hashing forgoes SipHash's HashDoS resistance, which
+    /// matches the threat model the dedup tables' fixed multiply hashers
+    /// ([`crate::sig::U64Hasher`]) already accept — collisions cost probes,
+    /// never correctness, and the cardinality bail bounds the dictionary.
+    ids: HashMap<Box<[u8]>, u32, rustc_hash::FxBuildHasher>,
     /// Interned triples, indexed by ID.
     entries: Vec<TileEntry>,
     /// Reused buffer for the lookup key, so probing allocates nothing.
@@ -171,20 +170,24 @@ impl TileDictionary {
 
     /// Resolve `location` to its ID, assigning a fresh one if it is new.
     fn intern(&mut self, library: u32, location: ImagingLocation<'_>) -> Result<u32> {
+        self.pack_key(library, location)?;
         // Consecutive templates of a name-sorted file almost always share a
-        // tile, so this one-entry memo skips both the key build and the hash
-        // probe on the common case. It degrades to nothing on coordinate-sorted
-        // input, where the map carries the load.
-        if self.memo.matches(library, location) {
+        // tile, so this one-entry memo of the previous packed key skips the
+        // hash probe on the common case — one length-checked memcmp against
+        // the key just packed.
+        if self.memo.occupied && self.memo.key == self.key {
             return Ok(self.memo.id);
         }
 
-        self.pack_key(library, location)?;
         let id = match self.ids.get(self.key.as_slice()) {
             Some(&id) => id,
             None => self.insert(library, location)?,
         };
-        self.memo.store(library, location, id);
+        // Swap rather than copy: the old memo buffer becomes the next
+        // pack_key scratch, so storing the memo moves no bytes at all.
+        std::mem::swap(&mut self.memo.key, &mut self.key);
+        self.memo.id = id;
+        self.memo.occupied = true;
         Ok(id)
     }
 
@@ -303,6 +306,12 @@ const _: () = assert!(
     "SpillRecord must stay padding-free so a bucket's sort buffer stays 16 B/record"
 );
 
+const _: () = assert!(
+    BUCKET_BUFFER_BYTES.is_multiple_of(SPILL_RECORD_BYTES),
+    "observe_pair flushes a bucket on len == BUCKET_BUFFER_BYTES exactly, so the buffer must \
+     hold a whole number of records"
+);
+
 impl SpillRecord {
     /// Encode to its on-disk form.
     ///
@@ -395,7 +404,7 @@ pub(crate) struct TileSpiller {
     dictionary: TileDictionary,
     /// One append-only buffered file per bucket. Emptied by
     /// [`TileSpiller::finish_spill`], which must run before the buckets are read.
-    buckets: Vec<BufWriter<SpillSink>>,
+    buckets: Vec<SpillBucket>,
     /// Owns the bucket files; removes them when dropped.
     dir: TempDir,
     /// `buckets.len()`, cached as a `u32` for the hot-path modulo.
@@ -442,7 +451,7 @@ impl TileSpiller {
         for bucket in 0..bucket_count {
             let path = dir.path().join(format!("spill-{bucket:04}"));
             let sink = SpillSink::create(&path, level)?;
-            writers.push(BufWriter::with_capacity(BUCKET_BUFFER_BYTES, sink));
+            writers.push(SpillBucket { buf: Vec::with_capacity(BUCKET_BUFFER_BYTES), sink });
         }
 
         Ok(Self {
@@ -476,10 +485,18 @@ impl TileSpiller {
         )?;
         // Narrowing is checked in `new` via the partition cell count.
         let record = SpillRecord { sig: slot.sig, off: slot.off as u32, id };
-        let bucket = self.bucket_of(record);
-        self.buckets[bucket]
-            .write_all(&record.to_bytes())
-            .context("writing to the duplicate-decomposition spill (is the temp volume full?)")?;
+        let bucket_idx = self.bucket_of(record);
+        let bucket = &mut self.buckets[bucket_idx];
+        // An open-coded buffer rather than a `BufWriter`: the 16-byte append is
+        // a fixed-size store the compiler inlines, where `BufWriter::write_all`
+        // paid a `memmove` call per record.
+        if bucket.buf.len() == BUCKET_BUFFER_BYTES {
+            bucket.sink.write_all(&bucket.buf).context(
+                "writing to the duplicate-decomposition spill (is the temp volume full?)",
+            )?;
+            bucket.buf.clear();
+        }
+        bucket.buf.extend_from_slice(&record.to_bytes());
         self.spilled += 1;
         Ok(())
     }
@@ -533,19 +550,13 @@ impl TileSpiller {
     /// streams are closed without knowing whether the caller already did it. It
     /// accepts no further records afterwards.
     pub(crate) fn finish_spill(&mut self, measure: bool) -> Result<Option<u64>> {
-        for (bucket, writer) in std::mem::take(&mut self.buckets).into_iter().enumerate() {
-            writer
-                .into_inner()
-                // `IntoInnerError` owns the writer, which anyhow cannot accept;
-                // the buffered bytes are lost either way, so keep just the cause.
-                .map_err(std::io::IntoInnerError::into_error)
-                .with_context(|| {
-                    format!("flushing spill bucket {bucket} (is the temp volume full?)")
-                })?
-                .finish()
-                .with_context(|| {
-                    format!("closing spill bucket {bucket} (is the temp volume full?)")
-                })?;
+        for (bucket, mut writer) in std::mem::take(&mut self.buckets).into_iter().enumerate() {
+            writer.sink.write_all(&writer.buf).with_context(|| {
+                format!("flushing spill bucket {bucket} (is the temp volume full?)")
+            })?;
+            writer.sink.finish().with_context(|| {
+                format!("closing spill bucket {bucket} (is the temp volume full?)")
+            })?;
         }
         if !measure {
             return Ok(None);
@@ -822,51 +833,40 @@ impl ChanceModel {
     }
 }
 
-/// The previous template's triple, cached to skip the hash probe.
+/// The previous template's packed key, cached to skip the hash probe.
 ///
-/// Buffers are reused rather than reallocated: a miss used to box the unit and
-/// tile afresh, putting two allocations and two frees on the per-template path —
-/// so the memo did not "degrade to nothing" on input whose tiles are not
-/// clustered, it degraded to allocator traffic.
+/// Holds the packed key (see [`TileDictionary::pack_key`]) rather than the
+/// triple's fields: matching is then one length-checked memcmp against the key
+/// the current template just packed, and storing is a buffer swap that moves no
+/// bytes — the old memo buffer becomes the next template's pack scratch.
 #[derive(Default)]
 struct Memo {
-    library: u32,
-    unit: Vec<u8>,
-    tile: Vec<u8>,
+    /// Packed key of the previously interned triple.
+    key: Vec<u8>,
     id: u32,
-    /// False until the first template has been interned, so an all-zero memo
-    /// cannot match a real triple.
+    /// False until the first template has been interned, so an empty memo
+    /// cannot match a real key.
     occupied: bool,
 }
 
-impl Memo {
-    /// Whether this memo holds exactly `library` and `location`.
-    #[inline]
-    fn matches(&self, library: u32, location: ImagingLocation<'_>) -> bool {
-        self.occupied
-            && self.library == library
-            && self.unit.as_slice() == location.unit
-            && self.tile.as_slice() == location.tile
-    }
-
-    /// Overwrite the memo in place, keeping the buffers' capacity.
-    #[inline]
-    fn store(&mut self, library: u32, location: ImagingLocation<'_>, id: u32) {
-        self.library = library;
-        self.unit.clear();
-        self.unit.extend_from_slice(location.unit);
-        self.tile.clear();
-        self.tile.extend_from_slice(location.tile);
-        self.id = id;
-        self.occupied = true;
-    }
+/// One spill bucket: its pending-record buffer and the file it flushes to.
+///
+/// The buffer is managed by hand rather than through a `BufWriter` so the
+/// per-record 16-byte append inlines to fixed-size stores; records are appended
+/// by [`TileSpiller::observe_pair`] and the buffer is drained a full 64 KB at a
+/// time.
+struct SpillBucket {
+    /// Records not yet written to `sink`; capacity [`BUCKET_BUFFER_BYTES`].
+    buf: Vec<u8>,
+    /// The bucket file, optionally behind zstd.
+    sink: SpillSink,
 }
 
 /// Write half of a spill bucket.
 ///
 /// An enum rather than `Box<dyn Write>` because finishing a zstd stream consumes
 /// the encoder to write its frame epilogue, which a trait object cannot express.
-/// Dispatch cost is irrelevant: the [`BufWriter`] in front means a variant is
+/// Dispatch cost is irrelevant: the buffer in [`SpillBucket`] means a variant is
 /// selected once per 64 KB, not once per record.
 enum SpillSink {
     Raw(File),

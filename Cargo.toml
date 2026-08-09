@@ -43,6 +43,9 @@ memchr = "2"
 mimalloc = { version = "0.1", default-features = false }
 noodles-sam = "0.85"
 rawb-io = "0.1"
+# Hashes the tile dictionary's short packed keys (see src/tiles.rs). Already in
+# the tree via the bench-compare workspace member, so this adds no new crate.
+rustc-hash = "2"
 # Only for `--read-name-format regex:<pattern>`, the escape hatch for platforms
 # without a preset (see src/readname.rs). Already in the tree via env_logger →
 # env_filter, so this adds no new crate; the feature set matches env_filter's
