@@ -61,6 +61,15 @@ impl CategoryLadder {
     fn new(interval: u64) -> Self {
         Self { next: interval, last_total: 0, last_dup: 0 }
     }
+
+    /// Whether `total` has crossed the next snapshot threshold. The single
+    /// definition of the snapshot-trigger predicate: [`LadderRecorder::observe`]'s
+    /// hot-path guards and [`LadderRecorder::snapshot`]'s catch-up loop both call
+    /// it, so the two cannot drift apart.
+    #[inline]
+    fn due(&self, total: u64) -> bool {
+        total >= self.next
+    }
 }
 
 /// Per-library ladder state: independent snapshot bookkeeping for the library's
@@ -109,28 +118,36 @@ impl LadderRecorder {
     /// library's both-mapped count crosses a multiple of `interval`, and a
     /// `single_end` snapshot each time its mapped-orphan count does. Cheap
     /// enough for the hot path: two comparisons per template.
+    #[inline]
     pub fn observe(&mut self, lib: u32, stats: &LibraryStats) {
         let i = lib as usize;
-        Self::snapshot(
-            &mut self.rows,
-            &self.sample,
-            self.interval,
-            &mut self.libs[i].pairs,
-            &stats.name,
-            CATEGORY_PAIRS,
-            stats.both_mapped_id_count,
-            stats.both_mapped_dup_count,
-        );
-        Self::snapshot(
-            &mut self.rows,
-            &self.sample,
-            self.interval,
-            &mut self.libs[i].single_end,
-            &stats.name,
-            CATEGORY_SINGLE_END,
-            stats.mapped_orphan_id_count,
-            stats.orphan_dup_count,
-        );
+        // Guard each snapshot call behind its threshold compare so the
+        // per-template cost inlines to two compares; the snapshot body (row
+        // building) stays out of line on the cold path.
+        if self.libs[i].pairs.due(stats.both_mapped_id_count) {
+            Self::snapshot(
+                &mut self.rows,
+                &self.sample,
+                self.interval,
+                &mut self.libs[i].pairs,
+                &stats.name,
+                CATEGORY_PAIRS,
+                stats.both_mapped_id_count,
+                stats.both_mapped_dup_count,
+            );
+        }
+        if self.libs[i].single_end.due(stats.mapped_orphan_id_count) {
+            Self::snapshot(
+                &mut self.rows,
+                &self.sample,
+                self.interval,
+                &mut self.libs[i].single_end,
+                &stats.name,
+                CATEGORY_SINGLE_END,
+                stats.mapped_orphan_id_count,
+                stats.orphan_dup_count,
+            );
+        }
     }
 
     /// Emit snapshots for one category up to the current `total`, advancing its
@@ -152,7 +169,7 @@ impl LadderRecorder {
         total: u64,
         duplicates: u64,
     ) {
-        while total >= cat.next {
+        while cat.due(total) {
             rows.push(build_ladder_row(
                 sample,
                 library,
