@@ -961,12 +961,15 @@ impl RecordProcessor {
             // scans measured 11.9% of worker-thread samples on a store-only
             // input, where no decompression hides them.
             //
-            // The type tests are what those two finders accept, so a record
-            // carrying one of these tags under another type still counts as not
-            // having it. `MQ` admits every integer subtype rather than just `C`
-            // because fgumi's `append_int` emits `c` for MAPQ values 0..=127 —
-            // virtually all real MAPQ scores — and missing those would append a
-            // duplicate `MQ` on every run-through.
+            // A tag counts as present when a well-typed occurrence exists
+            // *anywhere* in the section: `Z` for `MC`, and any integer subtype
+            // for `MQ` (fgumi's `append_int` emits `c` for MAPQ 0..=127 —
+            // virtually all real scores — so accepting only `C` would append a
+            // duplicate `MQ` on every run-through). On a spec-invalid record
+            // carrying the same tag twice under mixed types this is
+            // deliberately laxer than the first-occurrence finders it
+            // replaced: a valid `MC`/`MQ` anywhere means appending another
+            // would be wrong.
             let mut has_mc = false;
             let mut has_mq = false;
             for entry in rec.tags().iter() {
@@ -981,6 +984,13 @@ impl RecordProcessor {
                 if has_mc && has_mq {
                     break;
                 }
+            }
+            // Nothing to add: skip building the editor, whose constructor
+            // re-decodes the aux offset the appends below never read. Re-runs
+            // over already-tagged input (fixmate/DRAGEN output) take this
+            // branch for every record.
+            if has_mc && has_mq {
+                continue;
             }
             let mut editor = rec.tags_editor();
             if !has_mc {
