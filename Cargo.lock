@@ -451,6 +451,7 @@ dependencies = [
  "noodles-util",
  "rawb-io",
  "regex",
+ "rustc-hash",
  "serde",
  "tempfile",
  "wide",
