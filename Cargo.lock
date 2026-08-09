@@ -123,9 +123,9 @@ dependencies = [
 
 [[package]]
 name = "bgzf"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ef1d1b6f6e93db458101ebf6367223be5a52f5d48cbfd79ccb23939452cda86"
+checksum = "27c64c8bf3975478be6ec69e474850d87b00c2d583ddf536eff531ed02c57ab6"
 dependencies = [
  "byteorder",
  "bytes",
