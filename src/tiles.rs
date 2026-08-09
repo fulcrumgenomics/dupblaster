@@ -175,7 +175,7 @@ impl TileDictionary {
         // tile, so this one-entry memo of the previous packed key skips the
         // hash probe on the common case — one length-checked memcmp against
         // the key just packed.
-        if self.memo.occupied && self.memo.key == self.key {
+        if self.memo.key == self.key {
             return Ok(self.memo.id);
         }
 
@@ -187,7 +187,6 @@ impl TileDictionary {
         // pack_key scratch, so storing the memo moves no bytes at all.
         std::mem::swap(&mut self.memo.key, &mut self.key);
         self.memo.id = id;
-        self.memo.occupied = true;
         Ok(id)
     }
 
@@ -841,12 +840,11 @@ impl ChanceModel {
 /// bytes — the old memo buffer becomes the next template's pack scratch.
 #[derive(Default)]
 struct Memo {
-    /// Packed key of the previously interned triple.
+    /// Packed key of the previously interned triple; empty until the first
+    /// intern. A packed key is never empty (it starts with a 4-byte library id
+    /// and a 2-byte length prefix), so a fresh memo cannot match a real key.
     key: Vec<u8>,
     id: u32,
-    /// False until the first template has been interned, so an empty memo
-    /// cannot match a real key.
-    occupied: bool,
 }
 
 /// One spill bucket: its pending-record buffer and the file it flushes to.
@@ -967,14 +965,20 @@ impl Read for SpillSource {
 /// `O(n log n)` comparisons, so the narrower key is worth the branch.
 fn sort_bucket(records: &mut [SpillRecord], library_of: &[u32], num_libs: u32) {
     if num_libs == 1 {
-        records.sort_unstable_by_key(|record| {
-            (u128::from(record.off) << 96) | (u128::from(record.sig) << 32) | u128::from(record.id)
-        });
+        records.sort_unstable_by_key(packed_sort_key);
     } else {
         records.sort_unstable_by_key(|record| {
-            (library_of[record.id as usize], record.off, record.sig, record.id)
+            (library_of[record.id as usize], packed_sort_key(record))
         });
     }
+}
+
+/// The `(off, sig, id)` portion of the sort key, packed into one `u128` whose
+/// numeric order is the tuple's lexicographic order. Both arms of
+/// [`sort_bucket`] key through this, so the field order is defined exactly once.
+#[inline]
+fn packed_sort_key(record: &SpillRecord) -> u128 {
+    (u128::from(record.off) << 96) | (u128::from(record.sig) << 32) | u128::from(record.id)
 }
 
 /// Read every record of a bucket file into `records`, replacing its contents.
