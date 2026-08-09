@@ -23,7 +23,6 @@
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
-use memchr::memchr_iter;
 use regex::bytes::Regex;
 
 /// Colons bounding the fields a [`ReadNameFormat::ColonDelimited`] name needs.
@@ -186,12 +185,34 @@ impl CustomReadNameRegex {
 fn colon_delimited_location(name: &[u8]) -> Option<ImagingLocation<'_>> {
     let mut colon = [0usize; REQUIRED_COLONS];
     let mut found = 0;
-    for pos in memchr_iter(b':', name) {
-        colon[found] = pos;
-        found += 1;
-        if found == REQUIRED_COLONS {
-            break;
+    // SWAR scan, eight bytes per step. Read names are ~40 bytes with a colon
+    // every few bytes, so a `memchr` call per colon is dominated by its SIMD
+    // setup; classifying a whole word at once with the zero-byte trick costs a
+    // handful of ALU ops for up to eight positions.
+    let mut i = 0;
+    while i + 8 <= name.len() && found < REQUIRED_COLONS {
+        let word = u64::from_le_bytes(name[i..i + 8].try_into().expect("8 bytes"));
+        let xored = word ^ u64::from_le_bytes([b':'; 8]);
+        // Exact per-byte zero detector: the masked add cannot carry across
+        // byte lanes, so the high bit of a lane is set iff that byte is zero.
+        // The cheaper `(x - 0x01…) & !x & 0x80…` form is NOT exact — its
+        // borrow also flags a `';'` (`':' + 1`) directly after a colon as a
+        // phantom colon, silently shifting every later field.
+        const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+        let mut hits = !(((xored & LOW7) + LOW7) | xored | LOW7);
+        while hits != 0 && found < REQUIRED_COLONS {
+            colon[found] = i + (hits.trailing_zeros() / 8) as usize;
+            found += 1;
+            hits &= hits - 1;
         }
+        i += 8;
+    }
+    while i < name.len() && found < REQUIRED_COLONS {
+        if name[i] == b':' {
+            colon[found] = i;
+            found += 1;
+        }
+        i += 1;
     }
     if found < REQUIRED_COLONS {
         return None;
@@ -285,6 +306,24 @@ mod tests {
     #[test]
     fn name_with_empty_lane_field_is_rejected() {
         assert!(extract(b"A00354:1305:H72CFDSXF::1101:1027:1986").is_none());
+    }
+
+    #[test]
+    fn a_semicolon_directly_after_a_colon_is_not_read_as_a_colon() {
+        // ';' is ':' + 1, the adversarial byte for word-at-a-time zero scans:
+        // an inexact detector's borrow flags it as a phantom colon, shifting
+        // every later field and silently extracting the wrong unit and tile.
+        let loc = extract(b"A:;B:FC:2:1101:3:4").expect("parses");
+        assert_eq!(loc.unit, b"FC:2");
+        assert_eq!(loc.tile, b"1101");
+    }
+
+    #[test]
+    fn a_run_of_semicolons_after_a_colon_is_not_read_as_colons() {
+        // The borrow in an inexact scan chains through consecutive ';' bytes.
+        let loc = extract(b"A:;;;:FC:2:1101:3:4").expect("parses");
+        assert_eq!(loc.unit, b"FC:2");
+        assert_eq!(loc.tile, b"1101");
     }
 
     #[test]
