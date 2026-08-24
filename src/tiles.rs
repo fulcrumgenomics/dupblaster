@@ -328,7 +328,7 @@ impl SpillRecord {
 
     /// Decode from its on-disk form.
     #[inline]
-    fn from_bytes(bytes: &[u8]) -> Self {
+    fn from_bytes(bytes: &[u8; SPILL_RECORD_BYTES]) -> Self {
         let sig = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
         let off = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
         let id = u32::from_le_bytes(bytes[12..16].try_into().expect("4 bytes"));
@@ -999,8 +999,10 @@ fn read_bucket(path: &Path, records: &mut Vec<SpillRecord>, level: Option<i32>) 
                 path.display()
             );
         }
-        records
-            .extend(buffer[..filled].chunks_exact(SPILL_RECORD_BYTES).map(SpillRecord::from_bytes));
+        // The bail above guarantees `filled` is a whole number of records, so
+        // the `as_chunks` remainder is empty.
+        let (chunks, _) = buffer[..filled].as_chunks::<SPILL_RECORD_BYTES>();
+        records.extend(chunks.iter().map(SpillRecord::from_bytes));
         if filled < buffer.len() {
             break;
         }
