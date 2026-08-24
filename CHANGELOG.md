@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-24
+
 ### Added
 
 - `--tmp-compression-level <LEVEL>`: compress dupblaster's temporary files with zstd, trading CPU for temporary disk. Off by default, so the default run is unchanged and as fast as before. Covers both temp files: the duplicate-split spill (16 bytes per mapped pair — ~5 GB for a 30x human genome, ~50 GB at 300x) and the orphan buffer `--single-end-strategy picard-exact` writes. Negative levels are zstd's fast tiers.
@@ -185,7 +187,8 @@ Picard MarkDuplicates.
   Picard's `kf`-tagged output to produce set-equivalence, orphan-discordance,
   and supplementary-flag-inheritance TSVs.
 
-[Unreleased]: https://github.com/fulcrumgenomics/dupblaster/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/fulcrumgenomics/dupblaster/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/fulcrumgenomics/dupblaster/releases/tag/v0.3.0
 [0.2.0]: https://github.com/fulcrumgenomics/dupblaster/releases/tag/v0.2.0
 [0.1.1]: https://github.com/fulcrumgenomics/dupblaster/releases/tag/v0.1.1
 [0.1.0]: https://github.com/fulcrumgenomics/dupblaster/releases/tag/v0.1.0
