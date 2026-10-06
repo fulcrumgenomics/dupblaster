@@ -127,8 +127,43 @@ def _cram_url(sample: str) -> str:
 # The partner tools compared against Picard. Each tool's `run_*` rule
 # names its own prep input and native raw-output format explicitly, then
 # converts that raw output to the shared `out.nsort.bam` artifact in the
-# same rule (see step 5 in the header). This list only drives the
-# per-(sample, tool, rep) fan-out for aggregation + comparison.
+# same rule (see step 5 in the header).
+#
+# Tools fall into two CLASSES, benchmarked on deliberately different terms
+# because they occupy different slots in a real pipeline:
+#
+#   streaming  — consume query-grouped input in a single pass, living inside
+#                the `aligner | marker | sorter` pipe. Timed in stock config:
+#                there is no compute-thread knob worth sweeping (dupblaster's
+#                threads hide IO latency rather than adding throughput;
+#                samblaster and dupsifter are single-threaded), and output is
+#                *uncompressed* BAM because the sort immediately downstream
+#                recompresses it anyway.
+#   coordinate — require coordinate-ordered input and run *after* the sort,
+#                as the last step writing the analysis-ready BAM. Swept over
+#                thread counts where the tool has a knob, reading and writing
+#                at compression level 1 — what a production sort/mark step
+#                actually emits (level 6 buys little and costs a lot; durable
+#                archival is CRAM's job, not the working BAM's).
+#
+# Runtimes are only ever compared WITHIN a class. The two classes sit at
+# different points in a pipeline and are given different IO terms, so a
+# head-to-head wall-clock number across them would not mean anything.
+# Functional equivalence, by contrast, is computed for every tool in both
+# classes — dup calls are comparable no matter where a tool runs.
+#
+# Per-tool fields:
+#   cls    — "streaming" | "coordinate"
+#   input  — which prepped input it consumes (resolved by _time_inputs)
+#   sweep  — thread points to time, expressed as the TOTAL number of CPU
+#            slots the tool is given; ["stock"] for tools with no thread
+#            knob. `samtools -@ N` means N *additional* threads, so a sweep
+#            point of N passes `-@ N-1`; FastDup's `--num-threads N` is a
+#            total, so it gets N.
+#
+# Stock runs report wall time and CPU only, on a single-CPU assumption. The
+# "reserved CPU seconds" metric (slots x wall) applies to the thread sweep,
+# where the number of slots claimed is an explicit input rather than a guess.
 #
 # Notes on the less obvious ones:
 #   - samtools-markdup-S: `-S` propagates the dup flag to secondary /
@@ -139,25 +174,60 @@ def _cram_url(sample: str) -> str:
 #     into the key for same-strand pairs; Picard and dupblaster are
 #     coordinate-canonical and R1/R2-agnostic, the closer analogue to `-m s`.
 #     This row tests whether `-m s` tightens pair concordance with Picard.
+#     `-m s -S` is the variant swept for markdup, because it is the one whose
+#     output most closely matches Picard's (100% paired-set concordance and
+#     Picard-like supplementary propagation, vs 99.87% for the default `-m t`)
+#     — a thread curve is only worth having for the configuration you would
+#     actually deploy against Picard-equivalent output. The other two variants
+#     exist to price a *flag*, not to be swept, so they run at one mid-sweep
+#     point and are read against the swept variant at that same point.
 #   - dupsifter (huishenlab): samblaster-lineage, single-pass, streams a
 #     read-name-grouped BAM. Run in `-W` (WGS-only) mode here since our
 #     bench data is unconverted WGS; its WGBS strand-coupling is irrelevant.
-TOOLS = [
-    "samblaster",
-    "dupblaster-sam",
-    "dupblaster-bam",
-    "dupblaster-picard-approx",
-    "dupblaster-picard-exact",
-    "picard",
-    "samtools-markdup",
-    "samtools-markdup-S",
-    "samtools-markdup-seq-S",
-    "dupsifter",
-]
+#   - fastdup (zzhofict, Bioinformatics 2025, doi:10.1093/bioinformatics/btaf633):
+#     Picard's algorithm reimplemented in C++ with a speculation-and-test
+#     scheme. Takes coordinate-sorted BAM and needs no `fixmate -m` tags.
+#     It has NO compression-level control and always writes level 6, so
+#     unlike its class-mates it cannot be held to the level-1 standard —
+#     measured on chr20 of HG03953, ~65% of its single-threaded CPU is
+#     libdeflate level-6 deflate. Its numbers carry that penalty; the
+#     benchmark README says so where they are reported.
+
+# Thread points for the coordinate class, as total CPU slots claimed. Exactly
+# one command-line variant per tool is swept — the one whose output best
+# matches Picard's.
+COORD_SWEEP = [1, 4, 8, 16]
+# Mid-sweep point at which the non-swept markdup flag variants are priced.
+COORD_FLAG_POINT = [8]
+STOCK = ["stock"]
+
+TOOLS = {
+    "samblaster":               dict(cls="streaming",  input="qnsort_sam",        sweep=STOCK),
+    "dupblaster-sam":           dict(cls="streaming",  input="qnsort_sam",        sweep=STOCK),
+    "dupblaster-bam":           dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK),
+    "dupblaster-picard-approx": dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK),
+    "dupblaster-picard-exact":  dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK),
+    "dupsifter":                dict(cls="streaming",  input="qnsort_bam",        sweep=STOCK),
+    "picard":                   dict(cls="coordinate", input="coord_bam",         sweep=STOCK),
+    "samtools-markdup":         dict(cls="coordinate", input="fixmate_coord_bam", sweep=COORD_FLAG_POINT),
+    "samtools-markdup-S":       dict(cls="coordinate", input="fixmate_coord_bam", sweep=COORD_FLAG_POINT),
+    "samtools-markdup-seq-S":   dict(cls="coordinate", input="fixmate_coord_bam", sweep=COORD_SWEEP),
+    "fastdup":                  dict(cls="coordinate", input="coord_bam",         sweep=COORD_SWEEP),
+}
 
 SAMPLE_NAMES = list(SAMPLES.keys())
 TOOL_NAMES   = list(TOOLS)
 REP_IDS      = list(range(1, REPLICATES + 1))
+
+
+def timed_runs():
+    """Every (tool, sweep-point) pair that gets a timed run.
+
+    `nslots` is the path token: "stock" for tools with no thread knob, or the
+    total-CPU-slots number for a swept point (`t1`, `t4`, ... in the run
+    directory)."""
+    return [(tool, str(point)) for tool, spec in TOOLS.items()
+            for point in spec["sweep"]]
 
 
 # ---- targets -------------------------------------------------------------
@@ -371,6 +441,35 @@ rule prep_fixmate_coord_bam:
             | samtools sort -@ {threads} -l 1 \
                 -T "$tmpdir/sort" \
                 -o {output.bam} -
+        rm -rf "$tmpdir"
+        """
+
+
+rule prep_coord_bam:
+    """Plain coordinate-sorted BAM at L=1 — the input for the coordinate-order
+    tools that need no samtools mate tags: Picard and FastDup.
+
+    Both derive mate information themselves (Picard pairs ReadEnds in memory;
+    FastDup reimplements that), so unlike samtools markdup neither needs the
+    `MC`/`ms` tags from `fixmate -m`. Giving them a plain sort keeps the
+    untimed prep honest — they are charged for exactly the input they require,
+    and not for tags they never read.
+
+    Level 1 for the same reason as `prep_fixmate_coord_bam`: it is what a
+    production sort emits, and it is the level these tools' own output is
+    held to."""
+    input:
+        bam = "results/prepped/{sample}.qnsort.bam",
+    output:
+        bam = temp("results/prepped/{sample}.coord.bam"),
+    threads: 4
+    shell:
+        r"""
+        tmpdir=$(dirname {output.bam})/coord-tmp
+        mkdir -p "$tmpdir"
+        samtools sort -@ {threads} -l 1 \
+            -T "$tmpdir/sort" \
+            -o {output.bam} {input.bam}
         rm -rf "$tmpdir"
         """
 
@@ -744,6 +843,52 @@ rule run_samtools_markdup_seq_S:
         """
 
 
+rule run_fastdup:
+    """FastDup (Bioinformatics 2025, doi:10.1093/bioinformatics/btaf633):
+    Picard's algorithm reimplemented in C++ with a speculation-and-test
+    scheme, so it should land on Picard's duplicate sets exactly.
+
+    Consumes the plain coordinate-sorted BAM — it derives mate information
+    itself and needs none of the `fixmate -m` tags samtools markdup requires.
+    Its output is coordinate-ordered, so the untimed conversion name-sorts it
+    to the shared comparison artifact, exactly as the markdup rules do.
+
+    `--metrics` is mandatory (no way to suppress it), so it is written to the
+    run directory rather than discarded; it is Picard-format, which makes it a
+    useful cross-check of the flags we compare. Note FastDup labels the metrics
+    row with a read-group ID where Picard uses the LB value — a cosmetic
+    difference; it does group by library, emitting one row for this sample's 14
+    read groups that share `LB:HG03953`."""
+    input:
+        bam = "results/prepped/{sample}.coord.bam",
+    output:
+        out      = "results/runs/{sample}/fastdup/rep{rep}/out.nsort.bam",
+        metrics  = "results/runs/{sample}/fastdup/rep{rep}/metrics.txt",
+        time_txt = "results/runs/{sample}/fastdup/rep{rep}/time.txt",
+    threads: 4
+    resources:
+        bench = 100,
+    shell:
+        # --num-threads matches this rule's reservation. FastDup has no
+        # compression-level control (it always writes level 6) — see the TOOLS
+        # block; irrelevant here, where only the dup flags are consumed, but it
+        # is why its timed rows carry a compression penalty its class-mates
+        # don't.
+        r"""
+        rep=$(dirname {output.out})
+        tmpdir=$rep/fastdup-tmp
+        mkdir -p "$tmpdir"
+        env time -v -o {output.time_txt} \
+            fastdup --input {input.bam} \
+                --output $rep/out.raw.bam \
+                --metrics {output.metrics} \
+                --num-threads {threads}
+        samtools sort -n -@ {threads} -l 1 -T "$tmpdir/sort" \
+            -o {output.out} $rep/out.raw.bam
+        rm -rf "$tmpdir" $rep/out.raw.bam
+        """
+
+
 # ---- timing (/dev/null output) -------------------------------------------
 # A second, timing-only path that runs each tool writing its output to a
 # named FIFO drained to /dev/null. This models the real
@@ -763,26 +908,44 @@ rule run_samtools_markdup_seq_S:
 # TAG_DUPLICATE_SET_MEMBERS) — those exist only to feed the comparison and
 # cost CPU a normal user never pays; run_picard keeps them for `compare`.
 
+_PREPPED_INPUT = {
+    "qnsort_bam":        "{base}.qnsort.bam",
+    "qnsort_sam":        "{base}.qnsort.sam",
+    "coord_bam":         "{base}.coord.bam",
+    "fixmate_coord_bam": "{base}.fixmate-coord.bam",
+}
+
+
 def _time_inputs(wildcards):
     base = f"results/prepped/{wildcards.sample}"
-    tool = wildcards.tool
-    if tool in ("dupblaster-sam", "samblaster"):
-        return {"main": f"{base}.qnsort.sam"}
-    if tool.startswith("samtools-markdup"):
-        return {"main": f"{base}.fixmate-coord.bam"}
-    if tool == "dupsifter":
-        return {"main": f"{base}.qnsort.bam",
-                "ref": "results/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa"}
-    return {"main": f"{base}.qnsort.bam"}
+    spec = TOOLS[wildcards.tool]
+    inputs = {"main": _PREPPED_INPUT[spec["input"]].format(base=base)}
+    if wildcards.tool == "dupsifter":
+        inputs["ref"] = "results/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa"
+    return inputs
 
 def _time_command(wildcards, input):
     """The exact command timed for each tool, writing to the shell var $sink
     (a FIFO) and using $tmp for any on-disk scratch (counted in the timed
-    window where the tool needs it — e.g. picard-exact's orphan buffer)."""
+    window where the tool needs it — e.g. picard-exact's orphan buffer).
+
+    Output compression follows the class (see the TOOLS block): streaming
+    tools write uncompressed BAM, since the sort they feed recompresses it
+    anyway; coordinate tools write level 1, what a production mark-after-sort
+    step actually emits. FastDup is the one tool that cannot comply — it has
+    no compression-level control and always writes level 6.
+
+    Thread flags come from the sweep point in `wildcards.nslots`, which counts
+    TOTAL slots: `samtools -@ N` takes N *additional* threads, so it gets
+    N-1; FastDup's `--num-threads` is a total, so it gets N."""
     tool = wildcards.tool
+    slots = wildcards.nslots
     bin = DUPBLASTER_BIN
     def dupblaster(extra=""):
         return f'{bin} -i {input.main} -o "$sink" {extra}--ignore-unmated --quiet'
+    def markdup(extra=""):
+        return (f'samtools markdup -@ {int(slots) - 1} -d 100 -c {extra}-l 1 '
+                f'-T "$tmp/md" {input.main} "$sink"')
     if tool == "dupblaster-bam":           return dupblaster()
     if tool == "dupblaster-sam":           return dupblaster()
     if tool == "dupblaster-picard-approx": return dupblaster("--single-end-strategy picard-approx ")
@@ -790,14 +953,24 @@ def _time_command(wildcards, input):
     if tool == "samblaster":               return f'samblaster --ignoreUnmated -i {input.main} -o "$sink"'
     if tool == "dupsifter":                return f'dupsifter -W -o "$sink" -O "$tmp/stats.txt" {input.ref} {input.main}'
     if tool == "picard":
+        # Coordinate-sorted input with ASSUME_SORT_ORDER=coordinate: Picard is
+        # a coordinate-class tool, so it is timed as it is deployed — after the
+        # sort, not paying an internal queryname->coordinate sort inside its
+        # own timed window. (run_picard still reads the name-sorted BAM: it is
+        # the equivalence *reference*, and its name-ordered output is what lets
+        # bench-compare co-stream without a re-sort. Picard's duplicate sets
+        # don't depend on which order it is handed.)
         return (f'java -Xmx{PICARD_HEAP} -jar {PICARD_JAR} MarkDuplicates '
                 f'INPUT={input.main} OUTPUT="$sink" METRICS_FILE="$tmp/metrics.txt" TMP_DIR="$tmp" '
-                f'ASSUME_SORT_ORDER=queryname OPTICAL_DUPLICATE_PIXEL_DISTANCE=100 '
-                f'REMOVE_DUPLICATES=false COMPRESSION_LEVEL=0 '
+                f'ASSUME_SORT_ORDER=coordinate OPTICAL_DUPLICATE_PIXEL_DISTANCE=100 '
+                f'REMOVE_DUPLICATES=false COMPRESSION_LEVEL=1 '
                 f'VALIDATION_STRINGENCY=LENIENT VERBOSITY=WARNING QUIET=true')
-    if tool == "samtools-markdup":       return f'samtools markdup -d 100 -c -l 0 -T "$tmp/md" {input.main} "$sink"'
-    if tool == "samtools-markdup-S":     return f'samtools markdup -d 100 -c -S -l 0 -T "$tmp/md" {input.main} "$sink"'
-    if tool == "samtools-markdup-seq-S": return f'samtools markdup -d 100 -c -S -m s -l 0 -T "$tmp/md" {input.main} "$sink"'
+    if tool == "samtools-markdup":       return markdup()
+    if tool == "samtools-markdup-S":     return markdup("-S ")
+    if tool == "samtools-markdup-seq-S": return markdup("-S -m s ")
+    if tool == "fastdup":
+        return (f'fastdup --input {input.main} --output "$sink" '
+                f'--metrics "$tmp/metrics.txt" --num-threads {slots}')
     raise ValueError(f"no timing command for tool {tool!r}")
 
 def _time_ext(wildcards):
@@ -810,9 +983,11 @@ rule time_tool:
     input:
         unpack(_time_inputs),
     output:
-        time_txt = "results/runs/{sample}/{tool}/rep{rep}/time.devnull.txt",
+        time_txt = "results/runs/{sample}/{tool}/t{nslots}/rep{rep}/time.devnull.txt",
     wildcard_constraints:
         tool = "|".join(TOOL_NAMES),
+        # "stock" for tools with no thread knob; otherwise the sweep point.
+        nslots = r"stock|\d+",
     threads: 4
     resources:
         bench = 100,
@@ -872,17 +1047,29 @@ rule time_tool:
 # ---- aggregation ---------------------------------------------------------
 
 rule collate_bench:
-    """Walk every time.devnull.txt and emit one TSV row per (sample, tool, rep)."""
+    """Walk every time.devnull.txt and emit one TSV row per
+    (sample, tool, sweep point, rep).
+
+    The tool registry drives the fan-out, so a tool's sweep points are
+    declared in exactly one place (TOOLS) and its class is handed to the
+    collation script rather than re-derived there."""
     input:
-        expand("results/runs/{sample}/{tool}/rep{rep}/time.devnull.txt",
-               sample=SAMPLE_NAMES, tool=TOOL_NAMES, rep=REP_IDS),
+        [f"results/runs/{sample}/{tool}/t{nslots}/rep{rep}/time.devnull.txt"
+         for sample in SAMPLE_NAMES
+         for tool, nslots in timed_runs()
+         for rep in REP_IDS],
     output:
         tsv = "results/bench.tsv",
     params:
         script = str(WORKDIR / "workflow" / "scripts" / "collate_bench.py"),
+        # tool:nslots:class, one per timed (tool, sweep point).
+        spec = lambda wc: " ".join(
+            f"{tool}:{nslots}:{TOOLS[tool]['cls']}"
+            for tool, nslots in timed_runs()),
     shell:
         r"""
-        python {params.script} --root results/runs --output {output.tsv}
+        python {params.script} --root results/runs --output {output.tsv} \
+            --spec {params.spec}
         """
 
 
