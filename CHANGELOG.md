@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The minimum supported Rust version is now 1.92** (was 1.89). kuva is upgraded from 0.4.0 to 0.6.0, which renders the PDF plots through krilla instead of the archived svg2pdf and clears RUSTSEC-2026-0345; krilla needs Rust 1.92. The plots look the same and stay byte-identical from run to run.
+
 ## [0.3.0] - 2026-08-24
 
 ### Added

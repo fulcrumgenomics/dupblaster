@@ -2,7 +2,7 @@
 name = "bench-compare"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.92"
 description = "Single-pass duplicate-marking comparison vs Picard (kf tag) for the dupblaster benchmark"
 # Internal benchmark tool — never published to crates.io. Without this, a
 # workspace `cargo release` (release.toml sets `publish = true`) would try to

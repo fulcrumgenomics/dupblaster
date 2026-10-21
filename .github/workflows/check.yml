@@ -21,7 +21,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: "1.89.0"
+      RUSTUP_TOOLCHAIN: "1.92.0"
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -32,7 +32,7 @@ jobs:
       - name: Install Rust toolchain (MSRV)
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          toolchain: "1.89.0"
+          toolchain: "1.92.0"
       - name: Set up compilation cache (sccache)
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - name: Install nextest
