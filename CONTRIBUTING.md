@@ -11,7 +11,7 @@ Conduct, which applies to all interactions in this repository.
 
 **Prerequisites:**
 - Rust stable, minimum version from `rust-toolchain.toml` /
-  `Cargo.toml`'s `rust-version` field (currently **1.89**).
+  `Cargo.toml`'s `rust-version` field (currently **1.92**).
 - [`cargo-nextest`][nextest] for the test runner used in CI.
 - [`cargo-deny`][cargo-deny] for the supply-chain check (optional
   locally; CI runs it on every PR).

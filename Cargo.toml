@@ -10,7 +10,7 @@ version = "0.3.0"
 authors = ["Tim Fennell <tim@fulcrumgenomics.com>"]
 description = "Fast duplicate marking for query-grouped SAM/BAM files, inspired by samblaster and Picard MarkDuplicates"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.92"
 license = "MIT"
 readme = "README.md"
 homepage = "https://github.com/fulcrumgenomics/dupblaster"
@@ -33,9 +33,9 @@ env_logger = "0.11"
 fgoxide = "0.6"
 fgumi-raw-bam = "0.2.0"
 # Renders mate-CIGAR op lengths as decimal in the --add-mate-tags hot path.
-# Already in the tree via kuva → svg2pdf → pdf-writer, so this adds no new crate.
+# Already in the tree via kuva → krilla → pdf-writer, so this adds no new crate.
 itoa = "1.0"
-kuva = { version = "0.4.0", features = ["pdf"] }
+kuva = { version = "0.6.0", features = ["pdf"] }
 libc = "0.2"
 libdeflater = "1.25"
 log = "0.4"

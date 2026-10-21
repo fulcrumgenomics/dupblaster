@@ -315,6 +315,29 @@ fn count_histogram_multi_library_writes_one_faceted_pdf() {
     assert!(!path(".duplication-spectrum.libB.pdf").exists(), "no per-library plot file");
 }
 
+/// Both PDFs are byte-identical across separate processes, whose std `HashMap`s are seeded
+/// differently. Two libraries exercise the ladder's legend and the faceted spectrum.
+#[test]
+fn pdf_plots_are_byte_identical_across_processes() {
+    let env = TestEnv::new();
+    write_two_library_pairs(&env.input);
+    let prefixes: Vec<_> = (0..3).map(|run| env._tmp.path().join(format!("run{run}"))).collect();
+    for prefix in &prefixes {
+        let _ = run_histogram(&env.input, prefix, &[]);
+    }
+    for suffix in [".duplication-sampled.pdf", ".duplication-spectrum.pdf"] {
+        let read = |prefix: &Path| {
+            let mut path = prefix.as_os_str().to_owned();
+            path.push(suffix);
+            std::fs::read(&path).unwrap_or_else(|e| panic!("reading {suffix}: {e}"))
+        };
+        let expected = read(&prefixes[0]);
+        for prefix in &prefixes[1..] {
+            assert!(read(prefix) == expected, "{suffix} differs between runs");
+        }
+    }
+}
+
 #[test]
 fn unwritable_metrics_dir_fails_early_with_clear_error() {
     // The metrics files are written only at the very end, so a bad prefix must be

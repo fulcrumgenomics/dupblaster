@@ -24,16 +24,17 @@ yanked = "deny"
 ignore = [
     # ttf-parser is unmaintained (author declared; no fix forthcoming, no safe
     # upgrade). It is a transitive dependency of kuva's PDF backend
-    # (kuva -> svg2pdf -> fontdb/usvg/resvg/rustybuzz -> ttf-parser), used only to
-    # embed fonts when writing the optional `--complexity-metrics` plots — it is
-    # not on any read/dedup/write data path. Accepted as an unmaintained-crate
+    # (kuva -> krilla/usvg -> fontdb/rustybuzz -> ttf-parser), used only to
+    # embed fonts in the PDF plots: the duplication ladder, written on every run,
+    # and the opt-in `--duplication-spectrum` histogram. It is not on any
+    # read/dedup/write data path. Accepted as an unmaintained-crate
     # flag (not a vulnerability). Revisit if kuva's PDF stack moves off ttf-parser.
     "RUSTSEC-2026-0192",
     # rustybuzz is unmaintained (maintainer declared the project unmaintained on
     # 2026-07-11, recommending harfrust; no patched version). Same kuva PDF
-    # backend as ttf-parser above (kuva -> svg2pdf -> usvg/resvg -> rustybuzz),
-    # doing font shaping only when writing the optional `--complexity-metrics`
-    # plots — not on any read/dedup/write data path. Accepted as an
+    # backend as ttf-parser above (kuva -> krilla/usvg -> rustybuzz),
+    # doing font shaping only when writing those PDF plots, not on any
+    # read/dedup/write data path. Accepted as an
     # unmaintained-crate flag (not a vulnerability). Revisit if kuva's PDF stack
     # moves off rustybuzz.
     "RUSTSEC-2026-0206",
