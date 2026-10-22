@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The minimum supported Rust version is now 1.92** (was 1.89). kuva is upgraded from 0.4.0 to 0.6.0, which renders the PDF plots through krilla instead of the archived svg2pdf and clears RUSTSEC-2026-0345; krilla needs Rust 1.92. The plots look the same and stay byte-identical from run to run.
+- **The minimum supported Rust version is now 1.92** (was 1.89). kuva is upgraded from 0.4.0 to 0.6.0, which renders the PDF plots through krilla instead of the archived svg2pdf; krilla needs Rust 1.92. The plots look the same and stay byte-identical from run to run. The upgrade also clears kuva's RUSTSEC-2026-0345 advisory, which did not affect dupblaster: it covers unescaped labels in interactive SVG and terminal output, and user-supplied style values, none of which dupblaster's PDF plots use.
 
 ## [0.3.0] - 2026-08-24
 
