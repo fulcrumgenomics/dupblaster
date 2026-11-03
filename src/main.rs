@@ -206,6 +206,13 @@ fn parse_tmp_compression_level(s: &str) -> Result<i32, String> {
 /// between.
 const TUNING_HEADING: &str = "Advanced tuning (rarely needed)";
 
+/// Ceiling, in MB, on `--read-buffer-mb` and `--write-buffer-mb`: 1 TiB.
+///
+/// A typo guard, not a memory limit — it catches a byte count passed as MB
+/// (16 MiB in bytes would ask for 16 TiB). Memory is checked separately, by a
+/// warning in `run` when the two rings together exceed physical RAM.
+const MAX_BUFFER_MB: i64 = 1 << 20;
+
 /// Short `about` text shown by `-h`.
 const SHORT_ABOUT: &str =
     concat!(help_banner!(), "Mark or remove duplicate reads in a query-grouped SAM/BAM file.");
@@ -399,7 +406,7 @@ pub struct Args {
     /// The default absorbs typical aligner bursts (bwa-mem emits ~250 MB every
     /// few seconds); raise it for a faster or burstier producer.
     #[arg(long = "read-buffer-mb", default_value_t = 16, help_heading = TUNING_HEADING,
-          value_parser = clap::value_parser!(u32).range(1..=4096))]
+          value_parser = clap::value_parser!(u32).range(1..=MAX_BUFFER_MB))]
     pub read_buffer_mb: u32,
 
     /// Size in MB of the ring buffer between the worker and the output IO thread.
@@ -407,7 +414,7 @@ pub struct Args {
     /// Bigger than the read buffer because downstream sorters pause input for
     /// 1-3 s while flushing a chunk to disk; raise it to 256+ for slower sinks.
     #[arg(long = "write-buffer-mb", default_value_t = 64, help_heading = TUNING_HEADING,
-          value_parser = clap::value_parser!(u32).range(1..=4096))]
+          value_parser = clap::value_parser!(u32).range(1..=MAX_BUFFER_MB))]
     pub write_buffer_mb: u32,
 
     /// Maximum expected read length in bp; raise it for long reads.
@@ -540,6 +547,23 @@ fn run(args: Args) -> Result<ExitCode> {
         _ => Box::new(std::io::stdin()),
     };
     let read_buf_bytes = (args.read_buffer_mb as usize).saturating_mul(1024 * 1024);
+    let write_buf_bytes = (args.write_buffer_mb as usize).saturating_mul(1024 * 1024);
+    // Warn rather than refuse: swap, memory compression and overcommit can let an
+    // oversized ring run, and no portable "will it fit" check exists. Checked
+    // before the read ring is built, since that zero-fills it up front.
+    #[cfg(unix)]
+    if let Some(ram_bytes) = physical_memory_bytes()
+        && read_buf_bytes.saturating_add(write_buf_bytes) as u64 > ram_bytes
+    {
+        eprintln!(
+            "dupblaster: WARNING: --read-buffer-mb ({}) plus --write-buffer-mb ({}) exceeds \
+             this machine's physical memory ({} MB); expect heavy swapping or an \
+             out-of-memory kill.",
+            args.read_buffer_mb,
+            args.write_buffer_mb,
+            ram_bytes / (1024 * 1024)
+        );
+    }
     let mut reader_box: Box<dyn BufRead> =
         Box::new(ReadAhead::with_thread_name(raw_source, read_buf_bytes, "dupblaster"));
     let input_name =
@@ -593,7 +617,6 @@ fn run(args: Args) -> Result<ExitCode> {
 
     append_dupblaster_pg(&mut header)?;
 
-    let write_buf_bytes = (args.write_buffer_mb as usize).saturating_mul(1024 * 1024);
     let mut out = RawBamWriter::open(
         args.output.as_deref(),
         &header,
@@ -1178,6 +1201,18 @@ fn report(started: &StartedRun, n_templates: u64, quiet: bool) {
     let _ = writeln!(stderr, "dupblaster: Processed {n_templates} templates in {wall:.2}s wall.");
 }
 
+/// Total physical RAM in bytes, or `None` if the OS doesn't report it.
+///
+/// In a container this is the host's RAM, not the cgroup limit, so it can
+/// under-warn there.
+#[cfg(unix)]
+fn physical_memory_bytes() -> Option<u64> {
+    // SAFETY: `sysconf` takes no pointers; it only reads a system setting.
+    let (pages, page_size) =
+        unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    (pages > 0 && page_size > 0).then(|| (pages as u64).saturating_mul(page_size as u64))
+}
+
 /// Normalized resource-usage snapshot from `getrusage(RUSAGE_SELF)`.
 #[cfg(unix)]
 struct Rusage {
@@ -1312,6 +1347,48 @@ mod tests {
     fn min_bins_accepts_in_range() {
         let args = parse(&["--min-bins", "8192"]).unwrap();
         assert_eq!(args.min_bins, 8192);
+    }
+
+    #[test]
+    fn read_buffer_mb_accepts_more_than_4_gib() {
+        let args = parse(&["--read-buffer-mb", "8192"]).unwrap();
+        assert_eq!(args.read_buffer_mb, 8192);
+    }
+
+    #[test]
+    fn read_buffer_mb_accepts_1_tib() {
+        let args = parse(&["--read-buffer-mb", "1048576"]).unwrap();
+        assert_eq!(args.read_buffer_mb, 1_048_576);
+    }
+
+    #[test]
+    fn read_buffer_mb_rejects_more_than_1_tib() {
+        assert!(parse(&["--read-buffer-mb", "1048577"]).is_err());
+    }
+
+    #[test]
+    fn write_buffer_mb_accepts_more_than_4_gib() {
+        let args = parse(&["--write-buffer-mb", "8192"]).unwrap();
+        assert_eq!(args.write_buffer_mb, 8192);
+    }
+
+    #[test]
+    fn write_buffer_mb_accepts_1_tib() {
+        let args = parse(&["--write-buffer-mb", "1048576"]).unwrap();
+        assert_eq!(args.write_buffer_mb, 1_048_576);
+    }
+
+    #[test]
+    fn write_buffer_mb_rejects_more_than_1_tib() {
+        assert!(parse(&["--write-buffer-mb", "1048577"]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_memory_bytes_reports_a_plausible_size() {
+        // Any machine able to build and test dupblaster has at least 256 MiB.
+        let ram_bytes = physical_memory_bytes().expect("sysconf should report physical memory");
+        assert!(ram_bytes >= 256 * 1024 * 1024, "implausible RAM: {ram_bytes} bytes");
     }
 
     #[test]
