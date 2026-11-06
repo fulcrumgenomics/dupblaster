@@ -727,6 +727,17 @@ fn run(args: Args) -> Result<ExitCode> {
     // the BGZF EOF block and surfaced any main-output write error — an error
     // that relying on `Drop` alone would silently swallow.
     out.finish().context("finishing main output")?;
+    // Flushing stdout doesn't close it: a reader downstream in a pipe sees end of
+    // file only when every holder of the write end lets go, so close it here.
+    #[cfg(unix)]
+    if args.output.as_deref().is_none_or(|p| p.as_os_str() == "-")
+        && let Err(err) = close_stdout()
+    {
+        eprintln!(
+            "dupblaster: WARNING: could not close stdout early ({err}); a downstream reader \
+             will see end of file when dupblaster exits."
+        );
+    }
 
     // Only now that the output stream is closed may the decomposition read its
     // spill back: it touches gigabytes and can take tens of seconds, and
@@ -1205,6 +1216,22 @@ fn report(started: &StartedRun, n_templates: u64, quiet: bool) {
 ///
 /// In a container this is the host's RAM, not the cgroup limit, so it can
 /// under-warn there.
+/// Close standard output once the BAM written to it is complete, by pointing
+/// descriptor 1 at `/dev/null` rather than closing it outright: a later `open`
+/// can then never be handed descriptor 1, and any stray write to stdout goes
+/// nowhere.
+#[cfg(unix)]
+fn close_stdout() -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let devnull = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+    // SAFETY: `dup2` takes two plain descriptors: `devnull` is open for the whole
+    // call, and descriptor 1 always exists in a process that got this far.
+    if unsafe { libc::dup2(devnull.as_raw_fd(), libc::STDOUT_FILENO) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn physical_memory_bytes() -> Option<u64> {
     // SAFETY: `sysconf` takes no pointers; it only reads a system setting.
