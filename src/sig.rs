@@ -262,14 +262,14 @@ pub enum SingleEndStrategy {
     /// Exact Picard fragment semantics via a deferred two-pass scheme:
     /// fully-mapped/unmapped pairs stream straight to the output while
     /// every mapped-orphan / single-end "fragment" block is buffered to a
-    /// temporary BAM. After the pair pass completes, the pair
-    /// table is *consumed* into a fragment table (via
-    /// [`PairDupTable::drain_into_fragment_table`]) holding the 5' position
-    /// of every paired read end; the buffered fragments are then re-read
-    /// and checked against it. Because the fragment table is complete
-    /// before any fragment is checked, the "fragments never beat pairs"
-    /// rule holds exactly and independent of input order — unlike
-    /// `PicardApprox`. Costs a temporary on-disk copy of the fragment
+    /// temporary BAM. After the pair pass completes, the pair table is
+    /// *consumed* into a fragment table (via
+    /// [`PairDupTable::drain_ends_matching`]) holding the 5' position of
+    /// every paired read end that some buffered fragment shares; the
+    /// buffered fragments are then re-read and checked against it. Because
+    /// the fragment table is complete before any fragment is checked, the
+    /// "fragments never beat pairs" rule holds exactly and independent of
+    /// input order, unlike `PicardApprox`. Costs a temporary on-disk copy of the fragment
     /// blocks (a small fraction of paired data) and emits those fragments
     /// at the *end* of the output stream rather than in input order.
     /// Intended for paired data only.
@@ -376,8 +376,9 @@ pub(crate) fn single_end_slot(
 /// * **Fragment table** ([`FragmentDupTable`]): `S = u32` because each
 ///   entry is a single `bin_pos` (≤ 27 bits). Built with
 ///   [`Self::new_single_end`] which allocates a 1D `stride`-length cell
-///   array indexed by `off = s = bin_num*2 + strand`. Used only by
-///   [`SingleEndStrategy::PicardApprox`].
+///   array indexed by `off = s = bin_num*2 + strand`. Used by
+///   [`SingleEndStrategy::PicardApprox`] and
+///   [`SingleEndStrategy::PicardExact`].
 ///
 /// ## Why this partitioning level?
 ///
@@ -398,7 +399,7 @@ where
 {
     /// Cell-row width = `(bin_count + 1) * 2`. Used by
     /// [`PairDupTable::pair_slot`] to compute the 2D offset `s1 * stride + s2`
-    /// and by [`PairDupTable::drain_into_fragment_table`] to invert it; not
+    /// and by [`PairDupTable::drain_ends_matching`] to invert it; not
     /// consulted by fragment-table operations (which only use the `s1 = 0` row).
     stride: u32,
     /// The flat array of partition cells, each a `HashSet` of signature values.
@@ -413,13 +414,15 @@ where
 /// keying.
 pub type PairDupTable = DupTable<u64, U64Hasher>;
 
-/// Fragment-key dedup table (`u32` sigs, 1D-partitioned). Stores each end of
-/// every fully-mapped PE pair plus every orphan, enabling the orphan ↔ pair-end
-/// cross-check. Allocated under [`SingleEndStrategy::PicardApprox`] (populated
-/// concurrently with the pair pass) and [`SingleEndStrategy::PicardExact`]
-/// (populated after the pair pass by draining the pair table; see
-/// [`PairDupTable::drain_into_fragment_table`]). Not used by `StrandAware` /
-/// `SamblasterLegacy`, which key orphans on the pair table's `s1 = 0` row.
+/// Fragment-key dedup table (`u32` sigs, 1D-partitioned), enabling the orphan ↔
+/// pair-end cross-check. Under [`SingleEndStrategy::PicardApprox`] it holds each
+/// end of every fully-mapped PE pair plus every orphan, populated concurrently
+/// with the pair pass. Under [`SingleEndStrategy::PicardExact`] it is built after
+/// the pair pass from the pair ends that some orphan shares (see
+/// [`PairDupTable::drain_ends_matching`]), then takes the orphans as phase 2
+/// checks them; phase 1 also uses one to collect the orphans' keys. Not used by
+/// `StrandAware` / `SamblasterLegacy`, which key orphans on the pair table's
+/// `s1 = 0` row.
 pub type FragmentDupTable = DupTable<u32, U32Hasher>;
 
 impl<S, H> DupTable<S, H>
@@ -513,49 +516,57 @@ impl PairDupTable {
         !self.sets[slot.off].insert(slot.sig as u64)
     }
 
-    /// Consume every stored pair signature, inserting *both* 5'-aligned ends
-    /// of each pair into a freshly-built [`FragmentDupTable`], freeing each
-    /// pair cell as it is drained so peak memory stays near a single table
-    /// rather than holding the full pair and fragment tables at once.
+    /// Consume the pair table, returning a [`FragmentDupTable`] of the 5'-aligned
+    /// pair ends that `wanted` also holds. Each pair cell is freed as it is
+    /// drained, and the table itself when it returns.
     ///
-    /// Used by [`SingleEndStrategy::PicardExact`]: after the streaming pair
-    /// pass finishes, the returned table holds the 5' position of every
-    /// paired read end, so a deferred orphan / single-end read sharing one of
-    /// those 5' coordinates is marked as a duplicate of the pair ("fragments
-    /// never beat pairs"), exactly and independent of input order.
+    /// Used by [`SingleEndStrategy::PicardExact`], with `wanted` holding the 5'
+    /// key of every deferred orphan / single-end read. Phase 2 only asks whether
+    /// an orphan's own key is a pair end, so the pair ends no orphan shares can't
+    /// change any answer, and leaving them out keeps the table as small as the
+    /// orphans rather than twice the number of pairs. A pair cell whose ends'
+    /// `(bin_num, strand)` cohorts hold no orphan is dropped without looking at
+    /// its signatures. Each cell of the returned table is pre-sized for
+    /// `wanted`'s keys in that cell, which phase 2 inserts.
     ///
     /// Reconstruction is lossless because the pair table stores a pair's full
     /// signature: the cell index encodes each end's `(bin_num, strand)` (via
     /// `s = bin_num*2 + strand`) and the `u64` sig packs the two `bin_pos`
-    /// halves. Pair canonicalization (the `need_swap`-style ordering
-    /// applied before insertion) is irrelevant here because each end is
-    /// re-inserted independently.
-    ///
-    /// `cell_cap` is forwarded to the new fragment table's per-cell
-    /// pre-sizing (see `with_n_cells`).
-    pub fn drain_into_fragment_table(&mut self, cell_cap: usize) -> FragmentDupTable {
+    /// halves. `Slot { off: s, sig: bin_pos }` is therefore exactly the key
+    /// [`single_end_slot`] gives a strand-aware fragment at that end. Pair
+    /// canonicalization (the `need_swap`-style ordering applied before
+    /// insertion) is irrelevant because each end is checked independently.
+    pub(crate) fn drain_ends_matching(mut self, wanted: &FragmentDupTable) -> FragmentDupTable {
+        debug_assert_eq!(wanted.stride, self.stride, "built for a different bin count");
         let stride = self.stride as usize;
-        // `new_single_end(bin_count)` rebuilds `stride = (bin_count + 1) * 2`,
-        // so this reproduces the pair table's stride exactly.
-        let bin_count = self.stride / 2 - 1;
-        let mut frag = FragmentDupTable::new_single_end(bin_count, cell_cap);
+        let mut matched = FragmentDupTable {
+            stride: self.stride,
+            sets: wanted
+                .sets
+                .iter()
+                .map(|cell| HashSet::with_capacity_and_hasher(cell.len(), Default::default()))
+                .collect(),
+        };
         for off in 0..self.sets.len() {
-            // Recover each end's (bin_num, strand) from the 2D cell index.
-            let s1 = (off / stride) as u32;
-            let s2 = (off % stride) as u32;
-            let (bin_num1, rev1) = (s1 >> 1, s1 & 1 == 1);
-            let (bin_num2, rev2) = (s2 >> 1, s2 & 1 == 1);
-            // Move the cell out so its backing allocation is dropped as soon
-            // as we've drained it — this is what keeps the peak near one table.
+            // Move the cell out so its backing allocation is dropped as soon as
+            // it has been drained.
             let cell = std::mem::take(&mut self.sets[off]);
+            let (s1, s2) = (off / stride, off % stride);
+            let (wanted1, wanted2) = (&wanted.sets[s1], &wanted.sets[s2]);
+            if wanted1.is_empty() && wanted2.is_empty() {
+                continue;
+            }
             for sig in cell {
-                let bin_pos1 = (sig >> 32) as u32;
-                let bin_pos2 = (sig & 0xFFFF_FFFF) as u32;
-                frag.check_or_insert(bin_num1, bin_pos1, rev1);
-                frag.check_or_insert(bin_num2, bin_pos2, rev2);
+                let (bin_pos1, bin_pos2) = ((sig >> 32) as u32, (sig & 0xFFFF_FFFF) as u32);
+                if wanted1.contains(&bin_pos1) {
+                    matched.insert(Slot { off: s1, sig: bin_pos1 });
+                }
+                if wanted2.contains(&bin_pos2) {
+                    matched.insert(Slot { off: s2, sig: bin_pos2 });
+                }
             }
         }
-        frag
+        matched
     }
 }
 
@@ -564,9 +575,9 @@ impl PairDupTable {
 impl FragmentDupTable {
     /// Insert `(bin_num, bin_pos, rev)` into the fragment table; return
     /// `true` if the entry was already present. Strand-aware keying only
-    /// (the table is allocated only under `PicardApprox`, which doesn't
-    /// use the legacy strand-drop variant). Caller must ensure the
-    /// table was built with [`DupTable::new_single_end`].
+    /// (fragment tables exist only under `PicardApprox` / `PicardExact`,
+    /// neither of which drops the strand). Caller must ensure the table was
+    /// built with [`DupTable::new_single_end`].
     ///
     /// This is the only operation the table supports — there is no
     /// "register-without-checking" variant because the underlying
@@ -575,8 +586,8 @@ impl FragmentDupTable {
     /// (paired-end-end inserts in `RecordProcessor`) simply ignore it.
     #[inline]
     pub fn check_or_insert(&mut self, bin_num: u32, bin_pos: u32, rev: bool) -> bool {
-        // Fragment keying is always strand-aware (allocated only under
-        // PicardApprox, which has no legacy strand-drop variant).
+        // Fragment keying is always strand-aware (fragment tables exist only
+        // under the Picard strategies, which never drop the strand).
         self.insert(single_end_slot(bin_num, bin_pos, rev, true))
     }
 
@@ -696,32 +707,46 @@ mod tests {
         assert!(!t.check_or_insert(3, 555, true));
     }
 
+    /// A fragment table holding the given `(bin_num, bin_pos, rev)` keys.
+    fn fragments(keys: &[(u32, u32, bool)]) -> FragmentDupTable {
+        let mut t = FragmentDupTable::new_single_end(8, 0);
+        for &(bin_num, bin_pos, rev) in keys {
+            t.check_or_insert(bin_num, bin_pos, rev);
+        }
+        t
+    }
+
     #[test]
-    fn drain_recovers_both_pair_ends_into_fragment_table() {
+    fn drain_keeps_only_the_pair_ends_that_are_wanted() {
         let mut pairs = PairDupTable::new_pair(8, 64);
-        // Insert one pair: end A = (bin 1, pos 100, fwd), end B = (bin 2, pos 200, rev).
-        let s = pairs.pair_slot(1, 100, false, 2, 200, true);
-        assert!(!pairs.insert_pair(s));
-        let mut frag = pairs.drain_into_fragment_table(64);
-        // Both ends of the pair are now present in the fragment table: a
-        // re-insert at either coordinate reports a collision.
-        assert!(frag.check_or_insert(1, 100, false), "pair end A should be present");
-        assert!(frag.check_or_insert(2, 200, true), "pair end B should be present");
-        // A coordinate that was never part of any pair is absent.
-        assert!(!frag.check_or_insert(3, 300, false), "unrelated coord should be absent");
+        // Pair 1: ends (bin 1, pos 100, fwd) and (bin 2, pos 200, rev).
+        assert!(!pairs.insert_pair(pairs.pair_slot(1, 100, false, 2, 200, true)));
+        // Pair 2: ends (bin 3, pos 300, fwd) and (bin 4, pos 400, fwd).
+        assert!(!pairs.insert_pair(pairs.pair_slot(3, 300, false, 4, 400, false)));
+        // Pair 3: ends (bin 6, pos 600, fwd) and (bin 7, pos 700, fwd), in cohorts
+        // with no wanted key at all, so its cell is skipped without being read.
+        assert!(!pairs.insert_pair(pairs.pair_slot(6, 600, false, 7, 700, false)));
+        // Wanted: pair 1's first end, pair 2's second end, and a coordinate no pair has.
+        let wanted = fragments(&[(1, 100, false), (4, 400, false), (5, 500, false)]);
+        let mut matched = pairs.drain_ends_matching(&wanted);
+        assert!(matched.check_or_insert(1, 100, false), "pair 1's first end should match");
+        assert!(matched.check_or_insert(4, 400, false), "pair 2's second end should match");
+        assert!(!matched.check_or_insert(2, 200, true), "an end no one wants is left out");
+        assert!(!matched.check_or_insert(3, 300, false), "an end no one wants is left out");
+        assert!(!matched.check_or_insert(5, 500, false), "a wanted key no pair has is left out");
+        assert!(!matched.check_or_insert(6, 600, false), "a skipped cell's ends are left out");
+        assert!(!matched.check_or_insert(7, 700, false), "a skipped cell's ends are left out");
     }
 
     #[test]
     fn drain_is_strand_aware() {
         let mut pairs = PairDupTable::new_pair(8, 64);
         // Pair end at (bin 4, pos 555, forward).
-        let s = pairs.pair_slot(4, 555, false, 5, 600, false);
-        assert!(!pairs.insert_pair(s));
-        let mut frag = pairs.drain_into_fragment_table(64);
-        // The forward end collides; the reverse-strand coordinate at the same
-        // bin/pos is a distinct key and does not.
-        assert!(!frag.check_or_insert(4, 555, true), "reverse coord must not collide with fwd end");
-        assert!(frag.check_or_insert(4, 555, false), "forward end should be present");
+        assert!(!pairs.insert_pair(pairs.pair_slot(4, 555, false, 5, 600, false)));
+        let mut matched = pairs.drain_ends_matching(&fragments(&[(4, 555, false), (4, 555, true)]));
+        assert!(matched.check_or_insert(4, 555, false), "the forward key should match");
+        // The reverse-strand key at the same bin/pos is a different key.
+        assert!(!matched.check_or_insert(4, 555, true), "reverse key must not match a fwd end");
     }
 
     #[test]

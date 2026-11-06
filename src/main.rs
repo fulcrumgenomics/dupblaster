@@ -946,8 +946,9 @@ fn for_each_block(
 ///
 /// **Pass 1** streams pairs and unmapped/unmated blocks straight to `out`
 /// while buffering every mapped-orphan / single-end block to a temporary
-/// BAM. **Transition** drains the completed pair table into a
-/// fragment table holding every paired read end. **Pass 2** re-reads the
+/// BAM, recording each one's 5' key. **Transition** drains the completed pair
+/// table into a fragment table holding the paired read ends that one of those
+/// keys matches. **Pass 2** re-reads the
 /// buffered blocks and marks each fragment that collides with a pair end (or
 /// an earlier fragment), emitting them after the pairs.
 ///
@@ -993,7 +994,8 @@ fn run_picard_exact(
         temp_writer.finish().context("finishing temp orphan BAM")?;
     }
 
-    // Transition: build the fragment table from every pair end.
+    // Transition: build the fragment table from the pair ends the buffered
+    // fragments share.
     processor.finalize_fragment_table();
 
     // Pass 2: re-read the buffered fragments and mark them against the

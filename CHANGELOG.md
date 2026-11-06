@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `--single-end-strategy picard-exact` now keeps, after the pair pass, only the pair ends that some buffered orphan shares instead of building a table of every pair end; the duplicates marked and every metric are unchanged. On paired data this is faster and smaller (HG002 chr20, 9.46M templates: 9.4 s to 7.9 s, 407 MB to 342 MB peak); on single-end or orphan-heavy input, which the mode is not meant for, it is slower (about 30% on 8M single-end reads), since each orphan's key is now also recorded in the first pass.
 - `--read-buffer-mb` and `--write-buffer-mb` now accept up to 1 TiB (`1048576`), up from 4096. The ceiling only guards against typos such as passing a byte count. dupblaster now prints a warning, and carries on, when the two buffers together exceed the machine's physical RAM. In a container that check sees the host's RAM, not the container's limit.
 - **The minimum supported Rust version is now 1.92** (was 1.89). kuva is upgraded from 0.4.0 to 0.6.0, which renders the PDF plots through krilla instead of the archived svg2pdf; krilla needs Rust 1.92. The plots look the same and stay byte-identical from run to run. The upgrade also clears kuva's RUSTSEC-2026-0345 advisory, which did not affect dupblaster: it covers unescaped labels in interactive SVG and terminal output, and user-supplied style values, none of which dupblaster's PDF plots use.
 

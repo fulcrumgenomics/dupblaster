@@ -23,7 +23,7 @@ use crate::cigar::CigarInfo;
 use crate::counts::CountsMap;
 use crate::raw_writer::RawBamWriter;
 use crate::sig::{
-    BinIndex, FragmentDupTable, MethylationMode, PairDupTable, SingleEndStrategy,
+    BinIndex, FragmentDupTable, FragmentSlot, MethylationMode, PairDupTable, SingleEndStrategy,
     five_prime_aligned_pos, orphan_pos_override, single_end_slot,
 };
 use crate::tiles::TileSpiller;
@@ -295,8 +295,9 @@ pub struct RecordProcessor {
     /// Per-library pair tables, indexed by library bucket; `None` until the
     /// library's first pair is seen.
     dups: Vec<Option<PairDupTable>>,
-    /// Per-library fragment tables holding the 5' position of every paired
-    /// read end, so a later orphan / single-end read at the same
+    /// Per-library fragment tables holding the 5' position of paired read ends
+    /// (all of them, or under `PicardExact` those some orphan shares), so an
+    /// orphan / single-end read at the same
     /// `(bin_num, bin_pos, strand)` is detected as a duplicate of the pair via
     /// [`FragmentDupTable::check_or_insert`]. Two strategies populate it, at
     /// different times:
@@ -306,7 +307,8 @@ pub struct RecordProcessor {
     ///   Approximate, because an orphan that precedes its pair in the stream
     ///   isn't yet registered.
     /// * [`SingleEndStrategy::PicardExact`]: built *after* the pair pass by
-    ///   [`Self::finalize_fragment_table`] draining each library's pair table,
+    ///   [`Self::finalize_fragment_table`], from the ends in each library's pair
+    ///   table that some deferred fragment shares (see [`Self::orphan_keys`]),
     ///   so it's complete before any deferred fragment is checked.
     ///
     /// Stays all-`None` under `StrandAware` / `SamblasterLegacy` (those key
@@ -314,6 +316,11 @@ pub struct RecordProcessor {
     /// the pair table's `u64`) and a 1D `stride`-cell layout (vs 2D `stride²`),
     /// keeping the memory overhead bounded.
     frag_dups: Vec<Option<FragmentDupTable>>,
+    /// Per library, under [`SingleEndStrategy::PicardExact`] only: the 5' key of
+    /// every fragment phase 1 defers. [`Self::finalize_fragment_table`] keeps just
+    /// the pair ends among these keys, rather than every pair end, which is all
+    /// phase 2 can ask about. Taken (left `None`) at the transition.
+    orphan_keys: Vec<Option<FragmentDupTable>>,
     /// Resolves each template's read group to a library bucket. `num_libs() ==
     /// 1` means single-library mode, where [`Self::resolve_library`] short-
     /// circuits to bucket 0 without ever scanning a record's `RG` tag.
@@ -371,6 +378,7 @@ impl RecordProcessor {
         // first template, matching the pre-library memory profile.
         let dups = (0..num_libs).map(|_| None).collect();
         let frag_dups = (0..num_libs).map(|_| None).collect();
+        let orphan_keys = (0..num_libs).map(|_| None).collect();
         // Counts are eagerly allocated per library (unlike the lazily-built dup
         // tables) so the per-template observe hook is a simple cell index. Each
         // count side-table mirrors the dedup tables' partitioning, so it is
@@ -382,6 +390,7 @@ impl RecordProcessor {
             bin_count,
             dups,
             frag_dups,
+            orphan_keys,
             library_index,
             partition_cap,
             last_rg: Vec::new(),
@@ -713,9 +722,22 @@ impl RecordProcessor {
     /// Compute the single-end / orphan signature for the mapped fragment end
     /// and return whether it's a duplicate, against library `lib`'s tables.
     /// `PicardApprox` / `PicardExact` consult the fragment table (which also
-    /// holds every paired read end, so an orphan collides with a pair sharing
-    /// its 5' coordinate); `StrandAware` / `SamblasterLegacy` use the orphan
-    /// row of the pair table.
+    /// holds the paired read ends, every one or every one an orphan shares, so
+    /// an orphan collides with a pair sharing its 5' coordinate);
+    /// `StrandAware` / `SamblasterLegacy` use the orphan row of the pair table.
+    /// The single-end / orphan slot for a fragment's mapped end, and whether its
+    /// 5' coordinate was clamped into its contig. Single-end keying is
+    /// strand-aware except under samblaster-legacy, which keys orphans
+    /// strand-obliviously (the strand-drop lives in [`single_end_slot`]). The
+    /// slot is computed once and reused for the dedup check and the count
+    /// side-table so they group identically, and phase 1 of `PicardExact`
+    /// records the same slot that phase 2 checks.
+    fn fragment_slot(&self, mapped: &RawRecord) -> Result<(FragmentSlot, bool)> {
+        let d = self.derive_for_dup(mapped, true)?;
+        let se_strand_aware = self.opts.single_end_strategy != SingleEndStrategy::SamblasterLegacy;
+        Ok((single_end_slot(d.bin_num, d.bin_pos, d.is_reverse, se_strand_aware), d.clamped))
+    }
+
     fn check_fragment_signature(
         &mut self,
         block: &[RawRecord],
@@ -723,19 +745,13 @@ impl RecordProcessor {
         lib: u32,
         stats: &mut Stats,
     ) -> Result<bool> {
-        let d = self.derive_for_dup(&block[mapped], true)?;
-        if d.clamped {
+        let (slot, clamped) = self.fragment_slot(&block[mapped])?;
+        if clamped {
             self.note_clamp(stats);
         }
-        // Single-end keying is strand-aware except under samblaster-legacy,
-        // which keys orphans strand-obliviously. Compute the slot once (the
-        // strand-drop lives in `single_end_slot`), then reuse it for the dedup
-        // check and the count side-table so they group identically.
-        let se_strand_aware = self.opts.single_end_strategy != SingleEndStrategy::SamblasterLegacy;
-        let slot = single_end_slot(d.bin_num, d.bin_pos, d.is_reverse, se_strand_aware);
         let is_dup = match self.opts.single_end_strategy {
-            // Picard keys orphans on the fragment table (which also holds every
-            // pair-end, so an orphan collides with a pair at its 5' coordinate).
+            // Picard keys orphans on the fragment table (which also holds the
+            // pair ends, so an orphan collides with a pair at its 5' coordinate).
             SingleEndStrategy::PicardApprox | SingleEndStrategy::PicardExact => {
                 self.frag_table(lib).insert(slot)
             }
@@ -764,8 +780,10 @@ impl RecordProcessor {
     /// path would, but *defer* every mapped-fragment block by writing its
     /// whole record group to `temp` (a BAM). Deferred blocks are
     /// neither dup-marked nor counted here — that happens in phase 2, after
-    /// the fragment table is complete. Mate tags are added to fragment blocks
-    /// before buffering so the buffered copy matches single-pass output.
+    /// the fragment table is complete — but each one's 5' key is recorded in
+    /// [`Self::orphan_keys`] for [`Self::finalize_fragment_table`]. Mate tags
+    /// are added to fragment blocks before buffering so the buffered copy
+    /// matches single-pass output.
     pub fn process_block_phase1(
         &mut self,
         block: &mut [RawRecord],
@@ -783,7 +801,14 @@ impl RecordProcessor {
                     self.add_mate_tags_pair(block, mapped, m);
                 }
                 // Deferred to phase 2 (re-read from the temp BAM); the RG tag
-                // round-trips, so library attribution happens there.
+                // round-trips, so library attribution happens there. Its key is
+                // kept now, exactly as phase 2 will compute it. The key tables
+                // start unsized: orphans are a small fraction of paired data.
+                let (slot, _) = self.fragment_slot(&block[mapped])?;
+                let bin_count = self.bin_count;
+                self.orphan_keys[li]
+                    .get_or_insert_with(|| FragmentDupTable::new_single_end(bin_count, 0))
+                    .insert(slot);
                 for rec in block.iter() {
                     temp.write_record(rec)?;
                 }
@@ -822,17 +847,22 @@ impl RecordProcessor {
 
     /// Transition between phases 1 and 2 of [`SingleEndStrategy::PicardExact`]:
     /// consume each library's completed pair table into its fragment table,
-    /// which then holds the 5' position of every paired read end for that
-    /// library. Call exactly once, after phase 1 and before phase 2.
+    /// which then holds the 5' position of every paired read end that one of
+    /// that library's deferred fragments shares. Phase 2 checks only those
+    /// fragments' own keys, so this marks exactly what a table of every pair end
+    /// would, without building one twice the size of the pair table. A library
+    /// with no deferred fragment gets no table. Call exactly once, after phase 1
+    /// and before phase 2.
     pub fn finalize_fragment_table(&mut self) {
         debug_assert!(
             self.frag_dups.iter().all(Option::is_none),
             "fragment tables must be built exactly once"
         );
-        let cap = self.partition_cap;
+        // Every pair table is dropped here: phase 2 never reads one again.
         for lib in 0..self.dups.len() {
-            if let Some(pair) = self.dups[lib].as_mut() {
-                self.frag_dups[lib] = Some(pair.drain_into_fragment_table(cap));
+            let (pair, orphans) = (self.dups[lib].take(), self.orphan_keys[lib].take());
+            if let (Some(pair), Some(orphans)) = (pair, orphans) {
+                self.frag_dups[lib] = Some(pair.drain_ends_matching(&orphans));
             }
         }
     }
