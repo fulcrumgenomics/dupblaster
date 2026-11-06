@@ -8,7 +8,6 @@ mod helpers;
 use std::ffi::CString;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -60,8 +59,8 @@ fn stdout_reaches_end_of_file_before_the_metrics_are_written() {
         .rec_simple(name, 99, "chr1", 100, "50M", "=", 200, 150)
         .rec_simple(name, 147, "chr1", 200, "50M", "=", 100, -150)
         .write_to(&env.input);
-    let prefix = env._tmp.path().join("metrics");
-    let fifo: PathBuf = env._tmp.path().join("metrics.duplicate-metrics.tsv");
+    let prefix = metrics_prefix_in(env._tmp.path());
+    let fifo = prefix.with_extension("duplicate-metrics.tsv");
     let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
     // SAFETY: `fifo_c` is a valid NUL-terminated path for the duration of the call.
     assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0, "mkfifo {}", fifo.display());
