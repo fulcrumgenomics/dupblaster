@@ -23,6 +23,7 @@
 //! [`RawBamWriter::open_temp`].
 
 use std::io::{self, Write};
+use std::os::fd::AsFd;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -39,10 +40,9 @@ const BAM_MAGIC: &[u8; 4] = b"BAM\x01";
 /// The destinations we write BAM bytes to. No buffering of their own — BGZF
 /// hands down whole blocks, and a [`WriteBehind`] sits in front.
 enum Sink {
-    /// A regular file opened for writing.
+    /// A regular file opened for writing, or standard output taken over by
+    /// [`take_stdout`].
     File(std::fs::File),
-    /// Standard output (used when `--output` is absent or is `"-"`).
-    Stdout(io::Stdout),
     /// A file behind a zstd stream, for temporary output only.
     ///
     /// Nesting the codec inside the sink rather than around the BGZF writer keeps
@@ -61,7 +61,6 @@ impl Sink {
     fn finish(self) -> Result<()> {
         match self {
             Sink::File(mut f) => f.flush().context("flushing output file")?,
-            Sink::Stdout(mut s) => s.flush().context("flushing stdout")?,
             Sink::Zstd(encoder) => {
                 encoder.finish().context("finishing zstd temp output")?;
             }
@@ -74,17 +73,36 @@ impl Write for Sink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Sink::File(f) => f.write(buf),
-            Sink::Stdout(s) => s.write(buf),
             Sink::Zstd(e) => e.write(buf),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Sink::File(f) => f.flush(),
-            Sink::Stdout(s) => s.flush(),
             Sink::Zstd(e) => e.flush(),
         }
     }
+}
+
+/// Take standard output over as a file the writer owns, so that finishing the
+/// writer closes it just as it closes a regular file.
+///
+/// Dropping an [`io::Stdout`] closes nothing, and a reader downstream in a pipe
+/// sees end of file only once every descriptor on the write end is closed. So
+/// this duplicates descriptor 1, then points descriptor 1 itself at stderr,
+/// leaving the returned file as this process's only descriptor on the pipe.
+/// Redirecting descriptor 1 rather than closing it means a later `open` can
+/// never be handed it, and anything else printed to stdout lands on stderr
+/// instead of in the BAM.
+fn take_stdout() -> io::Result<std::fs::File> {
+    let stdout = io::stdout().as_fd().try_clone_to_owned()?;
+    // SAFETY: no `OwnedFd` owns descriptor 1 (`io::Stdout` uses it by number, and
+    // the borrow above ended with the clone), and `dup2` replaces it atomically,
+    // so it is never left closed.
+    if unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(std::fs::File::from(stdout))
 }
 
 /// BAM writer that owns its BGZF framing.
@@ -112,6 +130,10 @@ impl RawBamWriter {
     /// Output goes through a [`WriteBehind`] with a `ring_bytes` ring
     /// buffer so BGZF compression on the worker thread is decoupled from
     /// the actual `write()` syscall on the underlying file/stdout.
+    ///
+    /// Opening stdout takes descriptor 1 over for the rest of the process (see
+    /// `take_stdout`), so do it at most once: a second call would duplicate
+    /// stderr and write the BAM there.
     pub fn open(
         path: Option<&Path>,
         header: &Header,
@@ -124,7 +146,7 @@ impl RawBamWriter {
                     .with_context(|| format!("creating {}", p.display()))?;
                 Sink::File(f)
             }
-            _ => Sink::Stdout(io::stdout()),
+            _ => Sink::File(take_stdout().context("taking over stdout for the output BAM")?),
         };
         Self::from_sink(sink, header, ring_bytes, level)
     }
