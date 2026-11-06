@@ -165,6 +165,78 @@ fn picard_exact_fragment_keying_is_strand_aware() {
     );
 }
 
+/// An orphan matching a pair's *second* end is a duplicate too. The pair table
+/// keys a pair by both ends, and each end is struck from the orphans' keys
+/// separately, so this pins the second-end half of that check.
+#[test]
+fn picard_exact_orphan_matching_the_pairs_second_end_is_marked_dup() {
+    let env = TestEnv::new();
+    SamBuilder::new()
+        .sq("chr1", 1_000_000)
+        // Pair rA: R1 forward at chr1:100, R2 reverse at chr1:200 (5' end 249).
+        .rec_simple("rA", 99, "chr1", 100, "50M", "=", 200, 150)
+        .rec_simple("rA", 147, "chr1", 200, "50M", "=", 100, -150)
+        // Orphan rB: reverse single-end at chr1:200, so its 5' end is rA's R2's.
+        .rec_simple("rB", 16, "chr1", 200, "50M", "*", 0, 0)
+        // Orphan rC: reverse single-end at chr1:300, matching no pair end.
+        .rec_simple("rC", 16, "chr1", 300, "50M", "*", 0, 0)
+        .write_to(&env.input);
+    let bam_out = env._tmp.path().join("out.bam");
+    let recs =
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]).flags;
+    assert_eq!(nth_flag(&recs, "rA", 0), 99);
+    assert_eq!(nth_flag(&recs, "rA", 1), 147);
+    assert_eq!(nth_flag(&recs, "rB", 0), 16 | FLAG_DUPLICATE);
+    assert_eq!(nth_flag(&recs, "rC", 0), 16);
+}
+
+/// The key phase 1 records comes from the orphan's *mapped* read, wherever it
+/// sits in its block. Here the unmapped R1 comes first and the mapped R2, on the
+/// reverse strand, second; its 5' end is the pair's R2's, so it is a duplicate.
+#[test]
+fn picard_exact_orphan_whose_mapped_read_comes_second_is_marked_dup() {
+    let env = TestEnv::new();
+    SamBuilder::new()
+        .sq("chr1", 1_000_000)
+        // Pair rA: R1 forward at chr1:100, R2 reverse at chr1:200 (5' end 249).
+        .rec_simple("rA", 99, "chr1", 100, "50M", "=", 200, 150)
+        .rec_simple("rA", 147, "chr1", 200, "50M", "=", 100, -150)
+        // Orphan rB: R1 unmapped (FLAG 69 = paired | unmapped | first), placed at
+        // its mate; R2 mapped reverse at chr1:200
+        // (FLAG 153 = paired | mate-unmapped | reverse | last).
+        .record("rB", 69, "chr1", 200, 0, "*", "=", 200, 0, &"A".repeat(50), &"I".repeat(50))
+        .rec_simple("rB", 153, "chr1", 200, "50M", "=", 200, 0)
+        .write_to(&env.input);
+    let bam_out = env._tmp.path().join("out.bam");
+    let recs =
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]).flags;
+    assert_eq!(nth_flag(&recs, "rB", 0), 69 | FLAG_DUPLICATE);
+    assert_eq!(nth_flag(&recs, "rB", 1), 153 | FLAG_DUPLICATE);
+}
+
+/// Every orphan at a pair end is a duplicate, the first included: the pair
+/// claims the position, so no orphan there can be the original.
+#[test]
+fn picard_exact_every_orphan_at_a_pair_end_is_marked_dup() {
+    let env = TestEnv::new();
+    SamBuilder::new()
+        .sq("chr1", 1_000_000)
+        // Orphan rB first in the stream: forward single-end at chr1:100.
+        .rec_simple("rB", 0, "chr1", 100, "50M", "*", 0, 0)
+        // Pair rA: R1 forward at chr1:100, sharing rB's and rC's 5' end.
+        .rec_simple("rA", 99, "chr1", 100, "50M", "=", 200, 150)
+        .rec_simple("rA", 147, "chr1", 200, "50M", "=", 100, -150)
+        // Orphan rC after the pair, at the same 5' end.
+        .rec_simple("rC", 0, "chr1", 100, "50M", "*", 0, 0)
+        .write_to(&env.input);
+    let bam_out = env._tmp.path().join("out.bam");
+    let recs =
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]).flags;
+    assert_eq!(nth_flag(&recs, "rA", 0), 99);
+    assert_eq!(nth_flag(&recs, "rB", 0), FLAG_DUPLICATE);
+    assert_eq!(nth_flag(&recs, "rC", 0), FLAG_DUPLICATE);
+}
+
 /// `--tmp-dir` is honored: pointing it at a writable directory succeeds and
 /// produces the same result as the default temp dir.
 #[test]

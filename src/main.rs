@@ -946,10 +946,10 @@ fn for_each_block(
 ///
 /// **Pass 1** streams pairs and unmapped/unmated blocks straight to `out`
 /// while buffering every mapped-orphan / single-end block to a temporary
-/// BAM. **Transition** drains the completed pair table into a
-/// fragment table holding every paired read end. **Pass 2** re-reads the
-/// buffered blocks and marks each fragment that collides with a pair end (or
-/// an earlier fragment), emitting them after the pairs.
+/// BAM, recording each one's 5' key. **Transition** consumes the completed
+/// pair table, removing every recorded key that is a paired read end. **Pass
+/// 2** re-reads the buffered blocks and marks each fragment that collides with
+/// a pair end (or an earlier fragment), emitting them after the pairs.
 ///
 /// The temp file is created via [`create_temp_bam`] and unlinked when the
 /// `NamedTempFile` drops at the end of this function — after both the writer
@@ -993,12 +993,12 @@ fn run_picard_exact(
         temp_writer.finish().context("finishing temp orphan BAM")?;
     }
 
-    // Transition: build the fragment table from every pair end.
-    processor.finalize_fragment_table();
+    // Transition: strike the pair ends out of the buffered fragments' keys.
+    processor.remove_pair_ends_from_orphan_keys();
 
-    // Pass 2: re-read the buffered fragments and mark them against the
-    // now-complete fragment table. CRC verification is off — we wrote this
-    // file ourselves moments ago.
+    // Pass 2: re-read the buffered fragments and mark them against the keys
+    // that are left. CRC verification is off — we wrote this file ourselves
+    // moments ago.
     let file = temp.reopen().context("reopening temp orphan BAM for pass 2")?;
     // Unlike the write side, this runs on the worker thread — there is no
     // read-ahead for the temp file — so decompression is not free here.
@@ -1030,8 +1030,7 @@ fn run_picard_exact(
              the temporary file under --tmp-dir was truncated or corrupted"
         );
     }
-
-    Ok(())
+    processor.check_orphan_keys_consumed()
 }
 
 /// Create the temporary BAM used by picard-exact to buffer fragment blocks.

@@ -262,13 +262,13 @@ pub enum SingleEndStrategy {
     /// Exact Picard fragment semantics via a deferred two-pass scheme:
     /// fully-mapped/unmapped pairs stream straight to the output while
     /// every mapped-orphan / single-end "fragment" block is buffered to a
-    /// temporary BAM. After the pair pass completes, the pair
-    /// table is *consumed* into a fragment table (via
-    /// [`PairDupTable::drain_into_fragment_table`]) holding the 5' position
-    /// of every paired read end; the buffered fragments are then re-read
-    /// and checked against it. Because the fragment table is complete
-    /// before any fragment is checked, the "fragments never beat pairs"
-    /// rule holds exactly and independent of input order — unlike
+    /// temporary BAM, and its 5' key recorded. After the pair pass completes,
+    /// the pair table is *consumed*, removing every recorded key that is a
+    /// paired read end (via [`PairDupTable::remove_ends_from`]); the
+    /// buffered fragments are then re-read, and each is a duplicate unless
+    /// it is the first to find its key still present. Because every pair is
+    /// seen before any fragment is marked, the "fragments never beat pairs"
+    /// rule holds exactly and independent of input order, unlike
     /// `PicardApprox`. Costs a temporary on-disk copy of the fragment
     /// blocks (a small fraction of paired data) and emits those fragments
     /// at the *end* of the output stream rather than in input order.
@@ -376,8 +376,9 @@ pub(crate) fn single_end_slot(
 /// * **Fragment table** ([`FragmentDupTable`]): `S = u32` because each
 ///   entry is a single `bin_pos` (≤ 27 bits). Built with
 ///   [`Self::new_single_end`] which allocates a 1D `stride`-length cell
-///   array indexed by `off = s = bin_num*2 + strand`. Used only by
-///   [`SingleEndStrategy::PicardApprox`].
+///   array indexed by `off = s = bin_num*2 + strand`. Used by
+///   [`SingleEndStrategy::PicardApprox`], and by
+///   [`SingleEndStrategy::PicardExact`] to hold the deferred fragments' keys.
 ///
 /// ## Why this partitioning level?
 ///
@@ -398,7 +399,7 @@ where
 {
     /// Cell-row width = `(bin_count + 1) * 2`. Used by
     /// [`PairDupTable::pair_slot`] to compute the 2D offset `s1 * stride + s2`
-    /// and by [`PairDupTable::drain_into_fragment_table`] to invert it; not
+    /// and by [`PairDupTable::remove_ends_from`] to invert it; not
     /// consulted by fragment-table operations (which only use the `s1 = 0` row).
     stride: u32,
     /// The flat array of partition cells, each a `HashSet` of signature values.
@@ -413,12 +414,12 @@ where
 /// keying.
 pub type PairDupTable = DupTable<u64, U64Hasher>;
 
-/// Fragment-key dedup table (`u32` sigs, 1D-partitioned). Stores each end of
-/// every fully-mapped PE pair plus every orphan, enabling the orphan ↔ pair-end
-/// cross-check. Allocated under [`SingleEndStrategy::PicardApprox`] (populated
-/// concurrently with the pair pass) and [`SingleEndStrategy::PicardExact`]
-/// (populated after the pair pass by draining the pair table; see
-/// [`PairDupTable::drain_into_fragment_table`]). Not used by `StrandAware` /
+/// Fragment-key dedup table (`u32` sigs, 1D-partitioned), enabling the orphan ↔
+/// pair-end cross-check. Under [`SingleEndStrategy::PicardApprox`] it holds each
+/// end of every fully-mapped PE pair plus every orphan, populated concurrently
+/// with the pair pass. Under [`SingleEndStrategy::PicardExact`] it holds the
+/// deferred orphans' keys, from which the pair ends are removed after the pair
+/// pass (see [`PairDupTable::remove_ends_from`]). Not used by `StrandAware` /
 /// `SamblasterLegacy`, which key orphans on the pair table's `s1 = 0` row.
 pub type FragmentDupTable = DupTable<u32, U32Hasher>;
 
@@ -513,49 +514,38 @@ impl PairDupTable {
         !self.sets[slot.off].insert(slot.sig as u64)
     }
 
-    /// Consume every stored pair signature, inserting *both* 5'-aligned ends
-    /// of each pair into a freshly-built [`FragmentDupTable`], freeing each
-    /// pair cell as it is drained so peak memory stays near a single table
-    /// rather than holding the full pair and fragment tables at once.
+    /// Consume the pair table, removing from `keys` every key that is the
+    /// 5'-aligned end of a stored pair. Each pair cell is freed once scanned.
     ///
-    /// Used by [`SingleEndStrategy::PicardExact`]: after the streaming pair
-    /// pass finishes, the returned table holds the 5' position of every
-    /// paired read end, so a deferred orphan / single-end read sharing one of
-    /// those 5' coordinates is marked as a duplicate of the pair ("fragments
-    /// never beat pairs"), exactly and independent of input order.
+    /// Used by [`SingleEndStrategy::PicardExact`] between its passes, with
+    /// `keys` holding the 5' key of every deferred orphan / single-end read.
+    /// What it leaves are the keys no pair shares, so phase 2 needs no table of
+    /// pair ends and allocates nothing: a fragment is a duplicate unless it
+    /// removes its own key, which only the first fragment holding a key that
+    /// survived can do. A pair cell is dropped unread when neither end's
+    /// `(bin_num, strand)` cohort has a key left.
     ///
     /// Reconstruction is lossless because the pair table stores a pair's full
     /// signature: the cell index encodes each end's `(bin_num, strand)` (via
     /// `s = bin_num*2 + strand`) and the `u64` sig packs the two `bin_pos`
-    /// halves. Pair canonicalization (the `need_swap`-style ordering
-    /// applied before insertion) is irrelevant here because each end is
-    /// re-inserted independently.
-    ///
-    /// `cell_cap` is forwarded to the new fragment table's per-cell
-    /// pre-sizing (see `with_n_cells`).
-    pub fn drain_into_fragment_table(&mut self, cell_cap: usize) -> FragmentDupTable {
+    /// halves. `Slot { off: s, sig: bin_pos }` is therefore exactly the key
+    /// [`single_end_slot`] gives a strand-aware fragment at that end. Pair
+    /// canonicalization (the `need_swap`-style ordering applied before
+    /// insertion) is irrelevant because each end is checked independently.
+    pub(crate) fn remove_ends_from(self, keys: &mut FragmentDupTable) {
+        debug_assert_eq!(keys.stride, self.stride, "built for a different bin count");
         let stride = self.stride as usize;
-        // `new_single_end(bin_count)` rebuilds `stride = (bin_count + 1) * 2`,
-        // so this reproduces the pair table's stride exactly.
-        let bin_count = self.stride / 2 - 1;
-        let mut frag = FragmentDupTable::new_single_end(bin_count, cell_cap);
-        for off in 0..self.sets.len() {
-            // Recover each end's (bin_num, strand) from the 2D cell index.
-            let s1 = (off / stride) as u32;
-            let s2 = (off % stride) as u32;
-            let (bin_num1, rev1) = (s1 >> 1, s1 & 1 == 1);
-            let (bin_num2, rev2) = (s2 >> 1, s2 & 1 == 1);
-            // Move the cell out so its backing allocation is dropped as soon
-            // as we've drained it — this is what keeps the peak near one table.
-            let cell = std::mem::take(&mut self.sets[off]);
+        for (off, cell) in self.sets.into_iter().enumerate() {
+            let (s1, s2) = (off / stride, off % stride);
+            if keys.sets[s1].is_empty() && keys.sets[s2].is_empty() {
+                continue;
+            }
             for sig in cell {
-                let bin_pos1 = (sig >> 32) as u32;
-                let bin_pos2 = (sig & 0xFFFF_FFFF) as u32;
-                frag.check_or_insert(bin_num1, bin_pos1, rev1);
-                frag.check_or_insert(bin_num2, bin_pos2, rev2);
+                let (bin_pos1, bin_pos2) = ((sig >> 32) as u32, (sig & 0xFFFF_FFFF) as u32);
+                keys.remove(Slot { off: s1, sig: bin_pos1 });
+                keys.remove(Slot { off: s2, sig: bin_pos2 });
             }
         }
-        frag
     }
 }
 
@@ -564,19 +554,18 @@ impl PairDupTable {
 impl FragmentDupTable {
     /// Insert `(bin_num, bin_pos, rev)` into the fragment table; return
     /// `true` if the entry was already present. Strand-aware keying only
-    /// (the table is allocated only under `PicardApprox`, which doesn't
-    /// use the legacy strand-drop variant). Caller must ensure the
-    /// table was built with [`DupTable::new_single_end`].
+    /// (fragment tables exist only under `PicardApprox` / `PicardExact`,
+    /// neither of which drops the strand). Caller must ensure the table was
+    /// built with [`DupTable::new_single_end`].
     ///
-    /// This is the only operation the table supports — there is no
-    /// "register-without-checking" variant because the underlying
-    /// `HashSet::insert` already conveys both pieces of information in
-    /// one call; callers that don't care about the return value
-    /// (paired-end-end inserts in `RecordProcessor`) simply ignore it.
+    /// There is no "register-without-checking" variant because the
+    /// underlying `HashSet::insert` already conveys both pieces of
+    /// information in one call; callers that don't care about the return
+    /// value (paired-end-end inserts in `RecordProcessor`) simply ignore it.
     #[inline]
     pub fn check_or_insert(&mut self, bin_num: u32, bin_pos: u32, rev: bool) -> bool {
-        // Fragment keying is always strand-aware (allocated only under
-        // PicardApprox, which has no legacy strand-drop variant).
+        // Fragment keying is always strand-aware (fragment tables exist only
+        // under the Picard strategies, which never drop the strand).
         self.insert(single_end_slot(bin_num, bin_pos, rev, true))
     }
 
@@ -584,6 +573,17 @@ impl FragmentDupTable {
     #[inline]
     pub(crate) fn insert(&mut self, slot: FragmentSlot) -> bool {
         !self.sets[slot.off].insert(slot.sig)
+    }
+
+    /// Remove a precomputed fragment slot; returns `true` if it was present.
+    #[inline]
+    pub(crate) fn remove(&mut self, slot: FragmentSlot) -> bool {
+        self.sets[slot.off].remove(&slot.sig)
+    }
+
+    /// The number of keys held, across every cell.
+    pub(crate) fn key_count(&self) -> usize {
+        self.sets.iter().map(HashSet::len).sum()
     }
 }
 
@@ -696,32 +696,67 @@ mod tests {
         assert!(!t.check_or_insert(3, 555, true));
     }
 
-    #[test]
-    fn drain_recovers_both_pair_ends_into_fragment_table() {
-        let mut pairs = PairDupTable::new_pair(8, 64);
-        // Insert one pair: end A = (bin 1, pos 100, fwd), end B = (bin 2, pos 200, rev).
-        let s = pairs.pair_slot(1, 100, false, 2, 200, true);
-        assert!(!pairs.insert_pair(s));
-        let mut frag = pairs.drain_into_fragment_table(64);
-        // Both ends of the pair are now present in the fragment table: a
-        // re-insert at either coordinate reports a collision.
-        assert!(frag.check_or_insert(1, 100, false), "pair end A should be present");
-        assert!(frag.check_or_insert(2, 200, true), "pair end B should be present");
-        // A coordinate that was never part of any pair is absent.
-        assert!(!frag.check_or_insert(3, 300, false), "unrelated coord should be absent");
+    /// A fragment table holding the given `(bin_num, bin_pos, rev)` keys.
+    fn fragments(keys: &[(u32, u32, bool)]) -> FragmentDupTable {
+        let mut t = FragmentDupTable::new_single_end(8, 0);
+        for &(bin_num, bin_pos, rev) in keys {
+            t.check_or_insert(bin_num, bin_pos, rev);
+        }
+        t
+    }
+
+    /// Whether `t` holds the strand-aware key `(bin_num, bin_pos, rev)`.
+    fn holds(t: &FragmentDupTable, bin_num: u32, bin_pos: u32, rev: bool) -> bool {
+        let slot = single_end_slot(bin_num, bin_pos, rev, true);
+        t.sets[slot.off].contains(&slot.sig)
     }
 
     #[test]
-    fn drain_is_strand_aware() {
+    fn removing_pair_ends_removes_a_key_matching_either_end() {
+        let mut pairs = PairDupTable::new_pair(8, 64);
+        // Pair 1: ends (bin 1, pos 100, fwd) and (bin 2, pos 200, rev).
+        assert!(!pairs.insert_pair(pairs.pair_slot(1, 100, false, 2, 200, true)));
+        // Pair 2: ends (bin 3, pos 300, fwd) and (bin 4, pos 400, fwd).
+        assert!(!pairs.insert_pair(pairs.pair_slot(3, 300, false, 4, 400, false)));
+        // Pair 1's first end and pair 2's second end.
+        let mut keys = fragments(&[(1, 100, false), (4, 400, false)]);
+        pairs.remove_ends_from(&mut keys);
+        assert!(!holds(&keys, 1, 100, false), "a key matching a first end is removed");
+        assert!(!holds(&keys, 4, 400, false), "a key matching a second end is removed");
+        assert_eq!(keys.key_count(), 0);
+    }
+
+    #[test]
+    fn removing_pair_ends_keeps_a_key_no_pair_shares() {
+        let mut pairs = PairDupTable::new_pair(8, 64);
+        assert!(!pairs.insert_pair(pairs.pair_slot(1, 100, false, 2, 200, true)));
+        // Same cohort as pair 1's first end, at a different position.
+        let mut keys = fragments(&[(1, 101, false), (5, 500, false)]);
+        pairs.remove_ends_from(&mut keys);
+        assert!(holds(&keys, 1, 101, false), "a key in a pair end's cohort is kept");
+        assert!(holds(&keys, 5, 500, false), "a key in a cohort with no pair end is kept");
+        assert_eq!(keys.key_count(), 2);
+    }
+
+    #[test]
+    fn removing_pair_ends_is_strand_aware() {
         let mut pairs = PairDupTable::new_pair(8, 64);
         // Pair end at (bin 4, pos 555, forward).
-        let s = pairs.pair_slot(4, 555, false, 5, 600, false);
-        assert!(!pairs.insert_pair(s));
-        let mut frag = pairs.drain_into_fragment_table(64);
-        // The forward end collides; the reverse-strand coordinate at the same
-        // bin/pos is a distinct key and does not.
-        assert!(!frag.check_or_insert(4, 555, true), "reverse coord must not collide with fwd end");
-        assert!(frag.check_or_insert(4, 555, false), "forward end should be present");
+        assert!(!pairs.insert_pair(pairs.pair_slot(4, 555, false, 5, 600, false)));
+        let mut keys = fragments(&[(4, 555, false), (4, 555, true)]);
+        pairs.remove_ends_from(&mut keys);
+        assert!(!holds(&keys, 4, 555, false), "the forward key matches the forward end");
+        // The reverse-strand key at the same bin/pos is a different key.
+        assert!(holds(&keys, 4, 555, true), "the reverse key must not match a forward end");
+    }
+
+    #[test]
+    fn fragment_remove_reports_whether_the_key_was_present() {
+        let mut t = fragments(&[(3, 555, true)]);
+        let slot = single_end_slot(3, 555, true, true);
+        assert!(t.remove(slot), "the first removal finds the key");
+        assert!(!t.remove(slot), "a second removal finds nothing");
+        assert_eq!(t.key_count(), 0);
     }
 
     #[test]
