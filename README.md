@@ -311,7 +311,7 @@ Two things to know before reaching for a high level. The spill is split across 6
 
 Those two account for the whole 25.9 s above.
 
-In `bwa-mem … | dupblaster … | samtools sort`, the sort sees end-of-input as soon as the main pass ends and proceeds while dupblaster is still decomposing. The overhead the pipeline actually feels is the first row alone — about **+2.5%**.
+In `bwa-mem … | dupblaster … | samtools sort`, the sort sees end-of-input as soon as the main pass ends and proceeds while dupblaster is still decomposing. The overhead the pipeline actually feels is the first row alone — about **+2.5%**. End of input does not mean dupblaster has finished, though: the metrics files are written after it, so a script that reads them must wait for dupblaster to exit.
 
 ### How it works
 

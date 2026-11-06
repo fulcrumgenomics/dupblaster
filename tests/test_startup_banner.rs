@@ -57,8 +57,9 @@ fn quiet_still_reports_the_duplicate_summary() {
 #[test]
 fn piped_stdout_is_a_valid_bam_stream() {
     // With `-o -` the banner shares a process with the BAM stream. Parse stdout
-    // as BAM rather than scanning it for banner text: that way *any* stray write
-    // fails the test, not just this one string.
+    // as BAM rather than scanning it for banner text: that way any stray write
+    // made before the writer takes stdout over fails the test, not just this one
+    // string. Later ones land on stderr.
     let dir = tempdir().unwrap();
     let sam = tiny_input(dir.path());
     // The metrics prefix goes in the temp dir, not beside `-`, which would derive
