@@ -540,11 +540,12 @@ Four strategies are supported:
   two passes: fully-mapped and unmapped pairs stream straight to the
   output, while every mapped-orphan / single-end read is buffered to a
   temporary BAM (see `--tmp-dir`, and `--tmp-compression-level` to compress
-  it). After the pair pass, the pair table is consumed into a fragment
-  table holding the 5' position of each paired read end that some buffered
-  fragment shares, and the buffered fragments are re-read and marked
-  against it — so an orphan is marked a duplicate of a pair regardless of
-  which came first in the stream, unlike `picard-approx`. Two trade-offs:
+  it), and its 5' position recorded. After the pair pass, every recorded
+  position that is also a paired read end's is struck out, and the
+  buffered fragments are re-read and marked: a fragment is a duplicate
+  unless it is the first to find its position still recorded — so an
+  orphan is marked a duplicate of a pair regardless of which came first in
+  the stream, unlike `picard-approx`. Two trade-offs:
   (1) buffered fragments are emitted at the **end** of the output stream
   rather than in input order (re-sort downstream if order matters — most
   pipelines already do), and (2) it writes a temporary on-disk copy of the

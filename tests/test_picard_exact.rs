@@ -166,8 +166,8 @@ fn picard_exact_fragment_keying_is_strand_aware() {
 }
 
 /// An orphan matching a pair's *second* end is a duplicate too. The pair table
-/// keys a pair by both ends, and only the ends some orphan shares survive into
-/// the fragment table, so this pins the second-end half of that check.
+/// keys a pair by both ends, and each end is struck from the orphans' keys
+/// separately, so this pins the second-end half of that check.
 #[test]
 fn picard_exact_orphan_matching_the_pairs_second_end_is_marked_dup() {
     let env = TestEnv::new();
@@ -212,6 +212,29 @@ fn picard_exact_orphan_whose_mapped_read_comes_second_is_marked_dup() {
         run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]).flags;
     assert_eq!(nth_flag(&recs, "rB", 0), 69 | FLAG_DUPLICATE);
     assert_eq!(nth_flag(&recs, "rB", 1), 153 | FLAG_DUPLICATE);
+}
+
+/// Every orphan at a pair end is a duplicate, the first included: the pair
+/// claims the position, so no orphan there can be the original.
+#[test]
+fn picard_exact_every_orphan_at_a_pair_end_is_marked_dup() {
+    let env = TestEnv::new();
+    SamBuilder::new()
+        .sq("chr1", 1_000_000)
+        // Orphan rB first in the stream: forward single-end at chr1:100.
+        .rec_simple("rB", 0, "chr1", 100, "50M", "*", 0, 0)
+        // Pair rA: R1 forward at chr1:100, sharing rB's and rC's 5' end.
+        .rec_simple("rA", 99, "chr1", 100, "50M", "=", 200, 150)
+        .rec_simple("rA", 147, "chr1", 200, "50M", "=", 100, -150)
+        // Orphan rC after the pair, at the same 5' end.
+        .rec_simple("rC", 0, "chr1", 100, "50M", "*", 0, 0)
+        .write_to(&env.input);
+    let bam_out = env._tmp.path().join("out.bam");
+    let recs =
+        run_and_capture(&env.input, &bam_out, &["--single-end-strategy", "picard-exact"]).flags;
+    assert_eq!(nth_flag(&recs, "rA", 0), 99);
+    assert_eq!(nth_flag(&recs, "rB", 0), FLAG_DUPLICATE);
+    assert_eq!(nth_flag(&recs, "rC", 0), FLAG_DUPLICATE);
 }
 
 /// `--tmp-dir` is honored: pointing it at a writable directory succeeds and
