@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-07
+
 ### Changed
 
 - `--single-end-strategy picard-exact` no longer builds a table of every paired read end after the pair pass. It records each buffered orphan's 5' position during the pair pass and strikes out those a pair shares, so the pause before the buffered orphans are written is shorter, and processing them needs a table the size of the orphans rather than of the pairs. The duplicates marked and every metric are unchanged. Single-end or orphan-heavy input, which the mode is not meant for, is slower, since each orphan's position is now computed in both passes.
@@ -197,7 +199,8 @@ Picard MarkDuplicates.
   Picard's `kf`-tagged output to produce set-equivalence, orphan-discordance,
   and supplementary-flag-inheritance TSVs.
 
-[Unreleased]: https://github.com/fulcrumgenomics/dupblaster/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/fulcrumgenomics/dupblaster/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/fulcrumgenomics/dupblaster/releases/tag/v0.3.1
 [0.3.0]: https://github.com/fulcrumgenomics/dupblaster/releases/tag/v0.3.0
 [0.2.0]: https://github.com/fulcrumgenomics/dupblaster/releases/tag/v0.2.0
 [0.1.1]: https://github.com/fulcrumgenomics/dupblaster/releases/tag/v0.1.1
